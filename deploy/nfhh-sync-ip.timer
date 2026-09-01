@@ -1,5 +1,5 @@
 [Unit]
-Description=Netflix Household — 每 5 分鐘檢查出口 IP 是否變動
+Description=OTT Household — 每 5 分鐘檢查出口 IP 是否變動
 Documentation=file:///opt/nfhh/README.md
 
 [Timer]

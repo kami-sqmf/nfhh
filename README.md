@@ -1,8 +1,8 @@
 <div align="center">
 
-<img src="app/control/web/public/icon-192.png" width="72" alt="Netflix Household SmartDNS 專案標誌">
+<img src="app/control/web/public/icon-192.png" width="72" alt="OTT Household 專案標誌">
 
-# Netflix Household SmartDNS
+# OTT Household
 
 *讓分散在各樓層的裝置，在串流平台眼中收斂成同一個 household*
 

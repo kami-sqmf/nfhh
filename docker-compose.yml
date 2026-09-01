@@ -1,4 +1,4 @@
-# Netflix Household
+# OTT Household
 #
 # smartdns（:53/:853）、sni-proxy（:443）、control（127.0.0.1:8081）。
 # 三者皆 network_mode: host。約束見 docs/DECISIONS.md。

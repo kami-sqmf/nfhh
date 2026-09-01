@@ -1,5 +1,5 @@
 [Unit]
-Description=Netflix Household — 監看 acme.sh 憑證續期
+Description=OTT Household — 監看 acme.sh 憑證續期
 Documentation=file:///opt/nfhh/README.md
 
 [Path]

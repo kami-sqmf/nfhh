@@ -1,4 +1,4 @@
-//! nfhh-control — Netflix Household 管理面板
+//! nfhh-control — OTT Household 管理面板
 //!
 //! 用 Passkey (WebAuthn) 認證，手機可一鍵把「目前所在網路的公網 IP」
 //! 加進 DNS/proxy 白名單。
@@ -912,9 +912,9 @@ async fn dns_profile(
   <key>PayloadIdentifier</key><string>tw.kami.nfhh.dns</string>
   <key>PayloadUUID</key><string>c81e5d04-6b2f-4a87-8c33-9f1d70a4e256</string>
   <key>PayloadVersion</key><integer>1</integer>
-  <key>PayloadDisplayName</key><string>Netflix Household DNS</string>
+  <key>PayloadDisplayName</key><string>OTT Household DNS</string>
   <key>PayloadDescription</key><string>將本裝置的 DNS 指向 {host}（加密傳輸）。可隨時於「設定 &gt; 一般 &gt; VPN 與裝置管理」移除。</string>
-  <key>PayloadOrganization</key><string>Netflix Household</string>
+  <key>PayloadOrganization</key><string>OTT Household</string>
   <key>PayloadRemovalDisallowed</key><false/>
 </dict>
 </plist>
@@ -2962,7 +2962,7 @@ async fn main() -> Result<()> {
     }
 
     let webauthn = WebauthnBuilder::new(&cfg.rp_id, &Url::parse(&cfg.origin)?)?
-        .rp_name("Netflix Household")
+        .rp_name("OTT Household")
         .build()?;
 
     // 首次上線時先把 clients.nft 既有條目收進 DB，再同步

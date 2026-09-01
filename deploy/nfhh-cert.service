@@ -1,5 +1,5 @@
 [Unit]
-Description=Netflix Household — 憑證續期後重載 smartdns
+Description=OTT Household — 憑證續期後重載 smartdns
 Documentation=file:///opt/nfhh/README.md
 After=docker.service
 Wants=docker.service

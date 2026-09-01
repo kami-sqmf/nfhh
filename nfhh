@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# nfhh — Netflix Household 的統一操作入口。
+# nfhh — OTT Household 的統一操作入口。
 #
 # 日常會用到的東西都在這裡，不必記 docker compose 的參數或 scripts/ 底下的檔名。
 # 每個子命令背後就是 scripts/ 裡的一支腳本或一行 docker compose，
