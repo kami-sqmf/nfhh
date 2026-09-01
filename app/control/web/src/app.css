@@ -1,0 +1,170 @@
+/* nfhh-control 設計 token
+ *
+ * 來源是設計稿 1a 的「設計方針」。稿子本身不是 token 系統 —— 實際用到
+ * 24 種字級、27 種前景透明度、17 種圓角，多數差異是手繪過程的漂移
+ * （.5 跟 .55、13 跟 13.5 之間沒有語意差別）。這裡把它們收斂成一組
+ * 有名字的尺標，每一級都對應一個實際的用途。
+ *
+ * ── 深色模式怎麼運作 ──────────────────────────────────
+ * @theme 的變數只能宣告在頂層，但它編出來的 utility 是
+ * `background-color: var(--color-surface)` 這種形式。所以深色是用
+ * **普通 CSS** 在 :root 底下覆蓋同名變數，utility 會跟著變。
+ *
+ * ⚠️ 因此不能用 `@theme inline` —— inline 會把字面值烤進 utility，
+ *    覆蓋就失效了。
+ *
+ * 透明度階層寫成 color-mix(… var(--color-fg) …)，自訂屬性是在使用時
+ * 才代換的，所以深色換掉 --color-fg 之後這些階層會自己跟著翻轉，
+ * 不必逐條重寫。
+ */
+
+@import 'tailwindcss';
+
+@theme {
+  /* ── 字級：24 → 10 ────────────────────────────────
+   * 括號裡是稿子裡被收斂進來的原始值與出現次數。 */
+  --text-micro: 10px;    /* 9.5 / 10        —  39 次，時間戳、標籤 */
+  --text-meta: 10.5px;   /* 10.5            —  81 次，最高頻，自成一級 */
+  --text-label: 11.5px;  /* 11 / 11.5       —  81 次，次要說明 */
+  --text-body: 12.5px;   /* 12 / 12.5       —  55 次，內文 */
+  --text-item: 13.5px;   /* 13 / 13.5       —  36 次，清單項目 */
+  --text-lead: 15px;     /* 14 / 14.5 / 16  —  17 次，重點句、按鈕 */
+  --text-title: 19px;    /* 17 / 18 / 20    —  10 次，卡片標題 */
+  --text-head: 22px;     /* 22              —  11 次，分頁標題 */
+  --text-hero: 30px;     /* 24 / 26 / 30    —   5 次，登入頁大標 */
+  --text-code: 42px;     /* 38 / 42 / 44    —   3 次，驗證碼大字 */
+
+  /* ── 底色與前景 ──────────────────────────────────── */
+  --color-canvas: #efeeea;
+  --color-surface: #ffffff;
+  --color-fg: #1d1e1c;
+
+  /* 前景階層：27 種透明度 → 5 級。跟著 --color-fg 自動翻轉。 */
+  --color-fg-strong: color-mix(in srgb, var(--color-fg) 80%, transparent);
+  --color-fg-muted: color-mix(in srgb, var(--color-fg) 60%, transparent);
+  --color-fg-faint: color-mix(in srgb, var(--color-fg) 45%, transparent);
+  --color-line: color-mix(in srgb, var(--color-fg) 8%, transparent);
+  --color-line-firm: color-mix(in srgb, var(--color-fg) 16%, transparent);
+  /* hover 用的極淡底 */
+  --color-wash: color-mix(in srgb, var(--color-fg) 4%, transparent);
+
+  /* ── 語意色 ───────────────────────────────────────
+   * 1a：綠＝確定成立，琥珀＝還在觀察，紅＝被拒絕或撤銷，
+   *     灰＝無資訊。灰永不與紅混用。 */
+  --color-ok: #2e9e6b;
+  --color-ok-bg: #e4f3eb;
+  --color-ok-fg: #1c6544;
+  --color-watch: #d8973a;
+  --color-watch-bg: #fbf0dd;
+  --color-watch-fg: #8a5a15;
+  --color-bad: #c0503f;
+  --color-bad-bg: #fae9e6;
+  --color-bad-fg: #963a2b;
+  /* 「無資訊」用前景階層，不另外給色 —— 灰不是一種狀態色，
+   * 它是「沒有狀態」。給它專屬顏色會誘使人拿它當第四種狀態用。 */
+
+  /* ── 圓角：17 → 5 ─────────────────────────────────
+   * 稿子裡的 26px 全是手機外框（mockup 的裝置邊框），實作不需要。 */
+  --radius-chip: 6px;
+  --radius-sm: 12px;
+  --radius-md: 16px;
+  --radius-lg: 20px;
+  /* 膠囊：兩端半圓。Tailwind v4 只產生**有對應變數**的工具類別 ——
+   * 這個 token 缺席時 `rounded-pill` 不會出錯，而是整條規則不存在，
+   * 所有膠囊變成直角。開關的軌道曾經就是這樣變成方塊的。 */
+  --radius-pill: 999px;
+
+  /* ── 字體 ─────────────────────────────────────────
+   * 中文走系統字體：Noto Sans TC 完整檔數百 KB，而家人用的
+   * iOS/Android 本來就有像樣的中文字。省掉最大那包。 */
+  --font-sans: Figtree, -apple-system, BlinkMacSystemFont, 'PingFang TC',
+    'Noto Sans TC', 'Microsoft JhengHei', sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --shadow-card: 0 1px 3px color-mix(in srgb, var(--color-fg) 6%, transparent);
+}
+
+/* ── 深色 ──────────────────────────────────────────
+ * 只翻轉底色與語意色的色相亮度；透明度階層會自己跟上。
+ *
+ * 手法是把 1a 的六色互換角色：淺色的前景 #1D1E1C 變成卡片底，
+ * 淺色的底 #EFEEEA 變成文字。這樣深色不是憑空發明的一組顏色，
+ * 而是同一組色票換了位置。
+ *
+ * 語意色在深底上要提亮才有對比 —— 原本的 #2E9E6B 放在近黑底上
+ * 太暗，讀起來像深灰。 */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-canvas: #141513;
+    --color-surface: #1d1e1c;
+    --color-fg: #efeeea;
+
+    --color-ok: #4fbf8b;
+    --color-ok-bg: color-mix(in srgb, #4fbf8b 16%, transparent);
+    --color-ok-fg: #7fd4a8;
+    --color-watch: #e5ac5b;
+    --color-watch-bg: color-mix(in srgb, #e5ac5b 16%, transparent);
+    --color-watch-fg: #ebc183;
+    --color-bad: #e07a68;
+    --color-bad-bg: color-mix(in srgb, #e07a68 16%, transparent);
+    --color-bad-fg: #f0a093;
+
+    --shadow-card: 0 1px 3px rgb(0 0 0 / 0.4);
+  }
+}
+
+/* ── 基礎 ────────────────────────────────────────── */
+@layer base {
+  html {
+    background: var(--color-canvas);
+    /* iOS 上拉過頭時露出的底色要對，否則會閃白 */
+    color-scheme: light dark;
+  }
+
+  body {
+    margin: 0;
+    background: var(--color-canvas);
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+    font-size: var(--text-item);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    /* 手機優先。桌機不另外設計，只置中避免整片攤開（1a 待確認 ③）。 */
+    max-width: 480px;
+    margin-inline: auto;
+    /* 底部分頁是固定的，內容要讓出它的高度＋安全區 */
+    padding-bottom: calc(72px + env(safe-area-inset-bottom));
+  }
+
+  /* 所有可點目標 ≥ 48px（1a「形體」）。這裡只保證按鈕類的最小高度，
+   * 版面上更大的目標各自指定。 */
+  button,
+  [role='button'] {
+    font-family: inherit;
+    min-height: 44px;
+    cursor: pointer;
+  }
+
+  /* 機器產生的值一律等寬 —— 1a：把「可信資料」與「說明文字」分開 */
+  code,
+  kbd,
+  samp {
+    font-family: var(--font-mono);
+  }
+
+  /* iOS 在 font-size < 16px 的輸入框上會自動放大整頁 */
+  input,
+  textarea,
+  select {
+    font-size: 16px;
+    font-family: inherit;
+  }
+
+  summary {
+    cursor: pointer;
+    list-style: none;
+  }
+  summary::-webkit-details-marker {
+    display: none;
+  }
+}

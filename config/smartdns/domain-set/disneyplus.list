@@ -1,0 +1,13 @@
+# Disney+ 控制平面網域
+# platform-name: Disney+
+# platform-color: #0063E5
+# 一行一個網域，自動涵蓋所有子網域。不含影片 CDN，見 disneyplus-cdn.list.disabled。
+#
+# 清單依公開資訊整理，未必完整。找出漏掉的網域：
+#   ./scripts/find-uncovered.sh <裝置公網IP>
+
+disneyplus.com
+disney-plus.net
+bamgrid.com
+disneystreaming.com
+registerdisney.go.com

@@ -1,0 +1,12 @@
+[Unit]
+Description=Netflix Household — 每 5 分鐘檢查出口 IP 是否變動
+Documentation=file:///opt/nfhh/README.md
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

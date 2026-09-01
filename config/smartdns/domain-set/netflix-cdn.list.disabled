@@ -1,0 +1,6 @@
+# Netflix 影片 CDN（Open Connect Appliance）—— 預設停用
+#
+# household 判定走控制平面 API，不需要代理影片流量。
+# 若控制平面已代理但仍跳同戶驗證才啟用：
+#   mv netflix-cdn.list.disabled netflix-cdn.list && ./scripts/sync-ip.sh
+nflxvideo.net

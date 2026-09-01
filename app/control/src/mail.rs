@@ -1,0 +1,736 @@
+//! 信件解析與驗證碼抽取。Worker 只負責搬運原始信件，解析全在這邊做。
+
+use serde::Serialize;
+
+#[derive(Debug, Serialize, Default)]
+pub struct Parsed {
+    pub message_id: Option<String>,
+    pub sender: Option<String>,
+    pub recipient: Option<String>,
+    pub subject: Option<String>,
+    pub date: Option<i64>,
+    pub body: String,
+    /// 原始 HTML，供面板在沙箱 iframe 內呈現。
+    pub html: Option<String>,
+    pub code: Option<String>,
+    pub links: Vec<String>,
+    /// 寄件者驗證結果。決定這封信要不要真的扇出給家人。
+    pub auth: SenderAuth,
+}
+
+/// 從 `Authentication-Results` 表頭抽出的驗證結果。
+/// 信任錨點是通過驗證的品牌網域（DKIM `header.d`），不是信封寄件者網域。
+#[derive(Debug, Serialize, Default, Clone)]
+pub struct SenderAuth {
+    /// 所有 `dkim=pass` 的 `header.d`，任一命中白名單即可。
+    pub dkim_domains: Vec<String>,
+    /// `dmarc=pass` 時的 `header.from`，作為第二條比對路徑。
+    pub dmarc_from: Option<String>,
+    /// 只記錄不參與判斷，用來對照日誌。
+    pub envelope_domain: Option<String>,
+}
+
+impl SenderAuth {
+    pub fn is_trusted(&self, allowed: &[String]) -> bool {
+        let hit = |d: &String| {
+            allowed
+                .iter()
+                .any(|x| d == x || d.ends_with(&format!(".{x}")))
+        };
+        self.dkim_domains.iter().any(hit) || self.dmarc_from.as_ref().is_some_and(hit)
+    }
+
+    /// 給日誌用的一行摘要。不含收件人，可安全記錄。
+    pub fn summary(&self) -> String {
+        format!(
+            "dkim.d=[{}] dmarc.from={} envelope={}",
+            self.dkim_domains.join(","),
+            self.dmarc_from.as_deref().unwrap_or("無"),
+            self.envelope_domain.as_deref().unwrap_or("無")
+        )
+    }
+}
+
+/// 解析 `Authentication-Results`。各方法以 `;` 分隔，先切段再於段內比對。
+fn parse_auth_results(raw: &str) -> (Vec<String>, Option<String>) {
+    let lower = raw.to_lowercase();
+    let mut dkim = Vec::new();
+    let mut dmarc = None;
+    for seg in lower.split(';') {
+        if seg.contains("dkim=pass")
+            && let Some(d) = value_after(seg, "header.d=")
+            && !dkim.contains(&d)
+        {
+            dkim.push(d);
+        }
+        if seg.contains("dmarc=pass") && dmarc.is_none() {
+            dmarc = value_after(seg, "header.from=");
+        }
+    }
+    (dkim, dmarc)
+}
+
+/// 取出 `key` 之後的網域值，遇到分隔字元就停。
+fn value_after(seg: &str, key: &str) -> Option<String> {
+    let start = seg.find(key)? + key.len();
+    let v: String = seg[start..]
+        .chars()
+        .skip_while(|c| *c == '"' || *c == '\'')
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-')
+        .collect();
+    // 結尾的點是合法的 FQDN 寫法，但白名單比對不帶它
+    let v = v.trim_end_matches('.').to_string();
+    (!v.is_empty()).then_some(v)
+}
+
+pub fn parse(raw: &[u8]) -> Parsed {
+    let Some(msg) = mail_parser::MessageParser::default().parse(raw) else {
+        // 解析失敗仍保留原始內容，驗證碼可能還在裡面
+        let body = String::from_utf8_lossy(raw).chars().take(20_000).collect::<String>();
+        let code = extract_code(&body);
+        return Parsed { body, code, ..Default::default() };
+    };
+
+    // 可能有多個 Authentication-Results（每一跳一個），全部串起來一起看。
+    let auth_raw = msg
+        .headers()
+        .iter()
+        .filter(|h| h.name().eq_ignore_ascii_case("authentication-results"))
+        .filter_map(|h| h.value().as_text())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let (dkim_domains, dmarc_from) = parse_auth_results(&auth_raw);
+
+    let subject = msg.subject().map(|s| s.to_string());
+
+    // text/plain 與 HTML 兩段都要取：純文字段常是空殼，內容只在 HTML 裡
+    let text = msg.body_text(0).map(|t| t.to_string()).unwrap_or_default();
+    let raw_html = msg.body_html(0).map(|h| h.to_string());
+    let html = raw_html.as_deref().map(html_to_text).unwrap_or_default();
+
+    // 顯示用取比較有料的那份
+    let body = if html.chars().count() > text.chars().count() { html.clone() } else { text.clone() };
+
+    // 搜尋範圍涵蓋主旨與兩段內文
+    let haystack = format!(
+        "{}\n{}\n{}",
+        subject.as_deref().unwrap_or(""),
+        text,
+        html
+    );
+
+    let sender = msg
+        .from()
+        .and_then(|a| a.first())
+        .and_then(|a| a.address())
+        .map(|s| s.to_string());
+
+    Parsed {
+        auth: SenderAuth {
+            dkim_domains,
+            dmarc_from,
+            envelope_domain: sender
+                .as_deref()
+                .and_then(|s| s.split('@').nth(1))
+                .map(|d| d.to_lowercase()),
+        },
+        message_id: msg.message_id().map(|s| s.to_string()),
+        sender,
+        recipient: msg
+            .to()
+            .and_then(|a| a.first())
+            .and_then(|a| a.address())
+            .map(|s| s.to_string()),
+        subject,
+        date: msg.date().map(|d| d.to_timestamp()),
+        code: extract_code(&haystack),
+        links: extract_links(&body),
+        body: body.chars().take(20_000).collect(),
+        // 上限避免夾帶大量內嵌圖片的信把資料庫撐爆
+        html: raw_html.map(|h| h.chars().take(400_000).collect()),
+    }
+}
+
+/// 出現在驗證碼附近的字眼。距離越近，該數字越可能是我們要的。
+const HINTS: &[&str] = &[
+    "code", "passcode", "otp", "verification", "verify", "one-time", "temporary",
+    "驗證碼", "驗證", "代碼", "密碼", "一次性", "臨時", "认证", "验证码",
+];
+
+/// 數字後面接這些就是數量／日期，不是驗證碼。
+const UNITS: &[&str] = &["年", "月", "日", "%", "元", "px", "分", "秒", "小時"];
+
+/// 從文字中找出最像驗證碼的數字。沒有提示字眼就回傳 None，不猜。
+pub fn extract_code(text: &str) -> Option<String> {
+    let lower = text.to_lowercase();
+
+    // 提示字眼的位置。一個都沒有就不猜。
+    let mut hints: Vec<usize> = Vec::new();
+    for h in HINTS {
+        let mut from = 0;
+        while let Some(p) = lower[from..].find(h) {
+            hints.push(from + p);
+            from += p + h.len();
+        }
+    }
+    if hints.is_empty() {
+        return None;
+    }
+
+    let bytes = lower.as_bytes();
+    let mut best: Option<(usize, String)> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        let (end, len) = (i, i - start);
+        if !(4..=8).contains(&len) {
+            continue;
+        }
+        if start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
+            continue;
+        }
+        if end < bytes.len() && bytes[end].is_ascii_alphanumeric() {
+            continue;
+        }
+        let digits = &lower[start..end];
+
+        // ── 必須是獨立的一個詞：所在片段去掉標點後要正好等於這串數字 ──
+        // ── 不能是更長識別碼的一部分：看前後緊鄰的字元 ──
+        // 連接符出現在數字旁代表它鑲在 UUID / HTML 實體 / 路徑裡。
+        // 用緊鄰字元而非空白切詞：中文「您的驗證碼：123456」整句沒有空格。
+        const BAD_PREV: &[char] = &['-', '_', '&', '#', '=', '/', '+', '.', '%'];
+        const BAD_NEXT: &[char] = &['-', '_', '&', ';', '=', '/', '+', '%'];
+        if lower[..start].chars().next_back().is_some_and(|c| BAD_PREV.contains(&c)) {
+            continue;
+        }
+        if lower[end..].chars().next().is_some_and(|c| BAD_NEXT.contains(&c)) {
+            continue;
+        }
+
+        // ── 後面緊跟單位／日期字 → 是數量不是碼 ──
+        let after = lower[end..].trim_start();
+        if UNITS.iter().any(|u| after.starts_with(u)) {
+            continue;
+        }
+        // ── 前面是版權符號 ──
+        let before = lower[..start].trim_end();
+        if before.ends_with('©') || before.ends_with("(c)") {
+            continue;
+        }
+
+        let dist = hints
+            .iter()
+            .map(|h| h.abs_diff(start))
+            .min()
+            .unwrap_or(usize::MAX);
+
+        // 四位數又落在年份範圍，提示字眼的距離門檻加嚴
+        let limit = if len == 4
+            && digits.parse::<u32>().map_or(false, |v| (1900..=2100).contains(&v))
+        {
+            40
+        } else {
+            120
+        };
+        if dist > limit {
+            continue;
+        }
+        if best.as_ref().map_or(true, |(d, _)| dist < *d) {
+            best = Some((dist, digits.to_string()));
+        }
+    }
+    best.map(|(_, d)| d)
+}
+
+/// 抽出信中的連結。前端會把完整網址原樣顯示，不用錨點文字。
+pub fn extract_links(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = text;
+    while let Some(p) = rest.find("https://") {
+        let tail = &rest[p..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || c == '"' || c == '<' || c == '>' || c == ')')
+            .unwrap_or(tail.len());
+        let url: String = tail[..end].trim_end_matches(['.', ',', ';']).to_string();
+        if url.len() > 12 && !out.contains(&url) {
+            out.push(url);
+        }
+        rest = &tail[end.max(1)..];
+        if out.len() >= 10 {
+            break;
+        }
+    }
+    out
+}
+
+/// 解 HTML 實體，含數字型的 `&#8199;` / `&#x2007;`。
+/// 數字型必須解碼，否則實體裡的數字會變成假的驗證碼候選。
+fn decode_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let tail = &rest[amp..];
+        // 實體最長十來個字元，找太遠代表這個 & 只是普通字元
+        let Some(semi) = tail[..tail.len().min(12)].find(';') else {
+            out.push('&');
+            rest = &tail[1..];
+            continue;
+        };
+        let ent = &tail[1..semi];
+        let ch = if let Some(hex) = ent.strip_prefix("#x").or_else(|| ent.strip_prefix("#X")) {
+            u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
+        } else if let Some(dec) = ent.strip_prefix('#') {
+            dec.parse::<u32>().ok().and_then(char::from_u32)
+        } else {
+            match ent {
+                "nbsp" => Some(' '),
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                "shy" | "zwnj" | "zwj" => Some('\u{200b}'),
+                _ => None,
+            }
+        };
+        match ch {
+            Some(c) => out.push(c),
+            None => out.push_str(&tail[..=semi]),
+        }
+        rest = &tail[semi + 1..];
+    }
+    out.push_str(rest);
+    // 清掉不可見的排版填充字元，避免製造假的詞邊界
+    out.chars()
+        .filter(|c| !matches!(c, '\u{200b}'..='\u{200f}' | '\u{2007}' | '\u{feff}' | '\u{034f}'))
+        .collect()
+}
+
+/// 極簡 HTML 轉純文字。目的只是讓人讀得懂並讓驗證碼浮出來，不求還原排版。
+fn html_to_text(html: &str) -> String {
+    let mut out = String::with_capacity(html.len() / 2);
+    let mut chars = html.char_indices().peekable();
+    let lower = html.to_lowercase();
+
+    while let Some((i, c)) = chars.next() {
+        if c == '<' {
+            // script / style 的內容整段丟掉
+            for tag in ["script", "style"] {
+                if lower[i..].starts_with(&format!("<{tag}")) {
+                    if let Some(e) = lower[i..].find(&format!("</{tag}>")) {
+                        let skip_to = i + e + tag.len() + 3;
+                        while let Some((j, _)) = chars.peek() {
+                            if *j >= skip_to { break; }
+                            chars.next();
+                        }
+                    }
+                }
+            }
+            // 區塊標籤換行
+            if lower[i..].starts_with("<br") || lower[i..].starts_with("<p")
+                || lower[i..].starts_with("<div") || lower[i..].starts_with("<tr")
+                || lower[i..].starts_with("</p") || lower[i..].starts_with("</div")
+            {
+                out.push('\n');
+            }
+            for (_, c2) in chars.by_ref() {
+                if c2 == '>' { break; }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+
+    let out = decode_entities(&out);
+
+    // 壓掉空白：連續空行縮成一行，行首行尾去空白
+    let mut lines: Vec<&str> = Vec::new();
+    for line in out.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            if lines.last().map_or(false, |l: &&str| l.is_empty()) { continue; }
+            lines.push("");
+        } else {
+            lines.push(t);
+        }
+    }
+    lines.join("\n").trim().to_string()
+}
+
+/// 這封信有沒有「可以拿去用的東西」——— 決定它進不進驗證碼分頁。
+///
+/// 抽得到碼當然算。抽不到碼但命中關鍵字也算：Netflix 的「暫時存取碼」
+/// 就是這種 —— 碼不在信裡，在信中「取得存取碼」那顆按鈕後面。那封信正是
+/// 這個專案存在的理由，不能因為抽不到數字就對家人隱藏。
+///
+/// ⚠️ **排除字只比對主旨，關鍵字才比對主旨＋內文。** 這個不對稱是刻意的，
+/// 而且是踩過才知道的：
+///
+/// 排除字的用途是「整類信不要」，而那個類別是**主旨**在宣告的
+/// （電子報、促銷、通知）。內文裡的順帶提及不構成排除 —— 實際案例是
+/// 排除字設了「同戶」，而暫時存取碼信的內文正好在解釋規則時寫著
+/// 「此代碼僅限⋯⋯在 Netflix 同戶裝置以外的裝置暫時使用」，
+/// 於是最該顯示的那封信被自己的說明文字擋掉了。
+///
+/// 關鍵字比對內文則沒有這個風險：那是**包含**條件，多命中一封只是多顯示
+/// 一封；排除是**排他**條件，多命中一封就是永遠看不到。
+///
+/// 附帶好處：Worker 不解析 MIME、本來就只看得到主旨，這樣兩邊的排除判斷
+/// 天生一致，不必靠巧合對齊。
+pub fn is_actionable(
+    subject: Option<&str>,
+    body: Option<&str>,
+    has_code: bool,
+    keywords: &[String],
+    excludes: &[String],
+) -> bool {
+    let hits = |pats: &[String], hay: &str| {
+        let hay = hay.to_lowercase();
+        pats.iter()
+            .map(|p| p.trim().to_lowercase())
+            .filter(|p| !p.is_empty())
+            .any(|p| hay.contains(&p))
+    };
+
+    let subject = subject.unwrap_or_default();
+    if hits(excludes, subject) {
+        return false;
+    }
+    has_code || hits(keywords, &format!("{subject} {}", body.unwrap_or_default()))
+}
+
+/// 信件頁尾的樣板連結。這些每封行銷信都有，不是使用者要按的東西。
+///
+/// 比對的是路徑片段而非完整網址 —— 各平台的頁尾長得不一樣，
+/// 但「說明 / 條款 / 隱私 / 退訂」這幾類是通用的。
+const BOILERPLATE: &[&str] = &[
+    "/help", "/support", "/contactus", "/contact", "/legal",
+    "termsofuse", "/terms", "privacypolicy", "/privacy",
+    "unsubscribe", "optout", "/preferences", "/browse",
+];
+
+/// 信裡「要按的那個連結」。
+///
+/// 取第一個非樣板連結：信件的行動呼籲一定排在頁尾之前，而頁尾佔了連結
+/// 數量的大半（實測一封暫時存取碼信有 10 個連結，其中 8 個是頁尾）。
+pub fn primary_link(links: &[String]) -> Option<String> {
+    links
+        .iter()
+        .find(|u| {
+            let low = u.to_lowercase();
+            !BOILERPLATE.iter().any(|b| low.contains(b))
+        })
+        .cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn picks_digits_near_hint() {
+        assert_eq!(extract_code("Your verification code is 4821."), Some("4821".into()));
+        assert_eq!(extract_code("您的驗證碼：123456"), Some("123456".into()));
+    }
+
+    #[test]
+    fn ignores_digits_with_no_hint() {
+        // 沒有提示字眼就不猜
+        assert_eq!(extract_code("Copyright 2026 Netflix, 1234 Main St"), None);
+    }
+
+    #[test]
+    fn ignores_embedded_digits() {
+        // width="1234" 之類不該被當成驗證碼
+        assert_eq!(extract_code("code: <img width=600px> abc1234"), None);
+    }
+
+    fn kw() -> Vec<String> {
+        ["驗證碼", "存取碼", "verification code", "access code"]
+            .iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 抽不到碼但命中關鍵字要算數 —— Netflix 的暫時存取碼就是這種，
+    /// 而那正是這個專案存在的理由那封信。
+    #[test]
+    fn temporary_access_code_counts_even_without_a_number() {
+        assert!(is_actionable(
+            Some("您的 Netflix 暫時存取碼"),
+            Some("我們收到下列裝置的暫時存取碼申請。"),
+            false,
+            &kw(),
+            &[],
+        ));
+    }
+
+    /// 新裝置通知與行銷信不該進驗證碼分頁 —— 對照真實收到的主旨。
+    #[test]
+    fn notifications_and_marketing_are_excluded() {
+        for subject in [
+            "有新裝置正在使用您的帳戶",
+            "《大蟒蛇 4：血路斑駁》即將在9月1日星期二上線",
+            "Grand Theft Auto VI：加長版預覽",
+            "Hyena，這些 Netflix 影片即將上線",
+        ] {
+            assert!(
+                !is_actionable(Some(subject), Some(""), false, &kw(), &[]),
+                "{subject} 不該出現在驗證碼分頁"
+            );
+        }
+    }
+
+    /// 有碼一律算數，不必命中關鍵字 —— 主旨的寫法各平台不一樣。
+    #[test]
+    fn an_extracted_code_is_enough_on_its_own() {
+        assert!(is_actionable(Some("Netflix：您的登入碼"), None, true, &[], &[]));
+    }
+
+    /// 排除字優先於一切，命中主旨就是不要。
+    #[test]
+    fn excludes_beat_everything() {
+        assert!(!is_actionable(
+            Some("您的驗證碼與本月電子報"),
+            None,
+            true,
+            &kw(),
+            &["電子報".into()],
+        ));
+    }
+
+    /// 迴歸：排除字比對內文會把最該顯示的那封信擋掉。
+    ///
+    /// 真實案例 —— 排除字設「同戶」，而暫時存取碼信的內文正好在解釋規則時
+    /// 寫著「在 Netflix 同戶裝置以外的裝置暫時使用」。比對內文的話，
+    /// 這整套系統存在的理由那封信會被自己的說明文字擋掉。
+    #[test]
+    fn excludes_do_not_match_the_body() {
+        let body = "此代碼僅限旅行用或在 Netflix 同戶裝置以外的裝置暫時使用，請勿傳給其他人。";
+        assert!(
+            is_actionable(Some("您的 Netflix 暫時存取碼"), Some(body), false, &kw(), &["同戶".into()]),
+            "內文順帶提到排除字，不該讓整封信消失"
+        );
+        // 主旨真的在宣告這是那類信時才排除
+        assert!(!is_actionable(Some("關於同戶裝置的說明"), Some(body), false, &kw(), &["同戶".into()]));
+    }
+
+    /// 關鍵字仍然比對內文 —— 那是包含條件，多命中只是多顯示一封。
+    #[test]
+    fn keywords_still_match_the_body() {
+        assert!(is_actionable(Some("Netflix"), Some("您的驗證碼是 1234"), false, &kw(), &[]));
+    }
+
+    /// 沒設關鍵字時退回舊行為：只有抽得到碼的才算。
+    #[test]
+    fn empty_keywords_fall_back_to_code_only() {
+        assert!(!is_actionable(Some("您的 Netflix 暫時存取碼"), None, false, &[], &[]));
+        assert!(is_actionable(Some("任何主旨"), None, true, &[], &[]));
+    }
+
+    /// 主要連結要跳過頁尾樣板 —— 實測一封信 10 個連結，8 個是頁尾。
+    #[test]
+    fn primary_link_skips_the_footer() {
+        let links: Vec<String> = [
+            "https://www.netflix.com/account/travel/verify?nftoken=abc",
+            "https://www.netflix.com/ManageAccountAccess?g=1",
+            "https://help.netflix.com/help?g=1",
+            "https://www.netflix.com/TermsOfUse?g=1",
+            "https://www.netflix.com/PrivacyPolicy?g=1",
+            "https://www.netflix.com/browse?g=1",
+        ].iter().map(|s| s.to_string()).collect();
+
+        assert_eq!(
+            primary_link(&links).as_deref(),
+            Some("https://www.netflix.com/account/travel/verify?nftoken=abc")
+        );
+    }
+
+    /// 全部都是樣板時回 None，而不是硬挑一個頁尾連結給人按。
+    #[test]
+    fn primary_link_is_none_when_only_boilerplate() {
+        let links: Vec<String> =
+            ["https://help.netflix.com/help", "https://www.netflix.com/PrivacyPolicy"]
+                .iter().map(|s| s.to_string()).collect();
+        assert_eq!(primary_link(&links), None);
+        assert_eq!(primary_link(&[]), None);
+    }
+
+    #[test]
+    fn strips_html_and_script() {
+        let t = html_to_text("<style>.a{color:red}</style><p>您的驗證碼</p><div>9182</div>");
+        assert!(!t.contains("color"));
+        assert!(t.contains("9182"));
+        assert_eq!(extract_code(&t), Some("9182".into()));
+    }
+
+    /// 純文字段是空殼、驗證碼只在 HTML 裡。
+    #[test]
+    fn finds_code_when_only_html_has_it() {
+        let raw = b"From: Netflix <info@account.netflix.com>\r\n\
+Subject: Netflix\r\n\
+Content-Type: multipart/alternative; boundary=\"b1\"\r\n\
+\r\n\
+--b1\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+\r\n\
+Please use the HTML version\r\n\
+--b1\r\n\
+Content-Type: text/html; charset=utf-8\r\n\
+\r\n\
+<html><body><p>Your verification code is</p><div>4821</div></body></html>\r\n\
+--b1--\r\n";
+        let p = parse(raw);
+        assert_eq!(p.code, Some("4821".into()), "純文字段是空殼時要能從 HTML 抽到碼");
+    }
+
+    // ── 以下三個取自真實信件 ──
+
+    /// 中文整句沒有空格時仍要抽得到碼。
+    #[test]
+    fn handles_cjk_without_spaces() {
+        assert_eq!(extract_code("您的驗證碼：123456，15 分鐘內有效"), Some("123456".into()));
+        assert_eq!(extract_code("驗證碼(482155)"), Some("482155".into()));
+    }
+
+    #[test]
+    fn rejects_uuid_fragment() {
+        // Netflix 通知信尾的追蹤字串，該信無驗證碼，正確答案是 None
+        let t = "請驗證這是您本人。\nSRC: 5F639529_1be6e299-04c0-44eb-8300-9276379289a5_zh-TW_TW";
+        assert_eq!(extract_code(t), None, "UUID 片段不該被當成驗證碼");
+    }
+
+    #[test]
+    fn rejects_year_in_date() {
+        // Disney+ 登入活動通知，同樣沒有驗證碼
+        let t = "為了驗證是否為您本人：\n時間： 2026 年 08 月 09 日 AM12:39\n© 2026 迪士尼";
+        assert_eq!(extract_code(t), None, "日期裡的年份不該被當成驗證碼");
+    }
+
+    #[test]
+    fn decodes_numeric_entities() {
+        // 未解碼的 HTML 實體會產生假候選
+        let t = html_to_text("<p>您的驗證碼</p>&#8199;&#847;&#8199;&#847;<div>4821</div>");
+        assert!(!t.contains("8199"), "數字型實體必須被解碼，否則變成假候選");
+        assert_eq!(extract_code(&t), Some("4821".into()));
+    }
+
+    #[test]
+    fn real_disney_otp_still_works() {
+        let t = "使用這組驗證碼來驗證您的 MyDisney 帳戶。這組驗證碼將在 15 分鐘後失效。\n878688\n";
+        assert_eq!(extract_code(t), Some("878688".into()));
+    }
+
+    #[test]
+    fn extracts_links() {
+        let l = extract_links(r#"go <a href="https://netflix.com/verify?x=1">here</a>"#);
+        assert_eq!(l, vec!["https://netflix.com/verify?x=1"]);
+    }
+
+    // ── 寄件者驗證（網域取自實際日誌）────────────────
+
+    fn allow() -> Vec<String> {
+        vec!["netflix.com".into(), "disneyplus.com".into()]
+    }
+
+    fn auth_of(raw: &str) -> SenderAuth {
+        let (dkim_domains, dmarc_from) = parse_auth_results(raw);
+        SenderAuth { dkim_domains, dmarc_from, envelope_domain: None }
+    }
+
+    #[test]
+    fn trusts_brand_dkim_behind_ses() {
+        // SES 代寄會有兩條簽章，品牌那條要取到
+        let a = auth_of(
+            "mx.cloudflare.net; dkim=pass header.d=amazonses.com header.s=abc; \
+             dkim=pass header.d=netflix.com header.s=s1; \
+             spf=pass smtp.mailfrom=us-west-2.amazonses.com; \
+             dmarc=pass header.from=netflix.com",
+        );
+        assert_eq!(a.dkim_domains, vec!["amazonses.com", "netflix.com"]);
+        assert!(a.is_trusted(&allow()));
+    }
+
+    /// 信封網域內嵌 AWS 區域會隨區域切換而變，不得作為信任依據。
+    #[test]
+    fn survives_ses_region_change() {
+        let a = auth_of(
+            "mx.cloudflare.net; dkim=pass header.d=netflix.com; \
+             spf=pass smtp.mailfrom=eu-west-1.amazonses.com; \
+             dmarc=pass header.from=netflix.com",
+        );
+        assert!(a.is_trusted(&allow()), "換 AWS 區域不該影響判斷");
+    }
+
+    #[test]
+    fn trusts_brand_subdomain() {
+        let a = auth_of("mx.cloudflare.net; dkim=pass header.d=mail2.disneyplus.com; dmarc=pass header.from=disneyplus.com");
+        assert!(a.is_trusted(&allow()));
+    }
+
+    /// 他人的 SES 帳號能通過 SPF/DKIM，但簽不出 d=netflix.com。
+    #[test]
+    fn rejects_attacker_own_ses_account() {
+        let a = auth_of(
+            "mx.cloudflare.net; dkim=pass header.d=amazonses.com; \
+             spf=pass smtp.mailfrom=us-west-2.amazonses.com; dmarc=none",
+        );
+        assert!(!a.is_trusted(&allow()), "共用基礎設施網域不足以構成信任");
+    }
+
+    #[test]
+    fn rejects_failed_dkim() {
+        let a = auth_of("mx.cloudflare.net; dkim=fail header.d=netflix.com; spf=fail; dmarc=fail header.from=netflix.com");
+        assert!(a.dkim_domains.is_empty());
+        assert!(!a.is_trusted(&allow()));
+    }
+
+    /// 不同段的 header.d 與 pass 不得互相湊成通過。
+    #[test]
+    fn does_not_match_across_segments() {
+        let a = auth_of("mx.cloudflare.net; dkim=fail header.d=attacker.com; spf=pass header.d=netflix.com");
+        assert!(a.dkim_domains.is_empty(), "dkim=pass 與 header.d 必須在同一段");
+        assert!(!a.is_trusted(&allow()));
+    }
+
+    #[test]
+    fn rejects_missing_auth_results() {
+        assert!(!auth_of("").is_trusted(&allow()));
+    }
+
+    /// 後綴比對須帶點，netflix.com.evil.com 不得通過。
+    #[test]
+    fn rejects_lookalike_domain() {
+        let a = auth_of("mx.cloudflare.net; dkim=pass header.d=netflix.com.evil.com; dmarc=pass header.from=netflix.com.evil.com");
+        assert!(!a.is_trusted(&allow()));
+    }
+
+    #[test]
+    fn parses_auth_from_real_message() {
+        let raw = b"From: Netflix <info@account.netflix.com>\r\n\
+Authentication-Results: mx.cloudflare.net;\r\n\
+\tdkim=pass header.d=netflix.com header.s=s1;\r\n\
+\tspf=pass smtp.mailfrom=us-west-2.amazonses.com;\r\n\
+\tdmarc=pass header.from=netflix.com\r\n\
+Subject: \xe9\xa9\x97\xe8\xad\x89\xe7\xa2\xbc\r\n\
+\r\n\
+\xe6\x82\xa8\xe7\x9a\x84\xe9\xa9\x97\xe8\xad\x89\xe7\xa2\xbc\xef\xbc\x9a123456\r\n";
+        let p = parse(raw);
+        assert!(p.auth.is_trusted(&allow()), "折行的表頭要能正確解析");
+        assert_eq!(p.auth.envelope_domain.as_deref(), Some("account.netflix.com"));
+        assert_eq!(p.code, Some("123456".into()));
+    }
+
+    /// 解析失敗時沒有表頭可讀，必須落在「未通過」。
+    #[test]
+    fn unparseable_mail_is_not_trusted() {
+        let p = parse(b"\xff\xfe not a real message at all");
+        assert!(!p.auth.is_trusted(&allow()));
+    }
+}

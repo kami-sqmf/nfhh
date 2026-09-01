@@ -1,0 +1,33 @@
+# Rust 建置產物
+app/control/target/
+
+# generated/ —— 全部是機器產生的，內容是本機當下的狀態。
+# 進版控只會讓 git status 永遠是髒的，而且 generated/nft/clients.nft
+# 含家人所在網路的公網 IP，屬個資。
+# 全新 checkout 請先跑 ./nfhh bootstrap 建立佔位版本。
+generated/
+
+# 憑證與 DB 都在專案外（掛載 / docker volume），這幾條是防呆
+*.pem
+*.key
+*.cer
+*.db
+*.db-wal
+*.db-shm
+
+.env
+
+# Cloudflare Workers Logs 匯出檔 —— message 欄位含未遮罩的家人信箱，屬個資
+app/cloudflare/logs-*.json
+
+# Claude Design 的 handoff bundle —— 89 KB 的 HTML 原型，
+# 設計意圖已經落進 docs/ 與程式碼註解，原型本身沒必要進版控
+*-handoff.zip
+
+# 前端相依與建置產物。static/ 由 web/ 產生（vite build），
+# 而 Docker 映像內會重新建置，不需要進版控。
+app/control/web/node_modules/
+app/control/static/
+
+# 部署前的 volume 備份，含帳號、passkey、白名單與信件，屬個資
+backup/

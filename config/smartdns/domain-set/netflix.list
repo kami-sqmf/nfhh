@@ -1,0 +1,10 @@
+# Netflix 控制平面網域（household 判定走這些）
+# platform-name: Netflix
+# platform-color: #E50914
+# 一行一個網域，自動涵蓋所有子網域。不含影片 CDN，見 netflix-cdn.list.disabled。
+netflix.com
+netflix.net
+nflxext.com
+nflximg.net
+nflximg.com
+nflxso.net

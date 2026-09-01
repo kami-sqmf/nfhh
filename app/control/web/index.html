@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>OTT 共享控制台</title>
+<!-- PWA 外殼。iOS 只有「加到主畫面」之後才有 PushManager，
+     所以這幾行不是加分項，是通知能不能存在的前提。 -->
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#2E9E6B">
+<!-- iOS 的主畫面圖示只認這個標籤，manifest 的 icons 它不讀。
+     這顆同時也是通知上顯示的圖 —— iOS 忽略推送酬載裡的 icon。 -->
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<!-- 分頁圖示也用同一顆 —— 沒有這行瀏覽器會去要 /favicon.ico，
+     那個路徑在 SPA fallback 下會拿到 index.html，於是分頁一片空白。 -->
+<link rel="icon" type="image/png" href="/icon-192.png">
+<!-- 中文走系統字體，只外連這兩套。fonts.gstatic.com 要 preconnect
+     才不會在字體請求前多一次 DNS + TLS 往返。 -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+</head>
+<body>
+<div id="app"></div>
+<script type="module" src="/src/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+# Disney+ 影片 CDN —— 預設停用
+#
+# 若控制平面已代理但仍被判定為不同住所才啟用：
+#   mv disneyplus-cdn.list.disabled disneyplus-cdn.list && ./scripts/sync-ip.sh
+#
+# dssott.com 同時承載 API 與影片，啟用等於連影片一起代理。
+
+dssott.com
+dssedge.com

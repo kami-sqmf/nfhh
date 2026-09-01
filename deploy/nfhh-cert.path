@@ -1,0 +1,12 @@
+[Unit]
+Description=Netflix Household — 監看 acme.sh 憑證續期
+Documentation=file:///opt/nfhh/README.md
+
+[Path]
+# 目錄名字面上就含星號（acme.sh 對萬用憑證的命名慣例），不是 glob。
+# 同時監看目錄：續期若是「寫新檔再改名」，針對舊 inode 的 inotify 會漏掉。
+PathChanged=/etc/ssl/*.example.com_ecc/fullchain.cer
+PathChanged=/etc/ssl/*.example.com_ecc/
+
+[Install]
+WantedBy=multi-user.target

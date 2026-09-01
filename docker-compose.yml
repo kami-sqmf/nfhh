@@ -1,0 +1,115 @@
+# Netflix Household
+#
+# smartdns（:53/:853）、sni-proxy（:443）、control（127.0.0.1:8081）。
+# 三者皆 network_mode: host。約束見 docs/DECISIONS.md。
+#
+# 掛載一律遵守 config/ 唯讀、generated/ 由機器寫的分工：
+#   config/    → 你手改的，容器唯讀掛
+#   generated/ → 腳本與控制平面產生的，只有 control 需要可寫
+
+# 專案名寫死，不跟資料夾名走 —— 否則資料夾改名時 compose 會認成新專案。
+name: nfhh
+
+services:
+  smartdns:
+    image: pymumu/smartdns:latest
+    container_name: nfhh-smartdns
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./config/smartdns:/etc/smartdns:ro
+      # ⚠️ 產生的設定必須掛在 /etc/smartdns 之外：那層是唯讀掛載，
+      #    Docker 無法在裡面再建立掛載點，巢狀會啟動失敗。
+      - ./generated/smartdns:/etc/smartdns-gen:ro
+      # acme.sh 的萬用憑證目錄。目錄名字面上就含星號，不是 glob。
+      - "${NFHH_CERT_DIR:-/etc/ssl/*.${NFHH_DOMAIN}_ecc}:/certs:ro"
+      # 主機 CA bundle，供 DoT 上游驗證憑證（映像內沒有）
+      - /etc/ssl/certs:/etc/ssl/certs:ro
+      - smartdns-data:/var/lib/smartdns
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  sni-proxy:
+    image: nginx:alpine
+    container_name: nfhh-sniproxy
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./config/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      # SNI 白名單，由 apply-config.sh 產生。掛目錄而非單檔（產生器會改名，單檔會抓著舊 inode）
+      - ./generated/nginx:/etc/nginx/generated:ro
+    # 預設 fd 上限 1024，不足以支撐 worker_connections 8192
+    ulimits:
+      nofile: { soft: 65535, hard: 65535 }
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # 控制平面：Passkey 管理面板。只綁 127.0.0.1，入口是 Cloudflare Tunnel。
+  control:
+    build: ./app/control
+    container_name: nfhh-control
+    network_mode: host
+    restart: unless-stopped
+    # 操作主機 nftables 用
+    cap_add: [NET_ADMIN]
+    depends_on: [smartdns]
+    environment:
+      # 網域一律由 .env 的 NFHH_DOMAIN 衍生；個別項目仍可在 .env 覆寫。
+      NFHH_RP_ID: "${NFHH_RP_ID:-dnf.${NFHH_DOMAIN}}"   # WebAuthn RP ID，須等於瀏覽器看到的網域
+      NFHH_ORIGIN: "${NFHH_ORIGIN:-https://dnf.${NFHH_DOMAIN}}"
+      NFHH_BIND: 127.0.0.1:8081
+      NFHH_DB: /data/control.db
+      NFHH_CLIENTS_NFT: /nft/clients.nft
+      NFHH_DYNAMIC_CONF: /smartdns/dynamic-ip.conf
+      NFHH_DOT_CONF: /smartdns/dot.conf
+      NFHH_DOT_HOST: "${NFHH_DOT_HOST:-dns.${NFHH_DOMAIN}}"
+      # 額度是每人，不是全域。取代 v6 之前的 NFHH_MAX_ENTRIES ——
+      # 濫用防護改由「每人 4 條 × 成員數」與 admin 的 Email 登記共同構成。
+      NFHH_MAX_PER_USER: "4"
+      NFHH_TTL_DAYS: "7"
+      NFHH_DOMAIN_SET_DIR: /domain-set
+      NFHH_DNS_AUDIT: /smartdns-data/audit.log
+      # Email Worker 推送信件用的共用密鑰，值在 .env。留空則 /api/mail/ingest 停用。
+      NFHH_MAIL_SECRET: "${NFHH_MAIL_SECRET:-}"
+      NFHH_MAIL_KEEP_DAYS: "14"
+      # 註冊流程寄 Email 驗證碼與邀請函用。留空則兩者都停用。
+      NFHH_RESEND_KEY: "${RESEND_API_KEY:-}"
+      NFHH_MAIL_FROM: "${NFHH_MAIL_FROM:-share@${NFHH_DOMAIN}}"
+      # 轉發信箱的網域。「轉發收件人」頁新增信箱時拿它當預設後綴，
+      # 所以它不能只活在前端。只是種子值，之後以面板設定為準。
+      NFHH_MAIL_DOMAIN: "${NFHH_MAIL_DOMAIN:-share.${NFHH_DOMAIN}}"
+      # 邀請函的 Resend 樣板（別名或 id）。樣板要先在 dashboard 發布
+      NFHH_INVITE_TEMPLATE: "${NFHH_INVITE_TEMPLATE:-ott-share-invitation}"
+      # 轉發收件人的驗證狀態查詢，以及登記邀請時建立目的地位址。
+      # 需要帳戶層級的 Email Routing Addresses **讀 + 寫**（只有讀的話
+      # 「重新發送驗證信」與「登記時自動建位址」會失效）。留空則兩者都停用。
+      NFHH_CF_ACCOUNT: "${CF_ACCOUNT_ID:-}"
+      NFHH_CF_TOKEN: "${CF_API_TOKEN:-}"
+    volumes:
+      - control-data:/data
+      - ./generated/nft:/nft             # 需可寫：控制平面會重寫 clients.nft
+      - ./generated/smartdns:/smartdns:ro # 唯讀：只為了讀出目前的 WAN IP
+      # 平台清單的唯一來源。面板讀的跟 smartdns 讀的是同一批檔案，
+      # 所以列出的平台不可能跟實際被代理的網域不一致。
+      - ./config/smartdns/domain-set:/domain-set:ro
+      # smartdns 的查詢稽核檔。唯讀 —— 面板只讀不寫。
+      - smartdns-data:/smartdns-data:ro
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  # ⚠️ volume 名寫死成搬遷前的既有名稱。compose 預設會用「專案名_volume名」，
+  #    改了就會建出全新的空 volume —— 面板的 SQLite（帳號、Passkey、白名單、信件）
+  #    會整組看起來消失。這兩行是為了讓資料夾改名不需要搬 volume。
+  #
+  #    ⚠️ compose 每次都會警告「volume ... was created for project "smartdns"
+  #    (expected "nfhh")」。那是預期的、可以忽略 —— 它只是在說 volume 的
+  #    專案標籤跟現在的專案名不同，掛載本身完全正常。
+  #    改用 external: true 可以消掉警告，但全新安裝就得先手動建 volume，不划算。
+  smartdns-data:
+    name: smartdns_smartdns-data
+  control-data:
+    name: smartdns_control-data

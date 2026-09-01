@@ -1,0 +1,20 @@
+[Unit]
+Description=Netflix Household — nftables 白名單 ACL
+Documentation=file:///opt/nfhh/README.md
+# 必須在 docker 之前就位：容器一起來就綁 :53/:443
+Before=docker.service
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /opt/nfhh/config/nft/nfhh.nft
+# 白名單條目，可能不存在
+ExecStartPost=-/usr/sbin/nft -f /opt/nfhh/generated/nft/clients.nft
+
+# ⚠️ 刻意沒有 ExecStop（會 fail-open，理由見 docs/DECISIONS.md）。
+# 手動移除：sudo nft delete table inet nfhh
+
+[Install]
+WantedBy=multi-user.target

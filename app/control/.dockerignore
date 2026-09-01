@@ -1,0 +1,10 @@
+target/
+.git/
+*.db
+*.db-wal
+*.db-shm
+# 前端相依由 bun 在映像內裝，宿主的 node_modules 不進 build context
+web/node_modules/
+# static/ 是 web/ 的建置產物，映像內會重新產生。
+# 不排除的話宿主的舊產物會蓋掉映像內剛建好的那份。
+static/

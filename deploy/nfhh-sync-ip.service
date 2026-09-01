@@ -1,0 +1,10 @@
+[Unit]
+Description=Netflix Household — 同步出口 IP 到 smartdns 設定
+Documentation=file:///opt/nfhh/README.md
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=nfhh
+ExecStart=/opt/nfhh/scripts/apply-config.sh

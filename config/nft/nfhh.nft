@@ -1,0 +1,53 @@
+#!/usr/sbin/nft -f
+#
+# nfhh.nft — 白名單 ACL。閘門 :53 / :443 / :853，非白名單來源一律 drop。
+#
+# 套用：sudo nft -f config/nft/nfhh.nft   檢視：sudo nft list table inet nfhh
+# 移除：sudo nft delete table inet nfhh
+#
+# ⚠️ 先套這張表，再去路由器開 port forward。
+
+table inet nfhh {
+
+    # 白名單，由控制平面動態增刪，每筆自動過期
+    set clients_v4 {
+        type ipv4_addr
+        flags timeout
+        timeout 7d
+        comment "已授權的其他樓層公網 IPv4"
+    }
+
+    set clients_v6 {
+        type ipv6_addr
+        flags timeout
+        timeout 7d
+        comment "已授權的其他樓層公網 IPv6"
+    }
+
+    # 本層 LAN，靜態放行
+    set lan_v4 {
+        type ipv4_addr
+        flags interval
+        elements = { 192.168.24.0/22 }
+    }
+
+    chain input {
+        type filter hook input priority filter - 10; policy accept;
+
+        # 只攔自己的服務埠，其餘不碰
+        tcp dport { 53, 443, 853 } jump gate
+        udp dport 53 jump gate
+    }
+
+    chain gate {
+        ct state established,related return
+        iifname "lo" return
+        ip saddr @lan_v4 return
+        ip saddr @clients_v4 return
+        ip6 saddr @clients_v6 return
+
+        # 其餘：限速記錄後丟棄
+        limit rate 10/minute burst 5 packets log prefix "nfhh-drop: " level info
+        drop
+    }
+}

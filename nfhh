@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+#
+# nfhh — Netflix Household 的統一操作入口。
+#
+# 日常會用到的東西都在這裡，不必記 docker compose 的參數或 scripts/ 底下的檔名。
+# 每個子命令背後就是 scripts/ 裡的一支腳本或一行 docker compose，
+# 需要時仍可直接呼叫原腳本。
+
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+
+# .env 的網域設定（compose 會自己讀，腳本要自己載）
+[[ -f "$ROOT/.env" ]] && set -a && . "$ROOT/.env" && set +a
+NFHH_DOMAIN="${NFHH_DOMAIN:-example.com}"
+CERT_DIR="${NFHH_CERT_DIR:-/etc/ssl/*.${NFHH_DOMAIN}_ecc}"
+
+usage() {
+    cat <<EOF
+用法: ./nfhh <命令>
+
+  up                啟動三個容器（generated/ 不存在時會先自動 bootstrap）
+  down              停止並移除容器（⚠️ 全家會斷 DNS）
+  restart           重啟三個容器
+  logs [服務]       追蹤日誌。服務可填 smartdns / sni-proxy / control
+  status            一頁看完：容器、埠、白名單、對外 IP、憑證、systemd
+
+  apply             改完 config/smartdns/domain-set/*.list 後跑這個讓變更生效
+  check <來源IP>    列出該來源查過、但沒被平台清單涵蓋的網域
+  cert              重新部署憑證並重啟 smartdns（啟用/更新 DoT，需 sudo）
+  bootstrap         建立 generated/ 底下的佔位設定檔（全新 checkout 用）
+
+白名單一律經面板 https://dnf.${NFHH_DOMAIN} 管理，不要用 nft 手動加 —— 見 README.md。
+EOF
+}
+
+# generated/ 不存在時 compose 會用 root 身分建出空目錄，smartdns 隨即因為
+# conf-file 指向不存在的檔案而起不來。先補上佔位版本擋掉這個第一次啟動的坑。
+ensure_generated() {
+    if [[ ! -f generated/smartdns/platforms.conf ]]; then
+        echo "generated/ 尚未建立，先執行 bootstrap："
+        scripts/bootstrap.sh
+        echo
+    fi
+}
+
+# $1 = 標題, $2 = 值（空字串顯示為破折號）
+# printf 的 %-Ns 是按位元組補的，中文標題會排歪；這裡自己按顯示寬度補空白。
+row() {
+    local label="$1" val="${2:-—}" w=0 i ch
+    for ((i = 0; i < ${#label}; i++)); do
+        ch="${label:i:1}"
+        [[ "$ch" == [[:ascii:]] ]] && w=$((w + 1)) || w=$((w + 2))
+    done
+    printf '  %s%*s%s\n' "$label" $(( w < 20 ? 20 - w : 1 )) "" "$val"
+}
+
+status() {
+    echo "── 容器 ──────────────────────────────────────"
+    docker compose ps --format '  {{.Name}}\t{{.State}}\t{{.Status}}' 2>/dev/null \
+        | column -t -s$'\t' || echo "  （docker compose 讀不到狀態）"
+
+    echo
+    echo "── 監聽埠 ────────────────────────────────────"
+    for spec in "53/udp:DNS (UDP)" "53/tcp:DNS (TCP)" "443/tcp:SNI proxy" \
+                "853/tcp:DoT" "8081/tcp:控制平面"; do
+        port="${spec%%:*}"; label="${spec#*:}"
+        num="${port%%/*}"; proto="${port##*/}"
+        flag=$([[ "$proto" == udp ]] && echo -u || echo -t)
+        if ss -ln "$flag" 2>/dev/null | grep -qE "[:.]${num}\s"; then
+            row "$label" "✅ :$num"
+        else
+            row "$label" "❌ :$num 沒在聽"
+        fi
+    done
+
+    echo
+    echo "── 目前生效的 IP ─────────────────────────────"
+    conf=generated/smartdns/dynamic-ip.conf
+    row "對外 WAN IP" "$(grep -oE '^# WAN_IP = [0-9.]+' "$conf" 2>/dev/null | awk '{print $4}')"
+    row "本機 LAN IP" "$(grep -oE '^# LAN_IP = [0-9.]+' "$conf" 2>/dev/null | awk '{print $4}')"
+    row "已啟用平台"  "$(sed -n 's/^# 平台：//p' "$conf" 2>/dev/null)"
+
+    echo
+    echo "── 白名單（nft 記憶體中的真實狀態）───────────"
+    if out="$(sudo -n nft list set inet nfhh clients_v4 2>/dev/null)"; then
+        ips="$(echo "$out" | sed -n 's/.*elements = {\(.*\)}.*/\1/p')"
+        [[ -z "$ips" ]] && ips="$(echo "$out" | tr -d '\n' | sed -n 's/.*elements = {\(.*\)}.*/\1/p')"
+        if [[ -n "${ips// /}" ]]; then
+            echo "$ips" | tr ',' '\n' | sed 's/^ */  /'
+        else
+            echo "  （空 —— 其他樓層全部連不進來）"
+        fi
+    else
+        echo "  需要 sudo：sudo nft list set inet nfhh clients_v4"
+    fi
+
+    echo
+    echo "── DoT 與憑證 ────────────────────────────────"
+    if grep -q '^bind-tls' generated/smartdns/dot.conf 2>/dev/null; then
+        row "DoT" "✅ 已啟用"
+    else
+        row "DoT" "⛔ 停用中（./nfhh cert 可啟用）"
+    fi
+    for cand in "$CERT_DIR" "/etc/ssl/*.${NFHH_DOMAIN}"; do
+        if end="$(sudo -n openssl x509 -in "$cand/fullchain.cer" -noout -enddate 2>/dev/null)"; then
+            row "憑證有效至" "${end#notAfter=}"
+            break
+        fi
+    done
+
+    echo
+    echo "── systemd ───────────────────────────────────"
+    for u in nfhh-firewall.service nfhh-sync-ip.timer nfhh-cert.path; do
+        row "$u" "$(systemctl is-enabled "$u" 2>/dev/null || echo 未安裝)/$(systemctl is-active "$u" 2>/dev/null || echo -)"
+    done
+}
+
+cmd="${1:-help}"
+[[ $# -gt 0 ]] && shift
+
+case "$cmd" in
+    up)        ensure_generated; docker compose up -d "$@" ;;
+    down)      docker compose down "$@" ;;
+    restart)   docker compose restart "$@" ;;
+    logs)      docker compose logs -f --tail=100 "$@" ;;
+    status)    status ;;
+    apply)     exec scripts/apply-config.sh "$@" ;;
+    check)     exec scripts/find-missing-domains.sh "$@" ;;
+    cert)      exec sudo scripts/sync-cert.sh "$@" ;;
+    bootstrap) exec scripts/bootstrap.sh "$@" ;;
+    help|-h|--help) usage ;;
+    *)         echo "未知命令：$cmd" >&2; echo >&2; usage >&2; exit 1 ;;
+esac

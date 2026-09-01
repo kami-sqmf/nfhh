@@ -1,0 +1,5 @@
+# 診斷用網域
+#
+# ifconfig.me 回傳它看到的來源 IP，用來確認整條鏈路
+
+ifconfig.me
