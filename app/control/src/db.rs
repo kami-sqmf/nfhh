@@ -2033,11 +2033,11 @@ mod tests {
 
         conn.execute_batch(
             "INSERT INTO users (id, username, display_name, role, created_at)
-                 VALUES ('u1', 'kami', 'kami', 'admin', 100);
+                 VALUES ('u1', 'alex', 'alex', 'admin', 100);
              INSERT INTO credentials (id, user_id, passkey, created_at)
                  VALUES ('c1', 'u1', '{}', 100);
              INSERT INTO allowlist (ip, label, added_by, added_at, expires_at)
-                 VALUES ('1.2.3.4', '家裡', 'kami', 100, 999999999999);
+                 VALUES ('1.2.3.4', '家裡', 'alex', 100, 999999999999);
              INSERT INTO mails (message_id, received_at, subject, code)
                  VALUES ('m1', 100, '登入驗證碼', '3849');
              INSERT INTO mail_recipients (mailbox, address, added_at)
@@ -2057,9 +2057,9 @@ mod tests {
         let db = Arc::new(Mutex::new(conn));
 
         let u = get_user(&db, "u1").unwrap().expect("帳號不該消失");
-        assert_eq!(u.username, "kami", "username 是 WebAuthn user handle，不能被改寫");
+        assert_eq!(u.username, "alex", "username 是 WebAuthn user handle，不能被改寫");
         assert_eq!(u.email, None, "舊帳號沒有 email，應為 NULL 而不是空字串");
-        assert_eq!(u.label(), "kami", "還沒補 email 時顯示名退回 username");
+        assert_eq!(u.label(), "alex", "還沒補 email 時顯示名退回 username");
         assert_eq!(credential_count(&db, "u1").unwrap(), 1, "passkey 不該掉");
 
         let entries = list_allow(&db).unwrap();
@@ -2312,7 +2312,7 @@ mod tests {
     fn seeding_never_overwrites_a_configured_value() {
         let db = mem();
         seed_setting(&db, keys::SENDER_MODE, "observe").unwrap();
-        set_setting(&db, keys::SENDER_MODE, "enforce", Some("kami")).unwrap();
+        set_setting(&db, keys::SENDER_MODE, "enforce", Some("alex")).unwrap();
         seed_setting(&db, keys::SENDER_MODE, "observe").unwrap();
         assert_eq!(get_setting(&db, keys::SENDER_MODE).unwrap().as_deref(), Some("enforce"));
     }
@@ -2329,7 +2329,7 @@ mod tests {
     #[test]
     fn platform_grants_follow_the_user() {
         let db = mem();
-        create_user_with_platforms(&db, "u1", "kami", "kami", "admin", Some("KAMI@x.tw"), &[]).unwrap();
+        create_user_with_platforms(&db, "u1", "alex", "alex", "admin", Some("ALEX@x.tw"), &[]).unwrap();
         grant_platform(&db, "u1", "netflix", "admin").unwrap();
         grant_platform(&db, "u1", "disneyplus", "admin").unwrap();
         assert_eq!(platforms_for(&db, "u1").unwrap(), vec!["disneyplus", "netflix"]);
@@ -2345,11 +2345,11 @@ mod tests {
     #[test]
     fn email_lookup_is_case_insensitive() {
         let db = mem();
-        create_user_with_platforms(&db, "u1", "kami", "kami", "admin", Some("  KAMI@Example.COM "), &[]).unwrap();
-        let u = find_user_by_email(&db, "kami@example.com").unwrap().unwrap();
+        create_user_with_platforms(&db, "u1", "alex", "alex", "admin", Some("  ALEX@Example.COM "), &[]).unwrap();
+        let u = find_user_by_email(&db, "alex@example.com").unwrap().unwrap();
         assert_eq!(u.id, "u1");
-        assert_eq!(u.email.as_deref(), Some("kami@example.com"));
-        assert_eq!(u.label(), "kami@example.com", "有 email 就以 email 稱呼");
+        assert_eq!(u.email.as_deref(), Some("alex@example.com"));
+        assert_eq!(u.label(), "alex@example.com", "有 email 就以 email 稱呼");
     }
 
     /// 補填 email 之後，這個人既有的白名單條目不能變成「不是我的」。
@@ -2357,16 +2357,16 @@ mod tests {
     #[test]
     fn backfilling_email_moves_ownership() {
         let db = mem();
-        create_user_with_platforms(&db, "u1", "kami", "kami", "admin", None, &[]).unwrap();
-        upsert_allow(&db, "1.1.1.1", Some("家裡"), Some("kami"), 999, 7).unwrap();
+        create_user_with_platforms(&db, "u1", "alex", "alex", "admin", None, &[]).unwrap();
+        upsert_allow(&db, "1.1.1.1", Some("家裡"), Some("alex"), 999, 7).unwrap();
         upsert_allow(&db, "2.2.2.2", None, Some("someone-else"), 999, 7).unwrap();
-        assert_eq!(allow_count_by(&db, "kami").unwrap(), 1);
+        assert_eq!(allow_count_by(&db, "alex").unwrap(), 1);
 
-        set_user_email(&db, "u1", "kami@example.com").unwrap();
-        assert_eq!(rename_owner(&db, "kami", "kami@example.com").unwrap(), 1);
+        set_user_email(&db, "u1", "alex@example.com").unwrap();
+        assert_eq!(rename_owner(&db, "alex", "alex@example.com").unwrap(), 1);
 
-        assert_eq!(allow_count_by(&db, "kami@example.com").unwrap(), 1);
-        assert_eq!(allow_count_by(&db, "kami").unwrap(), 0);
+        assert_eq!(allow_count_by(&db, "alex@example.com").unwrap(), 1);
+        assert_eq!(allow_count_by(&db, "alex").unwrap(), 0);
         // 別人的條目不能被順手搬走
         assert_eq!(allow_count_by(&db, "someone-else").unwrap(), 1);
     }

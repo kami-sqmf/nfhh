@@ -876,6 +876,28 @@ fn dot_ready(path: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 描述檔識別碼的前綴：把 RP ID 反寫成 reverse-DNS。
+///
+/// iOS 以 `PayloadIdentifier` + UUID 判斷是不是同一份描述檔，所以這個值**必須
+/// 穩定** —— 一變，已安裝的人不會被取代，而是多出第二份描述檔搶 DNS 設定。
+/// 拿 `rp_id` 當來源正是因為它不能事後改（改了所有 passkey 一起作廢），
+/// 跟著它走等於跟著這個部署走，而且不必在程式裡寫死任何人的網域。
+fn profile_prefix(rp_id: &str) -> String {
+    let mut parts: Vec<&str> = rp_id
+        .trim()
+        .split('.')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    parts.reverse();
+    if parts.is_empty() {
+        // rp_id 不該是空的，但識別碼寧可退回一個固定值也不要變成空字串 ——
+        // 空的 PayloadIdentifier 會讓 iOS 直接拒收整份描述檔。
+        return "nfhh".to_string();
+    }
+    format!("{}.nfhh", parts.join(".").to_lowercase())
+}
+
 /// 產生 iOS / iPadOS 的 DNS 描述檔（.mobileconfig）。iOS 沒有可直接填主機名的欄位。
 ///
 /// 刻意不填 ServerAddresses：留空時 iOS 會用網路提供的 DNS 解析 ServerName，
@@ -886,6 +908,7 @@ async fn dns_profile(
 ) -> ApiResult<Response> {
     require_user(&st, &session).await?;
     let host = &st.cfg.dot_host;
+    let prefix = profile_prefix(&st.cfg.rp_id);
 
     // UUID 固定：iOS 以 PayloadIdentifier + UUID 判斷是否為同一份描述檔
     let xml = format!(
@@ -897,7 +920,7 @@ async fn dns_profile(
   <array>
     <dict>
       <key>PayloadType</key><string>com.apple.dnsSettings.managed</string>
-      <key>PayloadIdentifier</key><string>tw.kami.nfhh.dns.payload</string>
+      <key>PayloadIdentifier</key><string>{prefix}.dns.payload</string>
       <key>PayloadUUID</key><string>7f3a1c62-8d54-4b19-9a70-2e5c8f10d3b1</string>
       <key>PayloadVersion</key><integer>1</integer>
       <key>PayloadDisplayName</key><string>加密 DNS（DoT）</string>
@@ -909,7 +932,7 @@ async fn dns_profile(
     </dict>
   </array>
   <key>PayloadType</key><string>Configuration</string>
-  <key>PayloadIdentifier</key><string>tw.kami.nfhh.dns</string>
+  <key>PayloadIdentifier</key><string>{prefix}.dns</string>
   <key>PayloadUUID</key><string>c81e5d04-6b2f-4a87-8c33-9f1d70a4e256</string>
   <key>PayloadVersion</key><integer>1</integer>
   <key>PayloadDisplayName</key><string>OTT Household DNS</string>
@@ -3044,6 +3067,28 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 描述檔識別碼是 reverse-DNS，且不含任何寫死的網域。
+    #[test]
+    fn the_profile_identifier_is_derived_from_the_rp_id() {
+        assert_eq!(profile_prefix("dnf.example.com"), "com.example.dnf.nfhh");
+        assert_eq!(profile_prefix("panel.example.org"), "org.example.panel.nfhh");
+        // 大小寫與多餘的點不該產生第二種識別碼
+        assert_eq!(profile_prefix("DNF.Example.COM"), "com.example.dnf.nfhh");
+        assert_eq!(profile_prefix(".dnf.example.com."), "com.example.dnf.nfhh");
+    }
+
+    /// ⚠️ 識別碼一變，已安裝的人不會被取代而是多一份描述檔，兩份搶 DNS 設定。
+    /// 同一個 rp_id 必須永遠給出同一個值。
+    #[test]
+    fn the_profile_identifier_is_stable_and_never_empty() {
+        let a = profile_prefix("dnf.example.com");
+        assert_eq!(a, profile_prefix("dnf.example.com"));
+        // 空的 PayloadIdentifier 會讓 iOS 拒收整份描述檔
+        assert_eq!(profile_prefix(""), "nfhh");
+        assert_eq!(profile_prefix("..."), "nfhh");
+        assert!(!profile_prefix("localhost").is_empty());
+    }
 
     fn hdrs(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
