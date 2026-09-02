@@ -3374,6 +3374,52 @@ mod tests {
         let _ = start(victim).await.expect("驗證過的那個 session 要能拿到 challenge");
     }
 
+    /// 邀請連結那條路綁定了，驗證碼這條路也要 —— 兩支端點是同一道關卡的
+    /// 兩個入口，只補其中一個等於沒補。
+    #[tokio::test]
+    async fn email_proof_from_a_code_is_bound_to_the_session_too() {
+        let st = test_state();
+        // 同上：面板上先有人，`register_start` 才會走到信箱驗證那一關。
+        db::create_user_with_platforms(&st.db, "admin", "admin@x", "admin@x", "admin", Some("admin@x"), &[]).unwrap();
+        db::invite_email(&st.db, "mei@example.com", "admin", &[]).unwrap();
+        db::put_otp(
+            &st.db,
+            "mei@example.com",
+            &otp::hash(&st.db, "mei@example.com", "482913").unwrap(),
+            otp::TTL_SECS,
+        )
+        .unwrap();
+
+        // 收到碼的人在自己的瀏覽器輸入它
+        let victim = test_session();
+        let out = join_verify(
+            State(st.clone()), victim.clone(), hdrs(&[]),
+            Json(VerifyReq { email: "mei@example.com".into(), code: "482913".into() }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap()
+        .0;
+        assert_eq!(out["ok"], true);
+
+        let start = |s: Session| {
+            let st = st.clone();
+            async move {
+                register_start(
+                    State(st), s, hdrs(&[]),
+                    Json(RegisterStart { email: Some("mei@example.com".into()), bootstrap_token: None, nickname: None }),
+                )
+                .await
+                .map_err(|e| e.0)
+            }
+        };
+
+        // 旁觀者知道信箱、也知道有人剛驗過，但證明不在他的 session 上
+        let err = start(test_session()).await.unwrap_err();
+        assert!(err.to_string().contains("完成信箱驗證"), "拿到的訊息是：{err}");
+        let _ = start(victim).await.expect("輸入驗證碼的那個 session 要能拿到 challenge");
+    }
+
     /// 設定頁的欄位就是前後端的契約。少一個欄位不會有人報錯 ——
     /// 畫面上按得動、存檔回 200、重讀又跳回原樣（`forward_enforce` 真的
     /// 這樣漏過一版）。這條把兩個方向都釘住。
