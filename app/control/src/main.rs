@@ -55,6 +55,7 @@ struct Config {
     mail_secret: String,
     mail_keep_days: i64,
     /// 可信的寄件品牌網域（比對 DKIM 簽章網域，不是信封寄件者）。
+    /// 只是**種子值**，實際以 settings.sender_domains 為準（見 seed_settings／mail_ingest）。
     mail_allowed_senders: Vec<String>,
     /// 未通過驗證時是否真的收掉扇出。預設 false = 觀察期，只記錄不阻擋。
     mail_enforce_sender: bool,
@@ -3530,10 +3531,9 @@ mod tests {
     #[test]
     fn registering_an_invite_creates_the_forwarding_rows() {
         let st = test_state();
-        // 跟 invite_create 同一條路：設定沒種進去時退回 Config 的種子值
-        let domain = db::get_setting(&st.db, db::keys::MAIL_DOMAIN)
-            .unwrap()
-            .unwrap_or_else(|| st.cfg.mail_domain.clone());
+        // seed_settings 在建 state 時就把 MAIL_DOMAIN 種進 DB 了，這裡讀到的
+        // 一定是 Some —— 不必再像「預設網域」欄位那樣退回 Config 的種子值。
+        let domain = db::get_setting(&st.db, db::keys::MAIL_DOMAIN).unwrap().unwrap();
 
         for code in ["netflix", "disneyplus"] {
             db::add_recipient(&st.db, &format!("{code}@{domain}"), "mei@x.tw", None, "admin")
