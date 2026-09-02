@@ -178,3 +178,11 @@ compose 預設用資料夾名當專案名，volume 實際名稱是「專案名_v
 既有名稱（`smartdns_smartdns-data` / `smartdns_control-data`）。
 
 → 別為了「名字一致」把 volume 名改掉，除非你先把資料搬過去。
+
+## domain-set 清單只能放平台自己持有的網域
+
+`config/smartdns/domain-set/<平台>.list` 除了決定哪些網域被改寫到 proxy，現在也是
+「驗證碼卡片替哪些連結畫品牌按鈕」的依據（`platforms::domains`）。放進第三方
+CDN 或分析服務的網域，等於替它們背書。
+
+→ 影片 CDN 之類的請照既有慣例放 `*-cdn.list.disabled`，不要混進主清單。

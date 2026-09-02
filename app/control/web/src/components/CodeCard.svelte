@@ -21,6 +21,10 @@
     : { tone: 'none', text: '無驗證資訊' }
   )
 
+  // 按鈕下方一定露出目的網域：品牌卡片是背書，使用者要看得到背書的是哪裡。
+  // URL.hostname 給的是 punycode，同形字網域不會被畫成本尊。
+  const host = (u) => { try { return new URL(u).hostname } catch { return u } }
+
   async function copy() {
     try {
       await navigator.clipboard.writeText(mail.code)
@@ -64,11 +68,15 @@
       取得存取碼
     </a>
     <p class="mt-2 text-label leading-relaxed text-fg-muted text-pretty">
-      這封信沒有直接附上號碼，要到平台的頁面取得。
+      會開啟 <span class="font-mono">{host(mail.primary_link)}</span>。這封信沒有直接附上號碼，要到平台的頁面取得。
     </p>
   {:else}
     <p class="mt-3 text-body text-fg-faint">
-      這封信沒有可用的號碼或連結，請開原始信件查看。
+      {#if mail.verified !== true}
+        這封信未通過寄件者驗證，連結不會顯示。請開原始信件自行判斷。
+      {:else}
+        這封信沒有可用的號碼或連結，請開原始信件查看。
+      {/if}
     </p>
   {/if}
 

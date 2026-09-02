@@ -92,6 +92,21 @@ fn read_head(path: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// 該平台清單檔裡的網域（跳過註解與空行、一律小寫）。給連結背書用：
+/// 卡片只替落在這些網域下的連結畫品牌按鈕。
+///
+/// ⚠️ 因此清單裡只能放**平台自己持有**的網域（見 DECISIONS.md）。
+pub fn domains(dir: &str, code: &str) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(format!("{dir}/{code}.list")) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.to_lowercase())
+        .collect()
+}
+
 /// 從收件信箱推平台：`netflix@share.example.com` → `netflix`。
 ///
 /// 用信箱而不是 DKIM 簽章網域：信箱是你自己指派的，意圖明確；
@@ -356,5 +371,13 @@ mod tests {
     #[test]
     fn missing_directory_yields_empty_list() {
         assert!(list("/nonexistent/domain-set").is_empty());
+    }
+
+    #[test]
+    fn domains_reads_the_list_skipping_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("netflix.list"), "# platform-name: Netflix\n\nnetflix.com\nNFLXEXT.com\n").unwrap();
+        assert_eq!(domains(dir.path().to_str().unwrap(), "netflix"), vec!["netflix.com", "nflxext.com"]);
+        assert!(domains(dir.path().to_str().unwrap(), "nope").is_empty());
     }
 }

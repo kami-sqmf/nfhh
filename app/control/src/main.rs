@@ -1654,6 +1654,39 @@ impl MailScope {
     }
 }
 
+/// 只有「寄件者通過驗證」且「連結 host 落在該平台網域」才准畫品牌按鈕。
+/// 平台是由收件信箱分類的，跟寄件者是誰無關 —— 沒有這道檢查，任何人寄到
+/// netflix@ 信箱的釣魚連結都會穿上 Netflix 的外衣。
+///
+/// host 交給 `url` crate 判讀（跟瀏覽器同一套 WHATWG 規則：`\\` 當 `/`、
+/// host 小寫、IDN 轉 punycode）；帶帳密的 URL 一律拒絕。
+fn brand_link_allowed(verified: Option<bool>, link: &str, domains: &[String]) -> bool {
+    if verified != Some(true) {
+        return false;
+    }
+    let Ok(u) = url::Url::parse(link) else { return false };
+    if u.scheme() != "https" || !u.username().is_empty() || u.password().is_some() {
+        return false;
+    }
+    let Some(host) = u.host_str() else { return false };
+    domains.iter().any(|d| host == d || host.ends_with(&format!(".{d}")))
+}
+
+/// 對一批摘要套用 `brand_link_allowed`，不合格的把 `primary_link` 拿掉。
+fn strip_unbranded_links(st: &Shared, mails: &mut [db::MailSummary]) {
+    let mut cache: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for m in mails.iter_mut() {
+        let Some(link) = m.primary_link.clone() else { continue };
+        let code = m.platform.clone().unwrap_or_default();
+        let domains = cache
+            .entry(code.clone())
+            .or_insert_with(|| platforms::domains(&st.cfg.domain_set_dir, &code));
+        if !brand_link_allowed(m.verified, &link, domains) {
+            m.primary_link = None;
+        }
+    }
+}
+
 /// 驗證碼分頁的內容。
 ///
 /// 能不能看到一封信由 [`MailScope`] 說了算 —— 平台分權、顯示策略、可用性
@@ -1673,7 +1706,7 @@ async fn mail_list(
     let _ = db::purge_old_mails(&st.db, st.cfg.mail_keep_days);
 
     let scope = MailScope::load(&st, &uid)?;
-    let mails = db::recent_mail_summaries(&st.db, Some(&scope.granted), 60)?
+    let mut mails: Vec<_> = db::recent_mail_summaries(&st.db, Some(&scope.granted), 60)?
         .into_iter()
         .filter(|m| {
             scope.allows(
@@ -1686,6 +1719,7 @@ async fn mail_list(
         })
         .take(30)
         .collect();
+    strip_unbranded_links(&st, &mut mails);
 
     Ok(Json(mails))
 }
@@ -1697,7 +1731,10 @@ async fn mail_inbox(
     session: Session,
 ) -> ApiResult<Json<Vec<db::MailSummary>>> {
     require_admin(&st, &session).await?;
-    Ok(Json(db::recent_mail_summaries(&st.db, None, 60)?))
+    let mut mails = db::recent_mail_summaries(&st.db, None, 60)?;
+    // admin 也不該看到假品牌按鈕 —— 這支是診斷用的，越是要照實呈現
+    strip_unbranded_links(&st, &mut mails);
+    Ok(Json(mails))
 }
 
 /// 全文的唯一出口。授權跟清單、刪除同一個 [`MailScope`] ——
@@ -1709,10 +1746,16 @@ async fn mail_get(
 ) -> ApiResult<Json<db::Mail>> {
     let (uid, _) = require_user(&st, &session).await?;
     let me = db::get_user(&st.db, &uid)?.context("帳號已不存在")?;
-    let m = db::get_mail(&st.db, id)?.context("查無此信件")?;
+    let mut m = db::get_mail(&st.db, id)?.context("查無此信件")?;
     if !me.is_admin() && !MailScope::load(&st, &uid)?.allows_mail(&m) {
         // 不分辨「不存在」與「不是你的」：不給枚舉 id 的人存在性 oracle
         return Err(AppError(anyhow::anyhow!("查無此信件")));
+    }
+    if let Some(link) = m.primary_link.clone() {
+        let domains = platforms::domains(&st.cfg.domain_set_dir, m.platform.as_deref().unwrap_or(""));
+        if !brand_link_allowed(m.verified, &link, &domains) {
+            m.primary_link = None;
+        }
     }
     Ok(Json(m))
 }
@@ -4006,6 +4049,24 @@ mod tests {
             // 盯的就只是那份重寫，生產程式碼改壞了也照樣綠。
             assert_eq!(mode_allows(mode, Some(*verified)), *want, "mode={mode} verified={verified}");
         }
+    }
+
+    /// 卡片替連結畫平台品牌，等於替它背書。host 不在該平台網域清單內、
+    /// 或寄件者根本沒通過驗證，就不能有那顆按鈕。host 的判讀交給 `url` crate ——
+    /// 手寫的 parser 已經被 `\\@` 繞過一次（瀏覽器把 `\\` 當 `/`）。
+    #[test]
+    fn only_verified_links_on_platform_domains_get_the_branded_button() {
+        let nf = vec!["netflix.com".to_string(), "nflxext.com".to_string()];
+        assert!(brand_link_allowed(Some(true), "https://www.netflix.com/account/access", &nf));
+        assert!(brand_link_allowed(Some(true), "https://NETFLIX.com:443/x", &nf));
+        assert!(!brand_link_allowed(Some(false), "https://www.netflix.com/account/access", &nf), "未驗證");
+        assert!(!brand_link_allowed(None, "https://www.netflix.com/x", &nf), "舊信無驗證資訊也不背書");
+        assert!(!brand_link_allowed(Some(true), "https://netflix.com.evil.example/x", &nf));
+        assert!(!brand_link_allowed(Some(true), "https://netflix.com@evil.example/x", &nf), "userinfo");
+        assert!(!brand_link_allowed(Some(true), "https://evil.example\\@netflix.com/x", &nf), "反斜線：瀏覽器的 host 是 evil.example");
+        assert!(!brand_link_allowed(Some(true), "https://evil.example/?u=netflix.com", &nf));
+        assert!(!brand_link_allowed(Some(true), "https://nétflix.com/x", &nf), "IDN 同形字：host 會變 punycode，對不上");
+        assert!(!brand_link_allowed(Some(true), "http://www.netflix.com/x", &nf), "只接受 https");
     }
 
     /// 扇出對每個訂閱開一個 task 且沒有上限：一個 member 先堆幾千筆訂閱，
