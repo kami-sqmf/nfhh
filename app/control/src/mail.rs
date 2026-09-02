@@ -278,8 +278,9 @@ fn decode_entities(s: &str) -> String {
     while let Some(amp) = rest.find('&') {
         out.push_str(&rest[..amp]);
         let tail = &rest[amp..];
-        // 實體最長十來個字元，找太遠代表這個 & 只是普通字元
-        let Some(semi) = tail[..tail.len().min(12)].find(';') else {
+        // 實體最長十來個字元。上限算「字元」不算 byte，才不會切在多位元字元中間
+        let window_end = tail.char_indices().nth(12).map(|(i, _)| i).unwrap_or(tail.len());
+        let Some(semi) = tail[..window_end].find(';') else {
             out.push('&');
             rest = &tail[1..];
             continue;
@@ -318,7 +319,9 @@ fn decode_entities(s: &str) -> String {
 fn html_to_text(html: &str) -> String {
     let mut out = String::with_capacity(html.len() / 2);
     let mut chars = html.char_indices().peekable();
-    let lower = html.to_lowercase();
+    // 只做 ASCII 小寫：byte 長度與字元邊界跟原字串完全相同，下面用原字串的
+    // `i` 去切 `lower` 才安全。要比對的標籤名本來就是 ASCII。
+    let lower = html.to_ascii_lowercase();
 
     while let Some((i, c)) = chars.next() {
         if c == '<' {
@@ -732,5 +735,30 @@ Subject: \xe9\xa9\x97\xe8\xad\x89\xe7\xa2\xbc\r\n\
     fn unparseable_mail_is_not_trusted() {
         let p = parse(b"\xff\xfe not a real message at all");
         assert!(!p.auth.is_trusted(&allow()));
+    }
+
+    /// `İ`（U+0130）小寫化後變成兩個 code point、byte 數改變 —— 以前拿原字串
+    /// 的 byte 位移去切小寫字串，會落在字元中間而 panic。
+    #[test]
+    fn html_with_length_changing_lowercase_does_not_panic() {
+        let t = html_to_text("İ<script>x</script><p>ok</p>");
+        assert!(t.contains("ok"));
+        assert!(!t.contains("x"), "script 內容要整段丟掉");
+    }
+
+    /// 實體視窗以前固定切 12 bytes，第 12 個 byte 落在多位元字元中間就 panic。
+    #[test]
+    fn entity_window_never_splits_a_multibyte_char() {
+        assert_eq!(decode_entities("&a日日日日;"), "&a日日日日;");
+        assert_eq!(decode_entities("&amp;日"), "&日");
+    }
+
+    /// 整個解析器對任意 Unicode 都不得 unwind。
+    #[test]
+    fn parser_survives_hostile_unicode_html() {
+        for s in ["İ<", "<İ>", "&İİİİ;", "<p>İ</p>", "&#x1F600;İ<br", "ﬀ<style>İ</style>ﬀ", "<İ"] {
+            let _ = html_to_text(s);
+            let _ = decode_entities(s);
+        }
     }
 }
