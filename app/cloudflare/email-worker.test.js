@@ -24,6 +24,9 @@ test("4xx 與壞 JSON 是拒收，5xx 是不可用", async () => {
   expect((await classifyResponse(new Response("", { status: 401 }))).kind).toBe("rejected");
   expect((await classifyResponse(new Response("", { status: 422 }))).kind).toBe("rejected");
   expect((await classifyResponse(new Response("not json", { status: 200 }))).kind).toBe("rejected");
+  // 合法 JSON 但不是面板會回的物件：照 ok 走會在轉發前就拋例外，整封信不見
+  expect((await classifyResponse(new Response("null", { status: 200 }))).kind).toBe("rejected");
+  expect((await classifyResponse(new Response("[]", { status: 200 }))).kind).toBe("rejected");
   expect((await classifyResponse(new Response("", { status: 503 }))).kind).toBe("unavailable");
   expect((await classifyResponse(new Response('{"forward_to":[]}', { status: 200 }))).kind).toBe("ok");
 });

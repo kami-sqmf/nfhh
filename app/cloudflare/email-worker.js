@@ -69,7 +69,7 @@ export default {
 /**
  * 推信給面板並分類結果，絕不 throw：
  *   { kind: "ok", panel }            2xx 且 JSON 合法
- *   { kind: "rejected", status }     任何 4xx、或 2xx 但 JSON 壞掉 —— 永久性
+ *   { kind: "rejected", status }     任何 4xx、或 2xx 但 JSON 壞掉／不是物件 —— 永久性
  *   { kind: "unavailable", reason }  5xx、逾時、連不上 —— 暫時性
  *   { kind: "unconfigured" }         沒有 PANEL_ENDPOINT / PANEL_SECRET —— 部署狀態，
  *                                    不是攻擊面（攻擊者改不了 Worker 的環境變數）。
@@ -111,7 +111,14 @@ export async function classifyResponse(res) {
     return { kind: "rejected", status: res.status };
   }
   try {
-    return { kind: "ok", panel: await res.json() };
+    const panel = await res.json();
+    // 合法 JSON 但不是面板會回的物件（null、陣列、代理塞的字串）。照 ok 走的話
+    // decideTargets 讀 panel.forward_to 就會拋，而那是在 try 之外、message.forward()
+    // 之前 —— 整封信轉不出去，正好違反這支存在的理由。當拒收處理。
+    if (panel === null || typeof panel !== "object" || Array.isArray(panel)) {
+      return { kind: "rejected", status: res.status, reason: "bad json" };
+    }
+    return { kind: "ok", panel };
   } catch {
     return { kind: "rejected", status: res.status, reason: "bad json" };
   }
