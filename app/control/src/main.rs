@@ -173,6 +173,33 @@ const S_REG: &str = "reg_state";
 const S_REG_USER: &str = "reg_user";
 const S_AUTH: &str = "auth_state";
 
+/// 信箱＋passkey 登入的目標。跟註冊的 `S_REG_USER` 分開 ——
+/// 共用同一把鍵曾讓「啟動登入」覆寫「註冊目標」，member 的新 Passkey
+/// 就被寫進 admin 的資料列。
+const S_LOGIN_USER: &str = "login_user";
+
+/// 任一認證流程開始時，先把其他流程留下的狀態全部清掉。
+/// 登入與註冊各自是獨立的狀態機，殘留的鍵會讓 finish 讀到另一條流程的目標。
+/// 清不掉就整個請求失敗 —— 帶著殘留狀態繼續，正是這個弱點的成因。
+async fn clear_auth_flows(session: &Session) -> Result<()> {
+    for key in [S_REG, S_REG_USER, S_AUTH, S_LOGIN_USER, S_DISC] {
+        session.remove::<serde_json::Value>(key).await?;
+    }
+    Ok(())
+}
+
+/// 註冊完成前的最後一道不變量：已登入的人只能替**自己**加備援金鑰；
+/// 建立新帳號的流程則不該有人登入著。
+fn check_registration_owner(logged_in: Option<&str>, p: &PendingReg) -> Result<()> {
+    match (logged_in, p.is_new) {
+        (Some(uid), false) if uid == p.user_id => Ok(()),
+        (Some(_), false) => anyhow::bail!("註冊目標與目前登入的帳號不符，請重新開始"),
+        (Some(_), true) => anyhow::bail!("已登入的帳號不能建立新帳號，請先登出"),
+        (None, false) => anyhow::bail!("加註備援 Passkey 需要先登入"),
+        (None, true) => Ok(()),
+    }
+}
+
 async fn current_user(session: &Session) -> Option<(String, String)> {
     let id: Option<String> = session.get(S_USER).await.ok().flatten();
     let name: Option<String> = session.get(S_NAME).await.ok().flatten();
@@ -394,6 +421,7 @@ async fn register_start(
     Json(req): Json<RegisterStart>,
 ) -> ApiResult<Json<CreationChallengeResponse>> {
     let ip = client_ip(&headers);
+    clear_auth_flows(&session).await?;
     let logged_in = current_user(&session).await;
     let email = req.email.as_deref().map(|e| e.trim().to_lowercase());
     let nickname = req.nickname.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
@@ -500,6 +528,9 @@ async fn register_finish(
         .await?
         .context("註冊工作階段已失效，請重新開始")?;
 
+    let logged_in = current_user(&session).await;
+    check_registration_owner(logged_in.as_ref().map(|(id, _)| id.as_str()), &p)?;
+
     // 先驗 WebAuthn，通過了才消耗憑據
     let passkey = st.webauthn.finish_passkey_registration(&cred, &reg_state)?;
 
@@ -550,7 +581,9 @@ async fn register_finish(
         p.nickname.as_deref(),
     )?;
 
-    let _ = session.remove::<PasskeyRegistration>(S_REG).await;
+    // 兩把鍵都清，而且清不掉要報錯：殘留的目標是下一次攻擊的材料
+    session.remove::<PasskeyRegistration>(S_REG).await?;
+    session.remove::<PendingReg>(S_REG_USER).await?;
     db::audit(
         &st.db,
         Some(p.label()),
@@ -591,6 +624,7 @@ async fn login_any_start(
     State(st): State<Shared>,
     session: Session,
 ) -> ApiResult<Json<RequestChallengeResponse>> {
+    clear_auth_flows(&session).await?;
     let (rcr, disc) = st.webauthn.start_discoverable_authentication()?;
     session.insert(S_DISC, &disc).await?;
     Ok(Json(rcr))
@@ -639,6 +673,7 @@ async fn login_start(
     session: Session,
     Json(req): Json<EmailReq>,
 ) -> ApiResult<Json<RequestChallengeResponse>> {
+    clear_auth_flows(&session).await?;
     let ident = req.email.trim().to_lowercase();
     // 先查 email；查不到再退回 username，讓 v6 之前註冊、還沒補信箱的
     // 帳號仍然登得進來。
@@ -659,7 +694,7 @@ async fn login_start(
     session.insert(S_AUTH, &auth_state).await?;
     session
         .insert(
-            S_REG_USER,
+            S_LOGIN_USER,
             &PendingReg {
                 user_id: user.id,
                 username: user.username,
@@ -685,14 +720,15 @@ async fn login_finish(
         .await?
         .context("登入工作階段已失效，請重新開始")?;
     let p: PendingReg = session
-        .get(S_REG_USER)
+        .get(S_LOGIN_USER)
         .await?
         .context("登入工作階段已失效，請重新開始")?;
 
     let result = st.webauthn.finish_passkey_authentication(&cred, &auth_state)?;
     let cred_id = base64_url(result.cred_id().as_ref());
     let _ = db::touch_credential(&st.db, &cred_id);
-    let _ = session.remove::<PasskeyAuthentication>(S_AUTH).await;
+    session.remove::<PasskeyAuthentication>(S_AUTH).await?;
+    session.remove::<PendingReg>(S_LOGIN_USER).await?;
 
     session.insert(S_USER, &p.user_id).await?;
     session.insert(S_NAME, p.label()).await?;
@@ -3473,6 +3509,102 @@ mod tests {
             "錯誤要說得出原因，拿到的是：{}",
             err.0
         );
+    }
+
+    /// 不經 HTTP 層直接餵給 handler 的 session。每個測試自己開一個，
+    /// 跨 session 的攻擊情境就用兩個。
+    fn test_session() -> Session {
+        Session::new(None, Arc::new(MemoryStore::default()), None)
+    }
+
+    /// 這把新 Passkey 要寫給誰，必須跟「誰在這個 session 上」一致。
+    /// 任何一邊對不上，都代表 session 裡的目標被另一條流程改寫過。
+    #[test]
+    fn a_registration_may_only_land_on_the_session_owner() {
+        let mine = PendingReg {
+            user_id: "u1".into(), username: "a@x".into(), email: None, is_new: false,
+            role: "member".into(), bootstrap_token: None, nickname: None,
+        };
+        assert!(check_registration_owner(Some("u1"), &mine).is_ok());
+        assert!(check_registration_owner(Some("u2"), &mine).is_err(), "別人的目標");
+        assert!(check_registration_owner(None, &mine).is_err(), "沒登入卻在加備援金鑰");
+
+        let fresh = PendingReg { is_new: true, ..mine };
+        assert!(check_registration_owner(None, &fresh).is_ok());
+        assert!(check_registration_owner(Some("u1"), &fresh).is_err(), "登入中不能建新帳號");
+    }
+
+    /// 攻擊鏈的第一步是「啟動登入時舊的註冊 challenge 還在」。
+    /// 清除必須在查帳號**之前**發生，查不到帳號也要清。
+    #[tokio::test]
+    async fn starting_a_login_wipes_any_pending_registration() {
+        let st = test_state();
+        let session = test_session();
+        let (_, reg_state) = st
+            .webauthn
+            .start_passkey_registration(Uuid::new_v4(), "a@x", "a@x", None)
+            .unwrap();
+        session.insert(S_REG, &reg_state).await.unwrap();
+        session
+            .insert(S_REG_USER, &PendingReg {
+                user_id: "u1".into(), username: "a@x".into(), email: None, is_new: false,
+                role: "member".into(), bootstrap_token: None, nickname: None,
+            })
+            .await
+            .unwrap();
+
+        let _ = login_start(State(st.clone()), session.clone(), Json(EmailReq { email: "admin@x".into() })).await;
+
+        assert!(session.get::<PasskeyRegistration>(S_REG).await.unwrap().is_none());
+        assert!(session.get::<PendingReg>(S_REG_USER).await.unwrap().is_none());
+    }
+
+    /// 完整重播報告裡的攻擊鏈：member 先開「新增 Passkey」、再對 admin 的 Email
+    /// 啟動登入、最後提交第一步拿到的註冊回應。憑證不得寫進 admin 列。
+    #[tokio::test]
+    async fn a_member_cannot_attach_a_passkey_to_the_admin_via_login_start() {
+        use webauthn_authenticator_rs::{softpasskey::SoftPasskey, WebauthnAuthenticator};
+        let st = test_state();
+        let origin = Url::parse("http://localhost").unwrap();
+        db::create_user_with_platforms(&st.db, "admin", "admin@x", "admin@x", "admin", Some("admin@x"), &[]).unwrap();
+        db::create_user_with_platforms(&st.db, "mem", "mem@x", "mem@x", "member", Some("mem@x"), &[]).unwrap();
+
+        // admin 要先有一把 passkey，login_start 才發得出 challenge
+        let mut admin_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let (ccr, reg) = st.webauthn.start_passkey_registration(Uuid::new_v4(), "admin@x", "admin@x", None).unwrap();
+        let pk = st
+            .webauthn
+            .finish_passkey_registration(&admin_key.do_registration(origin.clone(), ccr).unwrap(), &reg)
+            .unwrap();
+        db::add_credential(&st.db, &base64_url(pk.cred_id().as_ref()), "admin", &serde_json::to_string(&pk).unwrap(), None).unwrap();
+
+        // 攻擊者：已登入的 member
+        let session = test_session();
+        session.insert(S_USER, &"mem".to_string()).await.unwrap();
+        session.insert(S_NAME, &"mem@x".to_string()).await.unwrap();
+        let mut attacker_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+
+        // 1. 新增 Passkey：拿到自己的註冊 challenge
+        let ccr = register_start(
+            State(st.clone()), session.clone(), hdrs(&[]),
+            Json(RegisterStart { email: None, bootstrap_token: None, nickname: None }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap()
+        .0;
+        // 2. 對 admin 的 Email 啟動登入
+        let _ = login_start(State(st.clone()), session.clone(), Json(EmailReq { email: "admin@x".into() }))
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        // 3. 提交第 1 步的註冊回應
+        let cred = attacker_key.do_registration(origin, ccr).unwrap();
+        let res = register_finish(State(st.clone()), session.clone(), hdrs(&[]), Json(cred)).await;
+
+        assert!(res.is_err(), "跨流程的 finish 必須失敗");
+        assert_eq!(db::credentials_for(&st.db, "admin").unwrap().len(), 1, "admin 不得多出憑證");
+        assert!(db::credentials_for(&st.db, "mem").unwrap().is_empty(), "也不該偷偷寫給 member 自己");
     }
 
     /// 白名單的授權對象必須是**那一戶的 IPv4**，不是連線來源。
