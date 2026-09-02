@@ -1702,11 +1702,14 @@ pub fn check_otp(db: &Db, email: &str, code_hash: &str, max_attempts: i64) -> Re
     let Some((stored, expires_at, attempts)) = row else {
         return Ok(OtpCheck::Expired);
     };
-    if attempts >= max_attempts {
-        return Ok(OtpCheck::TooManyAttempts);
-    }
+    // 到期先判，次數後判：反過來的話，燒完次數的那一列會永遠回
+    // `TooManyAttempts`，連 TTL 過了都不會自癒 —— 而呼叫端每次都寫一列
+    // `join_code_locked` 稽核。鎖不該比它鎖住的那組碼活得更久。
     if expires_at <= now() {
         return Ok(OtpCheck::Expired);
+    }
+    if attempts >= max_attempts {
+        return Ok(OtpCheck::TooManyAttempts);
     }
     if stored != code_hash {
         conn.execute(
@@ -2413,6 +2416,32 @@ mod tests {
             check_otp(&db, "mei@example.com", "hash-good", 3).unwrap(),
             OtpCheck::TooManyAttempts
         ));
+    }
+
+    /// 鎖住不等於永久作廢。次數檢查排在到期檢查前面的話，這一列會永遠回
+    /// `TooManyAttempts` —— 而面板每收到一次就寫一列 `join_code_locked`，
+    /// 等於留了一支不需要任何憑據就能無限寫稽核的端點。
+    #[test]
+    fn a_locked_code_expires_like_any_other() {
+        let db = mem();
+        put_otp(&db, "mei@example.com", "hash-good", 600).unwrap();
+        for _ in 0..3 {
+            check_otp(&db, "mei@example.com", "hash-bad", 3).unwrap();
+        }
+        // 時窗內照舊鎖住：這是原本就有的語義，不能因為換順序而消失
+        assert!(matches!(
+            check_otp(&db, "mei@example.com", "hash-good", 3).unwrap(),
+            OtpCheck::TooManyAttempts
+        ));
+
+        db.lock()
+            .unwrap()
+            .execute("UPDATE email_otp SET expires_at = 1", [])
+            .unwrap();
+        assert!(
+            matches!(check_otp(&db, "mei@example.com", "hash-good", 3).unwrap(), OtpCheck::Expired),
+            "過了 TTL 就該跟任何一組碼一樣單純過期，鎖不能比碼活得更久"
+        );
     }
 
     /// 重寄必須讓舊碼當場失效，否則會多開一個可用窗口。

@@ -276,10 +276,14 @@ async fn require_admin(st: &Shared, session: &Session) -> ApiResult<db::User> {
 const MAX_EMAIL_LEN: usize = 254;
 /// 白名單標籤、裝置名稱等可顯示文字的上限。
 const MAX_LABEL_LEN: usize = 128;
-/// 不需要登入的端點（join/start、join/invite、register/start）共用的限流：
-/// 每個來源 IP 每 10 分鐘 10 次、全域 200 次。名字沿用 join，計數是共用的。
+/// 不需要登入的端點（join/start、join/verify、join/invite，以及 register/start
+/// 的未登入分支）共用的限流：每個來源 IP 每 10 分鐘 30 次、全域 200 次。
+/// 名字沿用 join，計數是共用的。
+///
+/// 每 IP 30 次是給「整家人躲在同一個 NAT 後面同時開通」留的空間：寄碼、
+/// 打錯幾次、重寄，一個人就可能用掉五六次。
 const JOIN_LIMIT_WINDOW_SECS: i64 = 600;
-const JOIN_LIMIT_PER_IP: u32 = 10;
+const JOIN_LIMIT_PER_IP: u32 = 30;
 const JOIN_LIMIT_GLOBAL: u32 = 200;
 
 fn valid_email(s: &str) -> bool {
@@ -390,6 +394,7 @@ async fn join_verify(
     Json(req): Json<VerifyReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let ip = client_ip(&headers);
+    throttle_public(&st, ip.as_deref())?;
     let email = req.email.trim().to_lowercase();
     let code = otp::normalize(&req.code);
 
@@ -494,7 +499,6 @@ async fn register_start(
     Json(req): Json<RegisterStart>,
 ) -> ApiResult<Json<CreationChallengeResponse>> {
     let ip = client_ip(&headers);
-    throttle_public(&st, ip.as_deref())?;
     clear_auth_flows(&session).await?;
     let logged_in = current_user(&session).await;
     let email = req.email.as_deref().map(|e| e.trim().to_lowercase());
@@ -517,6 +521,10 @@ async fn register_start(
             nickname: nickname.clone(),
         }
     } else {
+        // 只有這條分支不需要登入。已登入的人加註備援 passkey 不該跟公開
+        // 流量搶同一份額度 —— 上面讀的 session 不碰 DB，這裡仍在任何
+        // DB 存取之前。
+        throttle_public(&st, ip.as_deref())?;
         let email = email.context("需要 Email 位址")?;
         if !valid_email(&email) {
             return Err(AppError(anyhow::anyhow!("請輸入完整的 Email 位址")));
@@ -3772,22 +3780,31 @@ mod tests {
         state_with(Config::from_env().unwrap())
     }
 
-    /// `set_var` 在 edition 2024 是 unsafe 且會干擾並行測試，改設定就直接組 Config。
+    /// 寄信服務**停用**的 state。`cfg.resend_key` 一律忽略 —— 開發機的
+    /// shell 匯出了 NFHH_RESEND_KEY 時，其他測試不該因此換一條路走。
     fn state_with(cfg: Config) -> Shared {
+        state_with_key(cfg, "")
+    }
+
+    /// 寄信服務啟用的 state。未受邀的位址在 `join_not_invited` 就結束，
+    /// 走不到真的要連外的 `send_code` —— 稽核那一列卻已經寫進去了。
+    fn state_with_mailer() -> Shared {
+        state_with_key(Config::from_env().unwrap(), "dummy")
+    }
+
+    /// `set_var` 在 edition 2024 是 unsafe 且會干擾並行測試，改設定就直接組 Config。
+    fn state_with_key(cfg: Config, resend_key: &str) -> Shared {
         let webauthn = WebauthnBuilder::new("localhost", &Url::parse("http://localhost").unwrap())
             .unwrap()
             .build()
             .unwrap();
         let db = db::test_db();
         seed_settings(&db, &cfg);
-        // cfg 等一下就被搬走了，先抄一份：NFHH_RESEND_KEY 預設是空的，
-        // 所以除了刻意設過的測試，寄信服務照舊是停用狀態
-        let cfg_mailer_key = cfg.resend_key.clone();
         Arc::new(AppState {
             db,
             webauthn,
             cfg,
-            mailer: mailer::Mailer::new(cfg_mailer_key, "a@b.c".into(), "tpl".into()),
+            mailer: mailer::Mailer::new(resend_key.into(), "a@b.c".into(), "tpl".into()),
             push: push::Push::new("a@b.c"),
             cf: cloudflare::Cloudflare::new(String::new(), String::new()),
             dns: Arc::new(dnslog::Window::new(DNS_WINDOW_SECS)),
@@ -4005,14 +4022,6 @@ mod tests {
         db.lock().unwrap().query_row("SELECT count(*) FROM audit", [], |r| r.get(0)).unwrap()
     }
 
-    /// 寄信服務啟用的 state。未受邀的位址在 `join_not_invited` 就結束，
-    /// 走不到真的要連外的 `send_code` —— 稽核那一列卻已經寫進去了。
-    fn state_with_mailer() -> Shared {
-        let mut cfg = Config::from_env().unwrap();
-        cfg.resend_key = "dummy".into();
-        state_with(cfg)
-    }
-
     /// 公開的 join/start 每次失敗都寫一列稽核；沒有限流就是一台免費寫入機。
     #[tokio::test]
     async fn join_start_is_rate_limited_per_ip() {
@@ -4028,6 +4037,68 @@ mod tests {
             JOIN_LIMIT_PER_IP as i64,
             "放行的每一次都該寫一列，被限流的那次一列都不能寫"
         );
+    }
+
+    /// join/verify 也是公開端點，而且鎖住的碼每被戳一次就寫一列
+    /// `join_code_locked` —— 不限流的話，一組作廢的碼就是一台寫入機。
+    #[tokio::test]
+    async fn join_verify_is_rate_limited_too() {
+        let st = test_state();
+        // 直接把次數推到上限：驗證碼本身不是這條測試的重點，
+        // 而且用真的猜錯去燒次數會先把限流額度花掉。
+        db::put_otp(&st.db, "x@y.z", "hash-good", 600).unwrap();
+        st.db
+            .lock()
+            .unwrap()
+            .execute(&format!("UPDATE email_otp SET attempts = {}", otp::MAX_ATTEMPTS), [])
+            .unwrap();
+
+        let h = || hdrs(&[("cf-connecting-ip", "203.0.113.11")]);
+        let body = || VerifyReq { email: "x@y.z".into(), code: "123456".into() };
+        let mut last = None;
+        for _ in 0..JOIN_LIMIT_PER_IP {
+            last = Some(
+                join_verify(State(st.clone()), test_session(), h(), Json(body()))
+                    .await
+                    .map_err(|e| e.0)
+                    .unwrap_err(),
+            );
+        }
+        assert!(last.unwrap().to_string().contains("錯誤次數過多"), "前 N 次要真的跑到業務邏輯");
+        let before = audit_rows(&st.db);
+        assert_eq!(before, JOIN_LIMIT_PER_IP as i64, "每一次被鎖都寫一列");
+
+        let err = join_verify(State(st.clone()), test_session(), h(), Json(body()))
+            .await
+            .map_err(|e| e.0)
+            .unwrap_err();
+        assert!(err.to_string().contains("太頻繁"), "{err}");
+        assert_eq!(audit_rows(&st.db), before, "被限流的請求不能再寫稽核");
+    }
+
+    /// 加註備援 passkey 要先登入，額度該留給真正打不開門的人 ——
+    /// 一家人躲在同一個 NAT 後面時，這條路不能被公開流量的額度拖下水。
+    #[tokio::test]
+    async fn adding_a_backup_passkey_while_logged_in_is_not_throttled() {
+        let st = test_state();
+        db::create_user_with_platforms(&st.db, "u1", "a@x.tw", "a@x.tw", "member", Some("a@x.tw"), &[])
+            .unwrap();
+        let h = || hdrs(&[("cf-connecting-ip", "203.0.113.12")]);
+        for i in 0..(JOIN_LIMIT_PER_IP + 5) {
+            let session = test_session();
+            session.insert(S_USER, &"u1".to_string()).await.unwrap();
+            session.insert(S_NAME, &"a@x.tw".to_string()).await.unwrap();
+            let res = register_start(
+                State(st.clone()),
+                session,
+                h(),
+                Json(RegisterStart { email: None, bootstrap_token: None, nickname: None }),
+            )
+            .await;
+            if let Err(e) = res {
+                panic!("第 {} 次就被擋了: {}", i + 1, e.0);
+            }
+        }
     }
 
     /// register/start 與 join/invite 同樣不需要登入、同樣每次失敗寫一列稽核。
