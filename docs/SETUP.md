@@ -118,16 +118,48 @@ cd /opt/nfhh && ./nfhh apply
 `deploy/` 底下的 unit 就是解這個的。
 
 ```bash
-sudo cp /opt/nfhh/deploy/nfhh-*.{service,timer,path} /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now nfhh-firewall.service nfhh-sync-ip.timer
+sudo cp /opt/nfhh/deploy/nfhh-*.{service,timer,path} /etc/systemd/system/ && sudo mkdir -p /etc/systemd/system/docker.service.d && sudo cp /opt/nfhh/deploy/docker.service.d/10-nfhh-firewall.conf /etc/systemd/system/docker.service.d/ && sudo systemctl daemon-reload && sudo systemctl enable --now nfhh-firewall.service nfhh-sync-ip.timer
 ```
 
 | Unit | 作用 |
 |---|---|
 | `nfhh-firewall.service` | 開機載入 nft 規則與白名單。排在 `docker.service` **之前**，確保容器綁 `:53` 時 ACL 已就位 |
+| `docker.service.d/10-nfhh-firewall.conf` | Docker 的 drop-in：`Requires=` 防火牆 unit，且啟動前確認 `inet nfhh` 表存在。防火牆載入失敗時 Docker **不會**啟動 |
 | `nfhh-sync-ip.timer` | 每 5 分鐘檢查出口 IP，變動時重新產生設定並重載 smartdns |
 | `nfhh-sync-ip.service` | 上面 timer 實際執行的工作 |
 | `nfhh-cert.path` | 監看 acme.sh 憑證續期（第 7 步啟用） |
 | `nfhh-cert.service` | 上面 path 觸發的工作 |
+
+> [!WARNING]
+> 這是刻意的 fail-closed：nft 規則載入失敗時整套服務（含管理面板）都不會起來。
+> 用 `systemctl status nfhh-firewall.service` 看原因、修好後
+> `sudo systemctl restart nfhh-firewall.service && sudo systemctl start docker.service`
+> （是 `restart` 不是 `start`：這個 unit 是 `RemainAfterExit=yes` 的 oneshot，
+> 表被刪掉後它仍是 active，`start` 什麼都不會做）。
+
+<details>
+<summary>驗證 drop-in 真的擋得住（維護時段、需要 console 進入方式）</summary>
+
+> [!CAUTION]
+> 這段會停掉 Docker 並刪除正式的 nft 表幾十秒：所有樓層的 DNS／proxy 會斷。
+> 順序是**先停 Docker 再刪表**（刪表瞬間 `:53` 若還開著就是 open resolver）。
+> 整段用 `trap` 包起來，任何一步失敗都會把防火牆與 Docker 帶回來。
+
+```bash
+set +e
+trap 'sudo systemctl restart nfhh-firewall.service; sudo systemctl start docker.service; echo "已復原：$(systemctl is-active nfhh-firewall.service docker.service | tr "\n" " ")"' EXIT
+sudo systemctl daemon-reload
+echo "requires/after: $(systemctl show docker.service -p Requires -p After | grep -c nfhh-firewall)"   # 預期 2
+sudo systemctl stop docker.service
+sudo nft delete table inet nfhh
+sudo systemctl start docker.service; echo "docker: $(systemctl is-active docker.service)"          # 預期 start 報錯、印出 failed 或 inactive
+echo "public listeners: $(sudo ss -ltnp | grep -cE ':53 |:443 |:853 ')"                            # 預期 0
+sudo systemctl restart nfhh-firewall.service && sudo nft list table inet nfhh >/dev/null && sudo systemctl start docker.service
+systemctl is-active docker.service nfhh-firewall.service                                            # 預期兩行 active
+trap - EXIT
+```
+
+</details>
 
 > [!IMPORTANT]
 > unit 檔內的路徑是寫死的 —— **systemd 不吃 `.env`**。專案不在 `/opt/nfhh`、或執行使用者不叫 `nfhh` 時，複製過去後要改 `ExecStart` 與 `User`；`nfhh-cert.path` 監看的憑證目錄同理，見第 7 步。
