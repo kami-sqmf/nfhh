@@ -1195,9 +1195,16 @@ async fn audit_list(
 
 /// ingest 的錯誤要讓 Worker 分得出「拒收」與「面板掛了」：前者不該退回
 /// 未過濾的 FORWARD_MAP，後者才該。一般 `AppError` 一律回 400，分不出來。
+///
+/// 對應到 Worker 的三種處置：
+///   - 5xx（含未啟用）→ 面板不可用，Worker 走 FORWARD_MAP
+///   - 401／422 → 面板拒收，Worker 只轉 FALLBACK_TO
 #[derive(Debug)]
 enum IngestError {
-    /// 密鑰不符或端點未啟用 —— 永久性，Worker 不得 fail-open
+    /// 端點未啟用（`NFHH_MAIL_SECRET` 為空）—— 面板刻意不參與，
+    /// Worker 應照 FORWARD_MAP 轉發
+    Disabled,
+    /// 密鑰不符 —— 永久性，Worker 不得 fail-open
     Unauthorized,
     /// 這封信本身解析不了 —— 永久性，重送也不會變
     Unprocessable(String),
@@ -1208,6 +1215,7 @@ enum IngestError {
 impl IntoResponse for IngestError {
     fn into_response(self) -> Response {
         let (status, msg) = match self {
+            Self::Disabled => (StatusCode::SERVICE_UNAVAILABLE, "信件端點未啟用".to_string()),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "未授權".to_string()),
             Self::Unprocessable(m) => (StatusCode::UNPROCESSABLE_ENTITY, m),
             Self::Internal(e) => {
@@ -1229,7 +1237,7 @@ impl From<anyhow::Error> for IngestError {
 /// 密鑰未設定時相關端點一律停用。
 fn require_mail_secret(st: &Shared, headers: &HeaderMap) -> std::result::Result<(), IngestError> {
     if st.cfg.mail_secret.is_empty() {
-        return Err(IngestError::Unauthorized);
+        return Err(IngestError::Disabled);
     }
     let given = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -1258,8 +1266,9 @@ fn require_mail_secret(st: &Shared, headers: &HeaderMap) -> std::result::Result<
 /// Worker 先推這裡、拿到 `forward_to` 才轉發 —— 篩選器的關鍵字要比對內文，
 /// 而只有這裡解析得到內文。
 ///
-/// ⚠️ 這支掛掉不能讓信轉不出去：Worker 逾時或收到 5xx 會退回 FORWARD_MAP 照送。
-///    但 4xx（401／422）是拒收，Worker 只會轉給 FALLBACK_TO —— 所以拒絕要拒得準。
+/// ⚠️ 這支掛掉不能讓信轉不出去：Worker 逾時或收到 5xx（含未啟用的 503）會退回
+///    FORWARD_MAP 照送。但 401／422 是拒收，Worker 只會轉給 FALLBACK_TO ——
+///    所以拒絕要拒得準。
 async fn mail_ingest(
     State(st): State<Shared>,
     headers: HeaderMap,
@@ -3347,6 +3356,19 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.into_response().status(), StatusCode::UNAUTHORIZED);
+
+        // 密鑰留空是「面板刻意不收信」，不是拒收 —— 回 5xx，Worker 才會照
+        // FORWARD_MAP 轉發，而不是把家人的碼收掉。
+        let mut off = Config::from_env().unwrap();
+        off.mail_secret = String::new();
+        let err = mail_ingest(
+            State(state_with(off)),
+            hdrs(&[("authorization", "Bearer anything")]),
+            eml("x", "y", "e2"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.into_response().status(), StatusCode::SERVICE_UNAVAILABLE);
 
         assert_eq!(
             IngestError::Unprocessable("壞信".into()).into_response().status(),
