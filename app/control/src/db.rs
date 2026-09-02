@@ -1856,10 +1856,14 @@ fn row_to_push(r: &rusqlite::Row) -> rusqlite::Result<PushSub> {
     })
 }
 
-/// 新增或更新一筆訂閱。
+/// 連續失敗這麼多次就不再對它扇出。
+pub const PUSH_MAX_FAILS: i64 = 10;
+
+/// 新增或更新一筆訂閱。回 false = 這個人的裝置數已達 `max_per_user`。
 ///
 /// endpoint 衝突時整筆蓋掉並把 `fail_count` 歸零 —— 那台裝置又活著了。
-/// `user_id` 也一起更新：同一台裝置可能換人登入。
+/// 只有「已經是自己的 endpoint」不佔新配額；接手別人的算新裝置，否則
+/// 配額用「重新登記別人的 endpoint」就繞掉了。整段在同一把鎖內。
 pub fn add_push_sub(
     db: &Db,
     user_id: &str,
@@ -1867,8 +1871,27 @@ pub fn add_push_sub(
     p256dh: &str,
     auth: &str,
     label: Option<&str>,
-) -> Result<()> {
+    max_per_user: i64,
+) -> Result<bool> {
     let conn = db.lock().unwrap();
+    let endpoint = endpoint.trim();
+    let owner: Option<String> = conn
+        .query_row(
+            "SELECT user_id FROM push_subscriptions WHERE endpoint = ?1",
+            params![endpoint],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if owner.as_deref() != Some(user_id) {
+        let n: i64 = conn.query_row(
+            "SELECT count(*) FROM push_subscriptions WHERE user_id = ?1",
+            params![user_id],
+            |r| r.get(0),
+        )?;
+        if n >= max_per_user {
+            return Ok(false);
+        }
+    }
     conn.execute(
         "INSERT INTO push_subscriptions
              (user_id, endpoint, p256dh, auth, label, created_at)
@@ -1876,9 +1899,9 @@ pub fn add_push_sub(
          ON CONFLICT(endpoint) DO UPDATE SET
              user_id = excluded.user_id, p256dh = excluded.p256dh,
              auth = excluded.auth, label = excluded.label, fail_count = 0",
-        params![user_id, endpoint.trim(), p256dh, auth, label, now()],
+        params![user_id, endpoint, p256dh, auth, label, now()],
     )?;
-    Ok(())
+    Ok(true)
 }
 
 pub fn list_push_subs(db: &Db, user_id: &str) -> Result<Vec<PushSub>> {
@@ -1943,20 +1966,24 @@ pub fn delete_push_sub_by_endpoint(db: &Db, endpoint: &str) -> Result<usize> {
 ///
 /// 平台過濾走 `user_platforms`，跟驗證碼分頁同一條規則（見 `mail_list`）——
 /// 分兩份寫遲早會歪。admin 一樣要被授權，沒有特例。
+///
+/// 連續失敗 `PUSH_MAX_FAILS` 次的一併排除：那種 endpoint 只會每次都逾時，
+/// 每封信都替它多等一輪，而且沒有任何辦法自己好起來（真的復活了會在
+/// 重新訂閱時把 `fail_count` 歸零）。
 pub fn push_subs_for_platform(db: &Db, platform: &str) -> Result<Vec<PushSub>> {
     let conn = db.lock().unwrap();
     let mut stmt = conn.prepare(&format!(
         "SELECT {} FROM push_subscriptions s
          JOIN users u ON u.id = s.user_id
          JOIN user_platforms p ON p.user_id = s.user_id
-         WHERE p.platform = ?1 AND u.notify_codes = 1",
+         WHERE p.platform = ?1 AND u.notify_codes = 1 AND s.fail_count < ?2",
         PUSH_COLS
             .split(", ")
             .map(|c| format!("s.{c}"))
             .collect::<Vec<_>>()
             .join(", ")
     ))?;
-    let rows = stmt.query_map(params![platform], row_to_push)?;
+    let rows = stmt.query_map(params![platform, PUSH_MAX_FAILS], row_to_push)?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
@@ -2727,7 +2754,7 @@ mod tests {
 
         // 他名下的每一種資料各放一筆
         add_credential(&db, "cred1", "u1", "passkey-json", Some("iPhone")).unwrap();
-        add_push_sub(&db, "u1", "https://push.example/aaa", "pub", "auth", None).unwrap();
+        assert!(add_push_sub(&db, "u1", "https://push.example/aaa", "pub", "auth", None, 8).unwrap());
         upsert_allow(&db, "1.2.3.4", None, Some("mei@x.tw"), now() + 86400, 7).unwrap();
         add_recipient(&db, "netflix@share.example.com", "mei@x.tw", None, "admin").unwrap();
         invite_email(&db, "mei@x.tw", "admin", &[]).unwrap();
@@ -2840,7 +2867,7 @@ mod tests {
             db, id, &format!("{id}@x.tw"), id, "member", Some(&format!("{id}@x.tw")), &[],
         )
         .unwrap();
-        add_push_sub(db, id, endpoint, "pub", "auth", Some("iPhone")).unwrap();
+        assert!(add_push_sub(db, id, endpoint, "pub", "auth", Some("iPhone"), 8).unwrap());
     }
 
     /// 同一台裝置重新訂閱不該累積第二筆 —— endpoint 是去重鍵。
@@ -2848,7 +2875,7 @@ mod tests {
     fn resubscribing_the_same_device_replaces_the_old_row() {
         let db = mem();
         user_with_push(&db, "u1", "https://push.example/aaa");
-        add_push_sub(&db, "u1", "https://push.example/aaa", "pub2", "auth2", Some("iPad")).unwrap();
+        assert!(add_push_sub(&db, "u1", "https://push.example/aaa", "pub2", "auth2", Some("iPad"), 8).unwrap());
 
         let subs = list_push_subs(&db, "u1").unwrap();
         assert_eq!(subs.len(), 1, "同一個 endpoint 只該有一筆");
@@ -2939,8 +2966,40 @@ mod tests {
         bump_push_fail(&db, id).unwrap();
         assert_eq!(list_push_subs(&db, "u1").unwrap()[0].fail_count, 2);
 
-        add_push_sub(&db, "u1", "https://push.example/aaa", "pub", "auth", None).unwrap();
+        assert!(add_push_sub(&db, "u1", "https://push.example/aaa", "pub", "auth", None, 8).unwrap());
         assert_eq!(list_push_subs(&db, "u1").unwrap()[0].fail_count, 0);
+    }
+    /// 訂閱是「每台裝置一筆」，一個人不可能有幾百台。配額檢查與寫入在同一把鎖內。
+    /// 接手別人的 endpoint 也算新裝置 —— 否則配額用「重新登記別人的 endpoint」就繞掉了。
+    #[test]
+    fn push_subscriptions_are_capped_per_user() {
+        let db = test_db();
+        create_user_with_platforms(&db, "u", "u", "u", "member", None, &[]).unwrap();
+        create_user_with_platforms(&db, "v", "v", "v", "member", None, &[]).unwrap();
+        for i in 0..3 {
+            assert!(add_push_sub(&db, "u", &format!("https://p.example/{i}"), "k", "a", None, 3).unwrap());
+        }
+        assert!(!add_push_sub(&db, "u", "https://p.example/new", "k", "a", None, 3).unwrap(), "第 4 台要拒絕");
+        // 既有、自己的 endpoint 重新訂閱不算新裝置
+        assert!(add_push_sub(&db, "u", "https://p.example/1", "k2", "a2", None, 3).unwrap());
+        // 別人的 endpoint：對 u 來說是新裝置，配額已滿就拒絕，所有權也不會轉移
+        assert!(add_push_sub(&db, "v", "https://p.example/v", "k", "a", None, 3).unwrap());
+        assert!(!add_push_sub(&db, "u", "https://p.example/v", "k", "a", None, 3).unwrap());
+        assert_eq!(list_push_subs(&db, "u").unwrap().len(), 3);
+        assert_eq!(list_push_subs(&db, "v").unwrap().len(), 1);
+    }
+
+    /// 反覆失敗的訂閱不再參與扇出：攻擊者的假 endpoint 只能拖慢一陣子。
+    #[test]
+    fn repeatedly_failing_subscriptions_leave_the_fanout() {
+        let db = test_db();
+        create_user_with_platforms(&db, "u", "u", "u", "member", None, &["netflix".into()]).unwrap();
+        add_push_sub(&db, "u", "https://p.example/1", "k", "a", None, 8).unwrap();
+        let id = list_push_subs(&db, "u").unwrap()[0].id;
+        for _ in 0..PUSH_MAX_FAILS {
+            bump_push_fail(&db, id).unwrap();
+        }
+        assert!(push_subs_for_platform(&db, "netflix").unwrap().is_empty());
     }
 
     /// 推送對象與驗證碼分頁同一條規則：沒有這個平台就收不到通知。
@@ -2962,7 +3021,7 @@ mod tests {
     fn admins_are_not_exempt_from_platform_filtering() {
         let db = mem();
         create_user_with_platforms(&db, "a1", "boss@x.tw", "boss", "admin", Some("boss@x.tw"), &[]).unwrap();
-        add_push_sub(&db, "a1", "https://push.example/aaa", "pub", "auth", None).unwrap();
+        assert!(add_push_sub(&db, "a1", "https://push.example/aaa", "pub", "auth", None, 8).unwrap());
 
         assert!(push_subs_for_platform(&db, "netflix").unwrap().is_empty());
     }

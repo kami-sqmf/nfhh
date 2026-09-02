@@ -1485,6 +1485,14 @@ async fn mail_ingest(
 
 // ── 推送通知 ──────────────────────────────────────────
 
+/// 一個人實際上有幾台裝置。訂閱永久寫入 SQLite，沒有上限就是免費的磁碟。
+const MAX_PUSH_SUBS_PER_USER: i64 = 8;
+const MAX_ENDPOINT_LEN: usize = 2048;
+/// 同時存在的推送 task 數（也就是同時在飛的連線數）。
+const PUSH_FANOUT_CONCURRENCY: usize = 8;
+/// 整批扇出的總 deadline。每個請求各有 10 秒 timeout，但分輪送時會疊加。
+const PUSH_FANOUT_DEADLINE_SECS: u64 = 60;
+
 /// 把新驗證碼推給有這個平台授權的人。
 ///
 /// ⚠️ 絕不能擋在 ingest 的回應路徑上：Worker 只等 5 秒，逾時就退回
@@ -1516,28 +1524,43 @@ async fn push_new_code(st: Shared, platform: String, code: Option<String>) {
 }
 
 /// 送給一組訂閱，順帶清掉已死的。並行送，免得最慢的那台拖住全部。
+///
+/// 並行度有上限，而且限的是**同時存在的 task 數**而不只是同時在飛的連線：
+/// 滿了就先等一個做完再開下一個，幾千筆訂閱不會先變成幾千個 task 排隊。
+/// 整批再套一個 deadline —— 假 endpoint 各自吃滿 10 秒的話，分輪會疊加。
+/// `JoinSet` 隨 `run` 一起被 drop 時會 abort 未完成的 task，逾時之後不會
+/// 留下殘留連線。
 async fn fan_out(st: &Shared, subs: Vec<db::PushSub>, n: &push::Notification) {
-    let mut set = tokio::task::JoinSet::new();
-    for sub in subs {
-        let (st, n) = (st.clone(), n.clone());
-        set.spawn(async move {
-            match st.push.send(&st.db, &sub, &n).await {
-                // 訂閱不存在了，當場清掉 —— 留著只會每次都失敗且無法自癒
-                Ok(false) => {
-                    let _ = db::delete_push_sub_by_endpoint(&st.db, &sub.endpoint);
-                    tracing::info!("訂閱已失效，已移除（user={}）", sub.user_id);
-                }
-                Ok(true) => {
-                    let _ = db::mark_push_ok(&st.db, sub.id);
-                }
-                Err(e) => {
-                    let _ = db::bump_push_fail(&st.db, sub.id);
-                    tracing::warn!("推送失敗（user={}）: {e:#}", sub.user_id);
-                }
+    let run = async {
+        let mut set = tokio::task::JoinSet::new();
+        for sub in subs {
+            if set.len() >= PUSH_FANOUT_CONCURRENCY {
+                set.join_next().await;
             }
-        });
+            let (st, n) = (st.clone(), n.clone());
+            set.spawn(async move {
+                match st.push.send(&st.db, &sub, &n).await {
+                    // 訂閱不存在了，當場清掉 —— 留著只會每次都失敗且無法自癒
+                    Ok(false) => {
+                        let _ = db::delete_push_sub_by_endpoint(&st.db, &sub.endpoint);
+                        tracing::info!("訂閱已失效，已移除（user={}）", sub.user_id);
+                    }
+                    Ok(true) => {
+                        let _ = db::mark_push_ok(&st.db, sub.id);
+                    }
+                    Err(e) => {
+                        let _ = db::bump_push_fail(&st.db, sub.id);
+                        tracing::warn!("推送失敗（user={}）: {e:#}", sub.user_id);
+                    }
+                }
+            });
+        }
+        set.join_all().await;
+    };
+    let deadline = std::time::Duration::from_secs(PUSH_FANOUT_DEADLINE_SECS);
+    if tokio::time::timeout(deadline, run).await.is_err() {
+        tracing::warn!("推送扇出超過 {PUSH_FANOUT_DEADLINE_SECS} 秒，剩餘請求已放棄");
     }
-    set.join_all().await;
 }
 
 /// 這封信要扇出給誰。兩個否決條件，任一成立就不轉給家人。
@@ -2252,22 +2275,28 @@ async fn push_subscribe(
 ) -> ApiResult<Json<serde_json::Value>> {
     let (uid, _) = require_user(&st, &session).await?;
 
-    // endpoint 決定面板往哪裡送 POST。推送服務一律是 https。
-    if !req.endpoint.starts_with("https://") {
-        return Err(AppError(anyhow::anyhow!("推送 endpoint 必須是 https")));
+    // endpoint 決定面板往哪裡送 POST。推送服務一律是 https，而且這個字串
+    // 會永久留在資料庫裡 —— 沒有長度上限就是讓人免費寫磁碟。
+    let endpoint = req.endpoint.trim();
+    if !endpoint.starts_with("https://") || endpoint.len() > MAX_ENDPOINT_LEN {
+        return Err(AppError(anyhow::anyhow!(
+            "推送 endpoint 必須是 https 且不超過 {MAX_ENDPOINT_LEN} 字元"
+        )));
     }
-    if req.p256dh.trim().is_empty() || req.auth.trim().is_empty() {
-        return Err(AppError(anyhow::anyhow!("缺少加密金鑰材料")));
+    // 非空不等於能用：金鑰材料要真的解得開、p256dh 要在曲線上，
+    // 否則存進去的是一筆每次扇出都在送出前就失敗的垃圾。
+    let (p256dh, auth) = (req.p256dh.trim(), req.auth.trim());
+    if !push::valid_keys(p256dh, auth) {
+        return Err(AppError(anyhow::anyhow!("加密金鑰材料格式不正確")));
     }
+    let label = req.label.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    check_label_len(label)?;
 
-    db::add_push_sub(
-        &st.db,
-        &uid,
-        &req.endpoint,
-        req.p256dh.trim(),
-        req.auth.trim(),
-        req.label.as_deref().map(str::trim).filter(|s| !s.is_empty()),
-    )?;
+    if !db::add_push_sub(&st.db, &uid, endpoint, p256dh, auth, label, MAX_PUSH_SUBS_PER_USER)? {
+        return Err(AppError(anyhow::anyhow!(
+            "這個帳號的裝置訂閱已達上限（{MAX_PUSH_SUBS_PER_USER} 台），請先移除不用的"
+        )));
+    }
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -3270,6 +3299,9 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // push::B64 的 encode 要有 Engine 這個 trait 在作用域裡
+    use base64::Engine as _;
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
 
     /// 描述檔識別碼是 reverse-DNS，且不含任何寫死的網域。
     #[test]
@@ -3858,6 +3890,71 @@ mod tests {
             // 盯的就只是那份重寫，生產程式碼改壞了也照樣綠。
             assert_eq!(mode_allows(mode, Some(*verified)), *want, "mode={mode} verified={verified}");
         }
+    }
+
+    /// 扇出對每個訂閱開一個 task 且沒有上限：一個 member 先堆幾千筆訂閱，
+    /// 再寄一封信給自己，就能同時打開幾千條連線。這裡用本機假推送服務量
+    /// 「同時在飛的請求數」。
+    ///
+    /// 假服務只接 TCP、不講 TLS：`push::audience` 只認 https，所以 endpoint
+    /// 必須是 https（http 的會在 `vapid_header` 就失敗，一條連線都不會開，
+    /// 量到的峰值永遠是 0）。要量的是「同時被接受的連線數」，握手則在
+    /// 200ms 後隨 socket 一起斷 —— 那正好就是「慢或惡意的 endpoint」。
+    #[tokio::test]
+    async fn fan_out_never_exceeds_the_concurrency_cap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (i2, p2) = (inflight.clone(), peak.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let (i, p) = (i2.clone(), p2.clone());
+                tokio::spawn(async move {
+                    let n = i.fetch_add(1, Ordering::SeqCst) + 1;
+                    p.fetch_max(n, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    i.fetch_sub(1, Ordering::SeqCst);
+                    drop(sock);
+                });
+            }
+        });
+
+        // 真實可用的金鑰材料：encrypt 要對 p256dh 做 ECDH，隨便塞會在送出前就失敗
+        let ua = p256::SecretKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let p256dh = push::B64.encode(ua.public_key().to_encoded_point(false).as_bytes());
+        let auth = push::B64.encode([7u8; 16]);
+
+        let st = test_state();
+        let subs: Vec<db::PushSub> = (0..20)
+            .map(|i| db::PushSub {
+                id: i, user_id: "u".into(), endpoint: format!("https://{addr}/push"),
+                p256dh: p256dh.clone(), auth: auth.clone(), label: None,
+                created_at: 0, last_ok_at: None, fail_count: 0,
+            })
+            .collect();
+        let n = push::Notification { title: "t".into(), body: "b".into(), tag: "netflix".into(), url: "/".into(), code: None };
+
+        let started = std::time::Instant::now();
+        fan_out(&st, subs, &n).await;
+
+        assert!(peak.load(Ordering::SeqCst) <= PUSH_FANOUT_CONCURRENCY, "峰值 {}", peak.load(Ordering::SeqCst));
+        assert!(started.elapsed() >= std::time::Duration::from_millis(500), "20 筆分 3 輪至少 600ms");
+    }
+
+    /// 金鑰材料要是真的：長度先擋、base64 要解得開、p256dh 要是曲線上的點。
+    #[test]
+    fn push_key_material_must_be_real() {
+        let ua = p256::SecretKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let good = push::B64.encode(ua.public_key().to_encoded_point(false).as_bytes());
+        let auth = push::B64.encode([1u8; 16]);
+        assert!(push::valid_keys(&good, &auth));
+        assert!(!push::valid_keys("not-base64!", "AAAA"));
+        assert!(!push::valid_keys(&push::B64.encode([4u8; 10]), &auth), "長度不對");
+        assert!(!push::valid_keys(&push::B64.encode([4u8; 65]), &auth), "65 bytes 但不在曲線上");
+        assert!(!push::valid_keys(&good, &push::B64.encode([1u8; 8])));
+        assert!(!push::valid_keys(&"A".repeat(4096), &auth), "先擋字串長度，不先解碼");
     }
 
     /// ⚠️ 被移除的成員必須**當場**失去存取，不能等到容器重啟。
