@@ -34,6 +34,12 @@ pub(crate) const B64: base64::engine::general_purpose::GeneralPurpose =
 /// 先擋字串長度（87 與 22 個 base64url 字元，多一點容錯），再解碼，
 /// 最後確認 p256dh 真的是曲線上的點 —— 解不開、長度不對、不在曲線上的
 /// 都不是訂閱，是想塞進資料庫的任意字串。
+///
+/// ⚠️ 長度要**剛好 65**，不能只問 `from_sec1_bytes` 收不收：33 bytes 的
+///    壓縮點它會自己解壓縮，ECDH 因此算得出來、推送服務照樣回 201，但
+///    `encrypt` 是把呼叫端給的那串位元組原封不動放進 RFC 8291 的 key_info，
+///    而瀏覽器那邊用的是自己的未壓縮形式 —— 兩邊的 key_info 不同，
+///    那台裝置一輩子解不開，而且沒有任何一次會回報失敗。
 pub fn valid_keys(p256dh: &str, auth: &str) -> bool {
     if p256dh.len() > 88 || auth.len() > 24 {
         return false;
@@ -41,7 +47,7 @@ pub fn valid_keys(p256dh: &str, auth: &str) -> bool {
     let (Ok(pk), Ok(a)) = (B64.decode(p256dh), B64.decode(auth)) else {
         return false;
     };
-    a.len() == 16 && p256::PublicKey::from_sec1_bytes(&pk).is_ok()
+    a.len() == 16 && pk.len() == 65 && p256::PublicKey::from_sec1_bytes(&pk).is_ok()
 }
 
 /// 要送到裝置上的通知。欄位名對應 service worker 讀的那幾個。

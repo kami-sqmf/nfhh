@@ -1529,13 +1529,21 @@ async fn push_new_code(st: Shared, platform: String, code: Option<String>) {
 /// 滿了就先等一個做完再開下一個，幾千筆訂閱不會先變成幾千個 task 排隊。
 /// 整批再套一個 deadline —— 假 endpoint 各自吃滿 10 秒的話，分輪會疊加。
 /// `JoinSet` 隨 `run` 一起被 drop 時會 abort 未完成的 task，逾時之後不會
-/// 留下殘留連線。
+/// 留下殘留連線。代價是全都是死 endpoint 時（每輪吃滿 10 秒，60 秒只夠
+/// 6 輪）大約第 48 筆之後就送不到了 —— 由 `fail_count` 把那些訂閱逐出
+/// 扇出來收斂，不是靠把 deadline 調大。
+///
+/// task 的結果一定要收：`join_all` 會把 panic 原地重拋，而呼叫端之一是
+/// `renew_active` 那條長命的迴圈 —— 它被 unwind 掉就再也不會續期。
 async fn fan_out(st: &Shared, subs: Vec<db::PushSub>, n: &push::Notification) {
     let run = async {
         let mut set = tokio::task::JoinSet::new();
         for sub in subs {
             if set.len() >= PUSH_FANOUT_CONCURRENCY {
-                set.join_next().await;
+                // 滿了就收掉一個再開下一個
+                if let Some(Err(e)) = set.join_next().await {
+                    tracing::warn!("推送 task 異常結束: {e}");
+                }
             }
             let (st, n) = (st.clone(), n.clone());
             set.spawn(async move {
@@ -1555,7 +1563,11 @@ async fn fan_out(st: &Shared, subs: Vec<db::PushSub>, n: &push::Notification) {
                 }
             });
         }
-        set.join_all().await;
+        while let Some(r) = set.join_next().await {
+            if let Err(e) = r {
+                tracing::warn!("推送 task 異常結束: {e}");
+            }
+        }
     };
     let deadline = std::time::Duration::from_secs(PUSH_FANOUT_DEADLINE_SECS);
     if tokio::time::timeout(deadline, run).await.is_err() {
@@ -3939,8 +3951,10 @@ mod tests {
         let started = std::time::Instant::now();
         fan_out(&st, subs, &n).await;
 
-        assert!(peak.load(Ordering::SeqCst) <= PUSH_FANOUT_CONCURRENCY, "峰值 {}", peak.load(Ordering::SeqCst));
-        assert!(started.elapsed() >= std::time::Duration::from_millis(500), "20 筆分 3 輪至少 600ms");
+        // 剛好等於上限：前 8 筆在碰到閘門之前就都 spawn 出去了，而每條連線
+        // 都被握住 200ms —— 少於 8 表示扇出根本沒真的送，多於 8 表示閘門沒關住
+        assert_eq!(peak.load(Ordering::SeqCst), PUSH_FANOUT_CONCURRENCY, "峰值");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(500), "20 筆分 3 輪，扣掉排程誤差也該有 500ms");
     }
 
     /// 金鑰材料要是真的：長度先擋、base64 要解得開、p256dh 要是曲線上的點。
@@ -3953,6 +3967,7 @@ mod tests {
         assert!(!push::valid_keys("not-base64!", "AAAA"));
         assert!(!push::valid_keys(&push::B64.encode([4u8; 10]), &auth), "長度不對");
         assert!(!push::valid_keys(&push::B64.encode([4u8; 65]), &auth), "65 bytes 但不在曲線上");
+        assert!(!push::valid_keys(&push::B64.encode(ua.public_key().to_encoded_point(true).as_bytes()), &auth), "壓縮點不收");
         assert!(!push::valid_keys(&good, &push::B64.encode([1u8; 8])));
         assert!(!push::valid_keys(&"A".repeat(4096), &auth), "先擋字串長度，不先解碼");
     }

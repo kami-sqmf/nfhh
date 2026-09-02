@@ -1988,19 +1988,23 @@ pub fn push_subs_for_platform(db: &Db, platform: &str) -> Result<Vec<PushSub>> {
 }
 
 /// 某個人所有開著「授權快到期」的訂閱。
+///
+/// 跟 `push_subs_for_platform` 一樣排除連續失敗 `PUSH_MAX_FAILS` 次的。
+/// 這條更禁不起拖：`renew_active` 是逐條白名單 `await` 過去的，一個吃滿
+/// timeout 的死 endpoint 會擋住後面所有條目的續期。
 pub fn push_subs_for_expiry(db: &Db, user_id: &str) -> Result<Vec<PushSub>> {
     let conn = db.lock().unwrap();
     let mut stmt = conn.prepare(&format!(
         "SELECT {} FROM push_subscriptions s
          JOIN users u ON u.id = s.user_id
-         WHERE s.user_id = ?1 AND u.notify_expiry = 1",
+         WHERE s.user_id = ?1 AND u.notify_expiry = 1 AND s.fail_count < ?2",
         PUSH_COLS
             .split(", ")
             .map(|c| format!("s.{c}"))
             .collect::<Vec<_>>()
             .join(", ")
     ))?;
-    let rows = stmt.query_map(params![user_id], row_to_push)?;
+    let rows = stmt.query_map(params![user_id, PUSH_MAX_FAILS], row_to_push)?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
@@ -2969,6 +2973,7 @@ mod tests {
         assert!(add_push_sub(&db, "u1", "https://push.example/aaa", "pub", "auth", None, 8).unwrap());
         assert_eq!(list_push_subs(&db, "u1").unwrap()[0].fail_count, 0);
     }
+
     /// 訂閱是「每台裝置一筆」，一個人不可能有幾百台。配額檢查與寫入在同一把鎖內。
     /// 接手別人的 endpoint 也算新裝置 —— 否則配額用「重新登記別人的 endpoint」就繞掉了。
     #[test]
@@ -2990,16 +2995,25 @@ mod tests {
     }
 
     /// 反覆失敗的訂閱不再參與扇出：攻擊者的假 endpoint 只能拖慢一陣子。
+    ///
+    /// 兩條查詢都要排除。到期提醒那條尤其禁不起拖 —— 它是 `renew_active`
+    /// 逐條白名單 await 過去的，死 endpoint 會擋住後面條目的續期。
     #[test]
     fn repeatedly_failing_subscriptions_leave_the_fanout() {
         let db = test_db();
         create_user_with_platforms(&db, "u", "u", "u", "member", None, &["netflix".into()]).unwrap();
         add_push_sub(&db, "u", "https://p.example/1", "k", "a", None, 8).unwrap();
+        // 「授權快到期」預設關著，先開起來，才看得出後面是 fail_count 擋掉的
+        set_notify_prefs(&db, "u", true, true).unwrap();
         let id = list_push_subs(&db, "u").unwrap()[0].id;
+        assert_eq!(push_subs_for_platform(&db, "netflix").unwrap().len(), 1);
+        assert_eq!(push_subs_for_expiry(&db, "u").unwrap().len(), 1);
+
         for _ in 0..PUSH_MAX_FAILS {
             bump_push_fail(&db, id).unwrap();
         }
         assert!(push_subs_for_platform(&db, "netflix").unwrap().is_empty());
+        assert!(push_subs_for_expiry(&db, "u").unwrap().is_empty(), "到期提醒也要排除");
     }
 
     /// 推送對象與驗證碼分頁同一條規則：沒有這個平台就收不到通知。
