@@ -4,7 +4,7 @@
 #
 # 用法：dev/shoot.sh <url> '<steps json>'    環境變數：MOCK（預設 dev/mock.js）、OUT（預設 /tmp/shots）
 set -euo pipefail
-here="$(cd "$(dirname "$0")" && pwd)"
+here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 
 # 釘 digest 而不是 tag：浮動 tag 的內容會變。這個值是本機 `docker image inspect`
 # 對 zenika/alpine-chrome 印出的 RepoDigest；要升級就重新 pull、inspect、換掉這行。
@@ -12,13 +12,20 @@ IMAGE='zenika/alpine-chrome@sha256:47da877e5622528039625218d15d7e1ccae4e426c6cc7
 OUT="${OUT:-/tmp/shots}"
 mkdir -p "$OUT"
 
-trap 'docker rm -f nfhh-shot >/dev/null 2>&1 || true' EXIT
+if docker inspect nfhh-shot >/dev/null 2>&1; then
+  echo "另一個 shoot.sh 還在跑（容器 nfhh-shot 存在）" >&2
+  exit 1
+fi
+
+started=
+trap '[[ -n "${started:-}" ]] && docker rm -f nfhh-shot >/dev/null 2>&1 || true' EXIT
 docker run -d --rm --name nfhh-shot \
   -p 127.0.0.1:9333:9333 \
+  --security-opt no-new-privileges --cap-drop ALL \
   --entrypoint chromium-browser "$IMAGE" \
   --headless --no-sandbox --disable-gpu --hide-scrollbars \
   --remote-debugging-port=9333 --remote-debugging-address=0.0.0.0 \
-  --disable-dev-shm-usage about:blank >/dev/null
+  --disable-dev-shm-usage about:blank >/dev/null && started=1
 
 # 映像預設以 chrome 使用者執行；萬一哪天不是，寧可中止
 uid="$(docker exec nfhh-shot id -u)"
@@ -28,5 +35,6 @@ for _ in $(seq 1 50); do
   curl -fs http://127.0.0.1:9333/json/version >/dev/null 2>&1 && break
   sleep 0.2
 done
+curl -fs http://127.0.0.1:9333/json/version >/dev/null || { echo "CDP 10 秒內沒起來，看 docker logs nfhh-shot" >&2; exit 1; }
 
 MOCK="${MOCK:-$here/mock.js}" OUT="$OUT" bun "$here/shoot.js" "$@"
