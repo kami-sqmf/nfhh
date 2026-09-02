@@ -1323,12 +1323,10 @@ async fn mail_ingest(
     // 通知裡放的是碼本身，所以跟的是**面板顯示**那條規則
     // （`sender_verify_mode`），不是轉發那條 —— 兩者會分岔，跟錯邊就是
     // 「通知有碼、點進面板什麼都沒有」。重送的信不推。
-    let visible = db::get_setting(&st.db, db::keys::SENDER_MODE)?
-        .unwrap_or_else(|| "observe".into())
-        != "enforce"
-        || verified;
+    let mode = db::get_setting(&st.db, db::keys::SENDER_MODE)?
+        .unwrap_or_else(|| "observe".into());
 
-    if is_new && actionable && visible {
+    if is_new && actionable && mode_allows(&mode, Some(verified)) {
         if let Some(pf) = platform.clone() {
             // 背景送，不擋回應。Worker 正在等 forward_to。
             tokio::spawn(push_new_code(st.clone(), pf, p.code.clone()));
@@ -1486,12 +1484,9 @@ impl MailScope {
 
 /// 驗證碼分頁的內容。
 ///
-/// 兩層過濾，順序不能顛倒：
-///   1. **平台分權** —— 沒有這個平台的人看不到它的驗證碼。認不出平台的信
-///      （`platform` 為 None）誰都看不到，只留在管理收件匣。
-///   2. **可用性** —— 有碼、或命中「驗證碼篩選器」的關鍵字。
-///   3. **顯示策略** —— 由 `sender_verify_mode` 決定未通過寄件者驗證的信
-///      要不要出現在這裡（見 db::keys::SENDER_MODE 的說明）。
+/// 能不能看到一封信由 [`MailScope`] 說了算 —— 平台分權、顯示策略、可用性
+/// 三個條件都寫在那裡，清單與刪除共用同一份。這支只負責取最近的信、
+/// 套上那條規則、截成一頁。
 ///
 /// admin 想看全部要去管理的收件匣，那支端點是另一條路徑。
 async fn mail_list(State(st): State<Shared>, session: Session) -> ApiResult<Json<Vec<db::Mail>>> {
@@ -3319,7 +3314,17 @@ mod tests {
             }
         }
         assert_eq!(deleted, 1, "只有清單看得到的那封能刪");
-        assert_eq!(db::recent_mails(&st.db, 10).unwrap().len(), 3);
+
+        // 只數數量的話，規則整個反過來也會通過 —— 得指認活下來的是哪三封。
+        let left = db::recent_mails(&st.db, 10).unwrap();
+        assert_eq!(left.len(), 3);
+        assert!(
+            left.iter().all(|m| m.code.as_deref() != Some("123456")),
+            "被刪的必須是 netflix 那封驗證碼信"
+        );
+        let mut subjects: Vec<&str> = left.iter().filter_map(|m| m.subject.as_deref()).collect();
+        subjects.sort_unstable();
+        assert_eq!(subjects, ["code", "diag", "新片上架"], "留下的是清單看不到的那三封");
     }
 
     /// 邀請連結兌換之後，接上的是跟驗證碼**完全一樣**的那道關卡 ——
@@ -3615,8 +3620,9 @@ mod tests {
             ("enforce", true, true),
         ];
         for (mode, verified, want) in cases {
-            let visible = *mode != "enforce" || *verified;
-            assert_eq!(visible, *want, "mode={mode} verified={verified}");
+            // 打的是 mail_ingest 真正用的那支判斷式。在測試裡重寫一遍規則，
+            // 盯的就只是那份重寫，生產程式碼改壞了也照樣綠。
+            assert_eq!(mode_allows(mode, Some(*verified)), *want, "mode={mode} verified={verified}");
         }
     }
 

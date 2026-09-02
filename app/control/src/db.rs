@@ -1230,6 +1230,8 @@ pub fn update_mail_code(db: &Db, id: i64, code: Option<&str>) -> Result<()> {
 /// 讀出、判斷、刪除都在同一把鎖內：判斷用的是刪除當下那一列，不會被中間
 /// 插進來的寫入改變。`pred` 回 false 與列不存在都回 0 —— 不給枚舉 id 的人
 /// 一個存在性 oracle。
+///
+/// `pred` 在鎖內執行，不可再碰 `db` —— 這把鎖不可重入，碰了就是整個行程卡死。
 pub fn delete_mail_if(db: &Db, id: i64, pred: impl Fn(&Mail) -> bool) -> Result<usize> {
     let conn = db.lock().unwrap();
     let row = conn
