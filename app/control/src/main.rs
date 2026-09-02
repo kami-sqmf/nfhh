@@ -1193,11 +1193,43 @@ async fn audit_list(
 
 // ── 驗證碼信件 ────────────────────────────────────────
 
+/// ingest 的錯誤要讓 Worker 分得出「拒收」與「面板掛了」：前者不該退回
+/// 未過濾的 FORWARD_MAP，後者才該。一般 `AppError` 一律回 400，分不出來。
+#[derive(Debug)]
+enum IngestError {
+    /// 密鑰不符或端點未啟用 —— 永久性，Worker 不得 fail-open
+    Unauthorized,
+    /// 這封信本身解析不了 —— 永久性，重送也不會變
+    Unprocessable(String),
+    /// 面板自己的問題（DB 等）—— 暫時性，Worker 可走退路
+    Internal(anyhow::Error),
+}
+
+impl IntoResponse for IngestError {
+    fn into_response(self) -> Response {
+        let (status, msg) = match self {
+            Self::Unauthorized => (StatusCode::UNAUTHORIZED, "未授權".to_string()),
+            Self::Unprocessable(m) => (StatusCode::UNPROCESSABLE_ENTITY, m),
+            Self::Internal(e) => {
+                tracing::error!("ingest 失敗: {e:#}");
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            }
+        };
+        (status, Json(serde_json::json!({ "error": msg }))).into_response()
+    }
+}
+
+impl From<anyhow::Error> for IngestError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Internal(e)
+    }
+}
+
 /// Worker 用的共用密鑰認證（機器對機器，Worker 做不了 WebAuthn）。
 /// 密鑰未設定時相關端點一律停用。
-fn require_mail_secret(st: &Shared, headers: &HeaderMap) -> ApiResult<()> {
+fn require_mail_secret(st: &Shared, headers: &HeaderMap) -> std::result::Result<(), IngestError> {
     if st.cfg.mail_secret.is_empty() {
-        return Err(AppError(anyhow::anyhow!("信件端點未啟用")));
+        return Err(IngestError::Unauthorized);
     }
     let given = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -1216,7 +1248,7 @@ fn require_mail_secret(st: &Shared, headers: &HeaderMap) -> ApiResult<()> {
             == 0;
     if !ok {
         tracing::warn!("共用密鑰不符，已拒絕");
-        return Err(AppError(anyhow::anyhow!("未授權")));
+        return Err(IngestError::Unauthorized);
     }
     Ok(())
 }
@@ -1226,15 +1258,20 @@ fn require_mail_secret(st: &Shared, headers: &HeaderMap) -> ApiResult<()> {
 /// Worker 先推這裡、拿到 `forward_to` 才轉發 —— 篩選器的關鍵字要比對內文，
 /// 而只有這裡解析得到內文。
 ///
-/// ⚠️ 這支掛掉不能讓信轉不出去：Worker 逾時或收到非 2xx 會退回 FORWARD_MAP 照送。
+/// ⚠️ 這支掛掉不能讓信轉不出去：Worker 逾時或收到 5xx 會退回 FORWARD_MAP 照送。
+///    但 4xx（401／422）是拒收，Worker 只會轉給 FALLBACK_TO —— 所以拒絕要拒得準。
 async fn mail_ingest(
     State(st): State<Shared>,
     headers: HeaderMap,
     body: axum::body::Bytes,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> std::result::Result<Json<serde_json::Value>, IngestError> {
     require_mail_secret(&st, &headers)?;
 
-    let p = mail::parse(&body, &st.cfg.mail_authserv_id);
+    // 任務 6 已修掉已知的 panic；這層是防線：解析器再出問題也只影響這封信，
+    // 而且回的是 422，Worker 會當「拒收」而不是「面板掛了」。
+    let authserv = st.cfg.mail_authserv_id.clone();
+    let p = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mail::parse(&body, &authserv)))
+        .map_err(|_| IngestError::Unprocessable("信件解析失敗".into()))?;
     // 以面板設定為準：環境變數只是首次啟動的種子（見 seed_settings）。
     // 以前這裡讀 Config，UI 撤銷的網域會一直被信任到下次重啟。
     let verified = p.auth.is_trusted(&db::get_setting_list(&st.db, db::keys::SENDER_DOMAINS));
@@ -3257,10 +3294,8 @@ mod tests {
                 ("authorization", "Bearer s3cret"),
                 ("x-nfhh-mailbox", "netflix@share.example.com"),
             ]);
-            // AppError 沒有 Debug，剝一層再 unwrap
             let out = mail_ingest(State(st.clone()), h, eml(subject, body, id))
                 .await
-                .map_err(|e| e.0)
                 .unwrap()
                 .0;
 
@@ -3293,12 +3328,34 @@ mod tests {
         ]);
         let out = mail_ingest(State(st.clone()), h, eml("關於同戶裝置", "說明。", "x1"))
             .await
-            .map_err(|e| e.0)
             .unwrap()
             .0;
 
         assert_eq!(out["actionable"], false);
         assert_eq!(db::recent_mails(&st.db, 60).unwrap().len(), 1, "信要留在管理收件匣");
+    }
+
+    /// Worker 要分得出「拒收」與「面板掛了」。以前兩者都是 400，Worker 只能
+    /// 一律走 fail-open 的 FORWARD_MAP，拒收的信反而被無過濾轉發。
+    #[tokio::test]
+    async fn ingest_errors_carry_a_status_the_worker_can_classify() {
+        let mut cfg = Config::from_env().unwrap();
+        cfg.mail_secret = "s3cret".into();
+        let st = state_with(cfg);
+
+        let err = mail_ingest(State(st), hdrs(&[("authorization", "Bearer nope")]), eml("x", "y", "e1"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.into_response().status(), StatusCode::UNAUTHORIZED);
+
+        assert_eq!(
+            IngestError::Unprocessable("壞信".into()).into_response().status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            IngestError::Internal(anyhow::anyhow!("db")).into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     /// 管理介面存的是 DB，ingest 以前讀的是啟動時的環境變數 —— 兩個權威來源。
@@ -3312,7 +3369,7 @@ mod tests {
         let ingest = |id: &'static str| {
             let st = st.clone();
             async move {
-                mail_ingest(State(st), h(), eml("code", "code 123456", id)).await.map_err(|e| e.0).unwrap().0
+                mail_ingest(State(st), h(), eml("code", "code 123456", id)).await.unwrap().0
             }
         };
 
