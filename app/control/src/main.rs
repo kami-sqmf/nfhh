@@ -181,6 +181,9 @@ const S_LOGIN_USER: &str = "login_user";
 /// 任一認證流程開始時，先把其他流程留下的狀態全部清掉。
 /// 登入與註冊各自是獨立的狀態機，殘留的鍵會讓 finish 讀到另一條流程的目標。
 /// 清不掉就整個請求失敗 —— 帶著殘留狀態繼續，正是這個弱點的成因。
+/// 刻意不清的是 `S_USER`／`S_NAME`（登入身分，加備援金鑰本來就要登入著）
+/// 與 `S_EMAIL_PROOF`（信箱證明，`register_start` 在清除之後才讀它）——
+/// 別把它們加進這個迴圈。
 async fn clear_auth_flows(session: &Session) -> Result<()> {
     for key in [S_REG, S_REG_USER, S_AUTH, S_LOGIN_USER, S_DISC] {
         session.remove::<serde_json::Value>(key).await?;
@@ -659,7 +662,7 @@ async fn login_any_finish(
 
     let cred_id = base64_url(result.cred_id().as_ref());
     let _ = db::touch_credential(&st.db, &cred_id);
-    let _ = session.remove::<DiscoverableAuthentication>(S_DISC).await;
+    session.remove::<DiscoverableAuthentication>(S_DISC).await?;
 
     let label = user.label().to_string();
     session.insert(S_USER, &user.id).await?;
@@ -3602,9 +3605,116 @@ mod tests {
         let cred = attacker_key.do_registration(origin, ccr).unwrap();
         let res = register_finish(State(st.clone()), session.clone(), hdrs(&[]), Json(cred)).await;
 
-        assert!(res.is_err(), "跨流程的 finish 必須失敗");
+        let err = res.expect_err("跨流程的 finish 必須失敗");
+        // 釘住失敗的**原因**：註冊狀態被 login_start 清掉了。
+        // 只驗 is_err() 的話，任何不相干的壞掉都能讓這個測試假裝通過。
+        assert!(err.0.to_string().contains("已失效"), "拿到的是：{}", err.0);
         assert_eq!(db::credentials_for(&st.db, "admin").unwrap().len(), 1, "admin 不得多出憑證");
         assert!(db::credentials_for(&st.db, "mem").unwrap().is_empty(), "也不該偷偷寫給 member 自己");
+    }
+
+    /// 上面那條攻擊鏈其實停在 `clear_auth_flows`，走不到 owner 檢查。
+    /// 這裡直接餵它該擋的情境：`register_start` 之後 session 的身分被換掉，
+    /// 而註冊狀態原封不動 —— 沒有這道檢查，憑證就會寫給換上來的那個人。
+    #[tokio::test]
+    async fn a_registration_is_refused_when_the_session_identity_changed() {
+        use webauthn_authenticator_rs::{softpasskey::SoftPasskey, WebauthnAuthenticator};
+        let st = test_state();
+        let origin = Url::parse("http://localhost").unwrap();
+        db::create_user_with_platforms(&st.db, "admin", "admin@x", "admin@x", "admin", Some("admin@x"), &[]).unwrap();
+        db::create_user_with_platforms(&st.db, "mem", "mem@x", "mem@x", "member", Some("mem@x"), &[]).unwrap();
+
+        let session = test_session();
+        session.insert(S_USER, &"mem".to_string()).await.unwrap();
+        session.insert(S_NAME, &"mem@x".to_string()).await.unwrap();
+
+        // 1. member 正常開始「新增 Passkey」，目標是自己
+        let ccr = register_start(
+            State(st.clone()), session.clone(), hdrs(&[]),
+            Json(RegisterStart { email: None, bootstrap_token: None, nickname: None }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap()
+        .0;
+
+        // 2. 換人 —— 不經任何清除，只有「誰在這個 session 上」變了
+        session.insert(S_USER, &"admin".to_string()).await.unwrap();
+
+        // 3. 提交第 1 步的註冊回應
+        let mut key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let cred = key.do_registration(origin, ccr).unwrap();
+        let err = register_finish(State(st.clone()), session.clone(), hdrs(&[]), Json(cred))
+            .await
+            .expect_err("註冊目標與登入者不符就不該通過");
+
+        assert!(err.0.to_string().contains("不符"), "要擋在 owner 檢查，拿到的是：{}", err.0);
+        assert!(db::credentials_for(&st.db, "admin").unwrap().is_empty(), "admin 不得多出憑證");
+        assert!(db::credentials_for(&st.db, "mem").unwrap().is_empty(), "member 也不該拿到");
+    }
+
+    /// 對稱檢查：註冊那一側也要清得乾淨。登入流程留下的挑戰若活過
+    /// `register_start`，下一次 finish 就有另一條流程的目標可讀。
+    #[tokio::test]
+    async fn starting_a_registration_wipes_any_pending_login() {
+        let st = test_state();
+        db::create_user_with_platforms(&st.db, "u1", "mei@x.tw", "mei", "member", Some("mei@x.tw"), &[]).unwrap();
+
+        let session = test_session();
+        session.insert(S_USER, &"u1".to_string()).await.unwrap();
+        session.insert(S_NAME, &"mei@x.tw".to_string()).await.unwrap();
+        // `clear_auth_flows` 按鍵清除、不看型別，這兩把放什麼都會被清掉
+        session.insert(S_AUTH, &serde_json::json!("stale")).await.unwrap();
+        session.insert(S_DISC, &serde_json::json!("stale")).await.unwrap();
+        session
+            .insert(S_LOGIN_USER, &PendingReg {
+                user_id: "admin".into(), username: "admin@x".into(), email: None, is_new: false,
+                role: "admin".into(), bootstrap_token: None, nickname: None,
+            })
+            .await
+            .unwrap();
+
+        let _ = register_start(
+            State(st.clone()), session.clone(), hdrs(&[]),
+            Json(RegisterStart { email: None, bootstrap_token: None, nickname: None }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap();
+
+        assert!(session.get::<serde_json::Value>(S_AUTH).await.unwrap().is_none());
+        assert!(session.get::<serde_json::Value>(S_DISC).await.unwrap().is_none());
+        assert!(session.get::<PendingReg>(S_LOGIN_USER).await.unwrap().is_none());
+        // 清完之後才輪到自己的狀態進場
+        assert!(session.get::<PendingReg>(S_REG_USER).await.unwrap().is_some());
+        // 登入身分刻意留著 —— 加備援金鑰本來就要在登入狀態下做
+        assert_eq!(current_user(&session).await.map(|(id, _)| id).as_deref(), Some("u1"));
+    }
+
+    /// 可探索登入也是一條獨立的狀態機，開始時同樣要把註冊那側清空。
+    #[tokio::test]
+    async fn starting_a_discoverable_login_wipes_any_pending_registration() {
+        let st = test_state();
+        let session = test_session();
+        let (_, reg_state) = st
+            .webauthn
+            .start_passkey_registration(Uuid::new_v4(), "a@x", "a@x", None)
+            .unwrap();
+        session.insert(S_REG, &reg_state).await.unwrap();
+        session
+            .insert(S_REG_USER, &PendingReg {
+                user_id: "u1".into(), username: "a@x".into(), email: None, is_new: false,
+                role: "member".into(), bootstrap_token: None, nickname: None,
+            })
+            .await
+            .unwrap();
+
+        let _ = login_any_start(State(st.clone()), session.clone()).await.map_err(|e| e.0).unwrap();
+
+        assert!(session.get::<PasskeyRegistration>(S_REG).await.unwrap().is_none());
+        assert!(session.get::<PendingReg>(S_REG_USER).await.unwrap().is_none());
+        // 清完之後才輪到自己的挑戰進場
+        assert!(session.get::<DiscoverableAuthentication>(S_DISC).await.unwrap().is_some());
     }
 
     /// 白名單的授權對象必須是**那一戶的 IPv4**，不是連線來源。
