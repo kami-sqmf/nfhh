@@ -1431,6 +1431,59 @@ fn routing_mailbox(headers: &HeaderMap, parsed_to: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
+/// `sender_verify_mode` 對一封信的裁決。
+///
+/// `verified` 為 None 是 v5 之前的舊信 —— 那是「無驗證資訊」而不是
+/// 「未通過」，observe 下一樣顯示，只是前端標成灰色而非琥珀色。
+fn mode_allows(mode: &str, verified: Option<bool>) -> bool {
+    match mode {
+        // 未通過的擋掉，只進管理收件匣
+        "enforce" => verified == Some(true),
+        // off：不驗證；observe（預設）：未通過也顯示，前端標琥珀色
+        _ => true,
+    }
+}
+
+/// member 對一封信的可見範圍。清單、單封讀取、刪除三處共用同一條規則 ——
+/// 分開寫過一次，結果是清單看不到的信可以用猜 id 的方式讀到與刪掉。
+struct MailScope {
+    granted: Vec<String>,
+    mode: String,
+    keywords: Vec<String>,
+    excludes: Vec<String>,
+}
+
+impl MailScope {
+    fn load(st: &Shared, uid: &str) -> Result<Self> {
+        Ok(Self {
+            granted: db::platforms_for(&st.db, uid)?,
+            mode: db::get_setting(&st.db, db::keys::SENDER_MODE)?.unwrap_or_else(|| "observe".into()),
+            keywords: db::get_setting_list(&st.db, db::keys::CODE_KEYWORDS),
+            excludes: db::get_setting_list(&st.db, db::keys::CODE_EXCLUDES),
+        })
+    }
+
+    fn allows(
+        &self,
+        platform: Option<&str>,
+        verified: Option<bool>,
+        subject: Option<&str>,
+        body: Option<&str>,
+        has_code: bool,
+    ) -> bool {
+        platform.is_some_and(|p| self.granted.iter().any(|g| g == p))
+            && mode_allows(&self.mode, verified)
+            // 有碼、或命中關鍵字。後者是為了 Netflix 的「暫時存取碼」——
+            // 碼不在信裡而在「取得存取碼」那顆按鈕後面，抽不到數字不代表
+            // 這封信對家人沒用。
+            && mail::is_actionable(subject, body, has_code, &self.keywords, &self.excludes)
+    }
+
+    fn allows_mail(&self, m: &db::Mail) -> bool {
+        self.allows(m.platform.as_deref(), m.verified, m.subject.as_deref(), m.body.as_deref(), m.code.is_some())
+    }
+}
+
 /// 驗證碼分頁的內容。
 ///
 /// 兩層過濾，順序不能顛倒：
@@ -1445,37 +1498,11 @@ async fn mail_list(State(st): State<Shared>, session: Session) -> ApiResult<Json
     let (uid, _) = require_user(&st, &session).await?;
     let _ = db::purge_old_mails(&st.db, st.cfg.mail_keep_days);
 
-    let granted = db::platforms_for(&st.db, &uid)?;
-    let mode = db::get_setting(&st.db, db::keys::SENDER_MODE)?
-        .unwrap_or_else(|| "observe".into());
-    let keywords = db::get_setting_list(&st.db, db::keys::CODE_KEYWORDS);
-    let excludes = db::get_setting_list(&st.db, db::keys::CODE_EXCLUDES);
+    let scope = MailScope::load(&st, &uid)?;
 
     let mails = db::recent_mails(&st.db, 60)?
         .into_iter()
-        .filter(|m| m.platform.as_deref().is_some_and(|p| granted.iter().any(|g| g == p)))
-        // 有碼、或命中關鍵字。後者是為了 Netflix 的「暫時存取碼」——
-        // 碼不在信裡而在「取得存取碼」那顆按鈕後面，抽不到數字不代表
-        // 這封信對家人沒用。
-        .filter(|m| {
-            mail::is_actionable(
-                m.subject.as_deref(),
-                m.body.as_deref(),
-                m.code.is_some(),
-                &keywords,
-                &excludes,
-            )
-        })
-        .filter(|m| match mode.as_str() {
-            // 不驗證，全部當通過
-            "off" => true,
-            // 未通過的擋掉，只進管理收件匣
-            "enforce" => m.verified == Some(true),
-            // 觀察期（預設）：未通過的照樣顯示，由前端標成琥珀色。
-            // verified 為 None 是 v5 之前的舊信，那是「無驗證資訊」不是
-            // 「未通過」—— 一樣顯示，灰色。
-            _ => true,
-        })
+        .filter(|m| scope.allows_mail(m))
         .take(30)
         .collect();
 
@@ -1494,8 +1521,15 @@ async fn mail_delete(
     session: Session,
     Path(id): Path<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    require_user(&st, &session).await?;
-    Ok(Json(serde_json::json!({ "ok": db::delete_mail(&st.db, id)? > 0 })))
+    let (uid, _) = require_user(&st, &session).await?;
+    let me = db::get_user(&st.db, &uid)?.context("帳號已不存在")?;
+    let n = if me.is_admin() {
+        db::delete_mail_if(&st.db, id, |_| true)?
+    } else {
+        let scope = MailScope::load(&st, &uid)?;
+        db::delete_mail_if(&st.db, id, |m| scope.allows_mail(m))?
+    };
+    Ok(Json(serde_json::json!({ "ok": n > 0 })))
 }
 
 /// 「全部刪除」。限管理員 —— 這會清掉所有人的驗證碼，
@@ -3257,6 +3291,35 @@ mod tests {
 
         assert_eq!(out["actionable"], false);
         assert_eq!(db::recent_mails(&st.db, 60).unwrap().len(), 1, "信要留在管理收件匣");
+    }
+
+    /// 刪除是全域硬刪，規則必須跟清單一模一樣：同平台但清單看不到的信
+    /// （非驗證碼信、enforce 下未通過的信）也不能靠猜 id 刪掉。
+    #[tokio::test]
+    async fn members_can_only_delete_mail_they_could_see() {
+        let st = test_state();
+        db::create_user_with_platforms(&st.db, "m", "m@x", "m@x", "member", Some("m@x"), &["netflix".into()]).unwrap();
+        let ins = |id: &str, pf: Option<&str>, subject: &str, code: Option<&str>| {
+            db::insert_mail(&st.db, Some(id), db::now(), None, None, Some(subject), code, None, None, &[], true, pf, None).unwrap()
+        };
+        ins("n", Some("netflix"), "code", Some("123456")); // 看得到
+        ins("ad", Some("netflix"), "新片上架", None); // 同平台但不是驗證碼信：清單看不到
+        ins("d", Some("disneyplus"), "code", Some("111111")); // 別的平台
+        ins("x", None, "diag", None); // 管理診斷
+        let ids: Vec<i64> = db::recent_mails(&st.db, 10).unwrap().into_iter().map(|m| m.id).collect();
+
+        let session = test_session();
+        session.insert(S_USER, &"m".to_string()).await.unwrap();
+        session.insert(S_NAME, &"m@x".to_string()).await.unwrap();
+        let mut deleted = 0;
+        for id in &ids {
+            let out = mail_delete(State(st.clone()), session.clone(), Path(*id)).await.map_err(|e| e.0).unwrap().0;
+            if out["ok"] == true {
+                deleted += 1;
+            }
+        }
+        assert_eq!(deleted, 1, "只有清單看得到的那封能刪");
+        assert_eq!(db::recent_mails(&st.db, 10).unwrap().len(), 3);
     }
 
     /// 邀請連結兌換之後，接上的是跟驗證碼**完全一樣**的那道關卡 ——

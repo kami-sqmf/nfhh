@@ -984,33 +984,49 @@ pub fn insert_mail(
     Ok(n == 1)
 }
 
+/// 讀信件的欄位清單。清單、單封讀取、刪除前的取列共用同一串 ——
+/// 欄位順序一旦跟 [`row_to_mail`] 的索引對不上就是全體對不上，
+/// 不會只有其中一支悄悄讀錯。
+const MAIL_COLS: &str = "id, received_at, sender, subject, code, body, links, html, verified,
+                         platform, skip_reason, recipient";
+
+fn row_to_mail(r: &rusqlite::Row) -> rusqlite::Result<Mail> {
+    let links_json: String = r.get(6).unwrap_or_else(|_| "[]".into());
+    let links: Vec<String> = serde_json::from_str(&links_json).unwrap_or_default();
+    Ok(Mail {
+        id: r.get(0)?,
+        received_at: r.get(1)?,
+        sender: r.get(2)?,
+        subject: r.get(3)?,
+        code: r.get(4)?,
+        body: r.get(5)?,
+        html: r.get(7).unwrap_or(None),
+        primary_link: crate::mail::primary_link(&links),
+        links,
+        verified: r.get::<_, Option<i64>>(8).unwrap_or(None).map(|v| v != 0),
+        platform: r.get(9).unwrap_or(None),
+        skip_reason: r.get(10).unwrap_or(None),
+        recipient: r.get(11).unwrap_or(None),
+    })
+}
+
 pub fn recent_mails(db: &Db, limit: i64) -> Result<Vec<Mail>> {
     let conn = db.lock().unwrap();
-    let mut stmt = conn.prepare(
-        "SELECT id, received_at, sender, subject, code, body, links, html, verified,
-                platform, skip_reason, recipient
-         FROM mails ORDER BY received_at DESC LIMIT ?1",
-    )?;
-    let rows = stmt.query_map(params![limit], |r| {
-        let links_json: String = r.get(6).unwrap_or_else(|_| "[]".into());
-        let links: Vec<String> = serde_json::from_str(&links_json).unwrap_or_default();
-        Ok(Mail {
-            id: r.get(0)?,
-            received_at: r.get(1)?,
-            sender: r.get(2)?,
-            subject: r.get(3)?,
-            code: r.get(4)?,
-            body: r.get(5)?,
-            html: r.get(7).unwrap_or(None),
-            primary_link: crate::mail::primary_link(&links),
-            links,
-            verified: r.get::<_, Option<i64>>(8).unwrap_or(None).map(|v| v != 0),
-            platform: r.get(9).unwrap_or(None),
-            skip_reason: r.get(10).unwrap_or(None),
-            recipient: r.get(11).unwrap_or(None),
-        })
-    })?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {MAIL_COLS} FROM mails ORDER BY received_at DESC LIMIT ?1"
+    ))?;
+    let rows = stmt.query_map(params![limit], row_to_mail)?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// 單封讀取。目前還沒有呼叫點 —— 「單封驗證碼」端點會用它，
+/// 屆時走的就是跟清單、刪除同一條可見性規則。
+#[allow(dead_code)]
+pub fn get_mail(db: &Db, id: i64) -> Result<Option<Mail>> {
+    let conn = db.lock().unwrap();
+    Ok(conn
+        .query_row(&format!("SELECT {MAIL_COLS} FROM mails WHERE id = ?1"), params![id], row_to_mail)
+        .optional()?)
 }
 
 /// 「全部刪除」。回傳刪掉的筆數。
@@ -1211,8 +1227,18 @@ pub fn update_mail_code(db: &Db, id: i64, code: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-pub fn delete_mail(db: &Db, id: i64) -> Result<usize> {
+/// 讀出、判斷、刪除都在同一把鎖內：判斷用的是刪除當下那一列，不會被中間
+/// 插進來的寫入改變。`pred` 回 false 與列不存在都回 0 —— 不給枚舉 id 的人
+/// 一個存在性 oracle。
+pub fn delete_mail_if(db: &Db, id: i64, pred: impl Fn(&Mail) -> bool) -> Result<usize> {
     let conn = db.lock().unwrap();
+    let row = conn
+        .query_row(&format!("SELECT {MAIL_COLS} FROM mails WHERE id = ?1"), params![id], row_to_mail)
+        .optional()?;
+    let Some(m) = row else { return Ok(0) };
+    if !pred(&m) {
+        return Ok(0);
+    }
     Ok(conn.execute("DELETE FROM mails WHERE id = ?1", params![id])?)
 }
 
