@@ -83,13 +83,19 @@ fn migrate(conn: &Connection) -> Result<()> {
 /// `received_at` 來自寄件者的 `Date:` 表頭 —— 拿它排序與清除，一封未來日期的
 /// 信可以永遠排第一、永遠不被清。`ingested_at` 是面板自己的時鐘，
 /// 排序、分頁、保留期一律只看它；`received_at` 降為顯示用。
+///
+/// 這欄的契約是「永不為 NULL」：遷移後仍是 NULL 的列一律當成過期資料清掉
+/// （見 [`purge_old_mails`]）—— 舊版執行檔滾回這顆庫上會插出沒填這欄的信，
+/// 留著就永遠躲過保留期。
 fn migrate_v12(conn: &Connection) -> Result<()> {
     add_column(conn, "mails", "ingested_at", "INTEGER")?;
     // 回填不能原樣抄 received_at：升級前就躺在表裡的偽造未來日期會直接變成
     // 「可信」時間，繼續置頂、繼續逃過清理。夾到遷移當下。
     conn.execute_batch(
         "UPDATE mails SET ingested_at = min(received_at, unixepoch()) WHERE ingested_at IS NULL;
-         CREATE INDEX IF NOT EXISTS idx_mails_ingested ON mails(ingested_at DESC);",
+         CREATE INDEX IF NOT EXISTS idx_mails_ingested ON mails(ingested_at DESC);
+         -- 已經沒有任何查詢對 received_at 排序或過濾，這條索引只剩維護成本
+         DROP INDEX IF EXISTS idx_mails_at;",
     )?;
     Ok(())
 }
@@ -1232,8 +1238,10 @@ pub const MAX_MAILS: i64 = 2000;
 /// 清除逾期信件並套用總量上限。兩者都只看 `ingested_at`。
 pub fn purge_old_mails(db: &Db, keep_days: i64) -> Result<usize> {
     let conn = db.lock().unwrap();
+    // NULL 也算過期：正常路徑一定會填，填不出來的是舊版執行檔寫的列，
+    // 而 `NULL < x` 永遠不成立 —— 不特別點名就永遠清不掉。
     let a = conn.execute(
-        "DELETE FROM mails WHERE ingested_at < ?1",
+        "DELETE FROM mails WHERE ingested_at IS NULL OR ingested_at < ?1",
         params![now() - keep_days * 86400],
     )?;
     let b = conn.execute(
@@ -3267,11 +3275,76 @@ mod tests {
             .unwrap();
         }
         purge_old_mails(&db, 14).unwrap();
+
+        let conn = db.lock().unwrap();
+        let n: i64 = conn.query_row("SELECT count(*) FROM mails", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, MAX_MAILS);
+
+        // 數量對了還不夠，要丟對邊：留最新收到的，丟最早收到的
+        let alive = |mid: String| -> bool {
+            conn.prepare("SELECT 1 FROM mails WHERE message_id = ?1")
+                .unwrap()
+                .exists(params![mid])
+                .unwrap()
+        };
+        assert!(alive(format!("m{}", MAX_MAILS + 4)), "最後收到的那封要留著");
+        assert!(!alive("m0".into()), "最早收到的那封先被丟掉");
+    }
+
+    /// 舊版執行檔滾回 v12 的庫上，會插出沒填 `ingested_at` 的列。
+    /// 那種列不能因為「NULL 比不出大小」就永遠躲過保留期。
+    #[test]
+    fn rows_without_an_ingest_time_are_purged_not_kept_forever() {
+        let db = test_db();
+        db.lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO mails (message_id, received_at, ingested_at)
+                 VALUES ('legacy', ?1, NULL)",
+                params![now()],
+            )
+            .unwrap();
+
+        assert_eq!(purge_old_mails(&db, 14).unwrap(), 1, "沒有收信時間的列一律當過期");
         let n: i64 = db
             .lock()
             .unwrap()
             .query_row("SELECT count(*) FROM mails", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n, MAX_MAILS);
+        assert_eq!(n, 0);
+    }
+
+    /// Worker 重送同一封信不能刷新 `ingested_at`，否則只要持續重送，
+    /// 一封信就永遠不會過保留期。
+    #[test]
+    fn redelivery_keeps_the_original_ingested_at() {
+        let db = test_db();
+        insert_mail(
+            &db, Some("dup"), now(), None, None, Some("原信"), None, None, None, &[], true,
+            None, None,
+        )
+        .unwrap();
+        let backdated = now() - 30 * 86400;
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE mails SET ingested_at = ?1 WHERE message_id = 'dup'",
+                params![backdated],
+            )
+            .unwrap();
+
+        let is_new = insert_mail(
+            &db, Some("dup"), now(), None, None, Some("重送"), None, None, None, &[], true,
+            None, None,
+        )
+        .unwrap();
+        assert!(!is_new, "同一個 Message-ID 是重送，不是新信");
+
+        let got: i64 = db
+            .lock()
+            .unwrap()
+            .query_row("SELECT ingested_at FROM mails WHERE message_id = 'dup'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(got, backdated, "重送不得把收信時間往後推，那等於免死金牌");
     }
 }

@@ -8,8 +8,19 @@ pub const MAX_SUBJECT_CHARS: usize = 500;
 pub const MAX_ADDR_CHARS: usize = 320;
 pub const MAX_MSGID_CHARS: usize = 998;
 
+/// 主旨純粹給人看，截斷不會讓任何判斷讀出錯誤結論。
 fn cap(s: String, max: usize) -> String {
     if s.chars().count() <= max { s } else { s.chars().take(max).collect() }
+}
+
+/// 位址與 Message-ID 不能截斷，只能整個丟掉。
+///
+/// 截斷會**憑空造出一個看起來合理的值**：`evil@netflix.com.attacker.example`
+/// 剛好切在第 320 個字就成了 `evil@netflix.com`；而 Message-ID 是去重鍵，
+/// 截短等於讓寄件者自由製造碰撞，用一封信蓋掉另一封。
+/// 超長的本來就不是正常信，寧可當它沒有這個表頭。
+fn reject_over(s: String, max: usize) -> Option<String> {
+    (s.chars().count() <= max).then_some(s)
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -226,9 +237,10 @@ pub fn parse(raw: &[u8], authserv_id: &str) -> Parsed {
         .from()
         .and_then(|a| a.first())
         .and_then(|a| a.address())
-        .map(|s| s.to_string());
+        .and_then(|s| reject_over(s.to_string(), MAX_ADDR_CHARS));
 
-    // envelope_domain 讀的是完整位址，先算完再把 sender 截短交出去。
+    // envelope_domain 只記錄不參與判斷，跟著被拒收的位址一起消失 ——
+    // 位址我們都不採信了，沒道理還把它的網域寫進日誌。
     let envelope_domain = sender
         .as_deref()
         .and_then(|s| s.split('@').nth(1))
@@ -236,13 +248,15 @@ pub fn parse(raw: &[u8], authserv_id: &str) -> Parsed {
 
     Parsed {
         auth: SenderAuth { dkim_domains, dmarc_from, envelope_domain },
-        message_id: msg.message_id().map(|s| cap(s.to_string(), MAX_MSGID_CHARS)),
-        sender: sender.map(|s| cap(s, MAX_ADDR_CHARS)),
+        message_id: msg
+            .message_id()
+            .and_then(|s| reject_over(s.to_string(), MAX_MSGID_CHARS)),
+        sender,
         recipient: msg
             .to()
             .and_then(|a| a.first())
             .and_then(|a| a.address())
-            .map(|s| cap(s.to_string(), MAX_ADDR_CHARS)),
+            .and_then(|s| reject_over(s.to_string(), MAX_ADDR_CHARS)),
         subject: subject.map(|s| cap(s, MAX_SUBJECT_CHARS)),
         date: msg.date().map(|d| d.to_timestamp()),
         code: extract_code(&haystack),
@@ -1066,6 +1080,9 @@ Subject: \xe9\xa9\x97\xe8\xad\x89\xe7\xa2\xbc\r\n\
     }
 
     /// 主旨、寄件者、Message-ID 沒有上限的話，每封信都能帶幾 MB 的表頭進資料庫。
+    ///
+    /// 主旨截短就好；位址與 Message-ID 只能整個拒收 —— 截短出來的位址會多出
+    /// 一個它本來沒有的網域，截短出來的 Message-ID 會撞掉別封信。
     #[test]
     fn header_metadata_is_capped() {
         let long = "x".repeat(5000);
@@ -1073,9 +1090,23 @@ Subject: \xe9\xa9\x97\xe8\xad\x89\xe7\xa2\xbc\r\n\
             "From: {long}@example.com\r\nTo: {long}@share.example.com\r\nSubject: {long}\r\nMessage-ID: <{long}@x>\r\n\r\nhi\r\n"
         );
         let m = parse(raw.as_bytes(), "mx.cloudflare.net");
-        assert!(m.subject.unwrap().chars().count() <= MAX_SUBJECT_CHARS);
-        assert!(m.sender.is_none_or(|s| s.chars().count() <= MAX_ADDR_CHARS));
-        assert!(m.recipient.is_none_or(|s| s.chars().count() <= MAX_ADDR_CHARS));
-        assert!(m.message_id.is_none_or(|s| s.chars().count() <= MAX_MSGID_CHARS));
+        assert_eq!(m.subject.unwrap().chars().count(), MAX_SUBJECT_CHARS, "主旨截到上限");
+        assert_eq!(m.sender, None, "超長寄件者整個不採信，不是切一半");
+        assert_eq!(m.recipient, None, "收件者同理");
+        assert_eq!(m.message_id, None, "去重鍵寧可沒有，也不要一個截短的");
+        assert_eq!(m.auth.envelope_domain, None, "位址都拒收了，網域不該還留著");
+    }
+
+    /// 正常長度的表頭一個都不能被上限誤傷。
+    #[test]
+    fn normal_headers_survive_the_caps() {
+        let raw = "From: info@account.netflix.com\r\nTo: netflix@share.example.com\r\n\
+                   Subject: 您的登入驗證碼\r\nMessage-ID: <abc123@netflix.com>\r\n\r\nhi\r\n";
+        let m = parse(raw.as_bytes(), "mx.cloudflare.net");
+        assert_eq!(m.sender.as_deref(), Some("info@account.netflix.com"));
+        assert_eq!(m.recipient.as_deref(), Some("netflix@share.example.com"));
+        assert_eq!(m.subject.as_deref(), Some("您的登入驗證碼"));
+        assert_eq!(m.message_id.as_deref(), Some("abc123@netflix.com"));
+        assert_eq!(m.auth.envelope_domain.as_deref(), Some("account.netflix.com"));
     }
 }

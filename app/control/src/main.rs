@@ -1262,11 +1262,14 @@ fn require_mail_secret(st: &Shared, headers: &HeaderMap) -> std::result::Result<
     Ok(())
 }
 
-/// 寄件者宣告的日期只當顯示用，而且要夾在合理範圍：一年前到一小時後之外
+/// 寄件者宣告的日期只當顯示用，而且要夾在合理範圍：保留期之前、一小時之後
 /// 一律改用現在。排序與保留期另外看 `ingested_at`（見 db::migrate_v12）。
-fn clamp_received(claimed: Option<i64>, now: i64) -> i64 {
+///
+/// 下限跟著保留期走而不是寫死一年：面板只留 `keep_days` 天，卻讓一封剛收到的
+/// 信顯示「300 天前」，是拿自己的 UI 幫寄件者說謊。
+fn clamp_received(claimed: Option<i64>, now: i64, keep_days: i64) -> i64 {
     match claimed {
-        Some(t) if t <= now + 3600 && t >= now - 365 * 86400 => t,
+        Some(t) if t <= now + 3600 && t >= now - keep_days * 86400 => t,
         _ => now,
     }
 }
@@ -1305,7 +1308,7 @@ async fn mail_ingest(
     let platform = platforms::classify(p.sender.as_deref(), &mailbox, &senders, &mailboxes, &known);
     let skip_reason = p.code.is_none().then_some("未擷取到驗證碼");
 
-    let received = clamp_received(p.date, db::now());
+    let received = clamp_received(p.date, db::now(), st.cfg.mail_keep_days);
     let is_new = db::insert_mail(
         &st.db,
         p.message_id.as_deref(),
@@ -4213,13 +4216,25 @@ mod tests {
     }
 
     /// 寄件者宣告的日期只當顯示用，太舊或在未來都改用現在。
+    /// 「太舊」以保留期為界 —— 留不了 14 天以上的信，就不該顯示得比那更舊。
     #[test]
     fn claimed_dates_are_clamped_to_a_sane_window() {
         let now = 1_800_000_000;
-        assert_eq!(clamp_received(None, now), now);
-        assert_eq!(clamp_received(Some(now - 60), now), now - 60);
-        assert_eq!(clamp_received(Some(now + 10 * 365 * 86400), now), now);
-        assert_eq!(clamp_received(Some(now - 400 * 86400), now), now);
-        assert_eq!(clamp_received(Some(now + 1800), now), now + 1800, "時鐘誤差一小時內接受");
+        let keep = 14;
+        assert_eq!(clamp_received(None, now, keep), now);
+        assert_eq!(clamp_received(Some(now - 60), now, keep), now - 60);
+        assert_eq!(clamp_received(Some(now + 10 * 365 * 86400), now, keep), now);
+        assert_eq!(clamp_received(Some(now - 400 * 86400), now, keep), now);
+        assert_eq!(
+            clamp_received(Some(now - 13 * 86400), now, keep),
+            now - 13 * 86400,
+            "還在保留期內的日期照原樣顯示"
+        );
+        assert_eq!(
+            clamp_received(Some(now - 15 * 86400), now, keep),
+            now,
+            "比保留期還舊的信根本不可能在庫裡，那日期是假的"
+        );
+        assert_eq!(clamp_received(Some(now + 1800), now, keep), now + 1800, "時鐘誤差一小時內接受");
     }
 }
