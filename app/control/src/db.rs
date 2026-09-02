@@ -71,6 +71,26 @@ fn migrate(conn: &Connection) -> Result<()> {
         migrate_v11(conn)?;
         conn.pragma_update(None, "user_version", 11)?;
     }
+    if version < 12 {
+        migrate_v12(conn)?;
+        conn.pragma_update(None, "user_version", 12)?;
+    }
+    Ok(())
+}
+
+/// v12：可信的接收時間。
+///
+/// `received_at` 來自寄件者的 `Date:` 表頭 —— 拿它排序與清除，一封未來日期的
+/// 信可以永遠排第一、永遠不被清。`ingested_at` 是面板自己的時鐘，
+/// 排序、分頁、保留期一律只看它；`received_at` 降為顯示用。
+fn migrate_v12(conn: &Connection) -> Result<()> {
+    add_column(conn, "mails", "ingested_at", "INTEGER")?;
+    // 回填不能原樣抄 received_at：升級前就躺在表裡的偽造未來日期會直接變成
+    // 「可信」時間，繼續置頂、繼續逃過清理。夾到遷移當下。
+    conn.execute_batch(
+        "UPDATE mails SET ingested_at = min(received_at, unixepoch()) WHERE ingested_at IS NULL;
+         CREATE INDEX IF NOT EXISTS idx_mails_ingested ON mails(ingested_at DESC);",
+    )?;
     Ok(())
 }
 
@@ -964,8 +984,8 @@ pub fn insert_mail(
     let n = conn.execute(
         "INSERT OR IGNORE INTO mails
          (message_id, received_at, sender, recipient, subject, code, body, html, links,
-          verified, platform, skip_reason)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+          verified, platform, skip_reason, ingested_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
         params![
             message_id,
             received_at,
@@ -978,7 +998,9 @@ pub fn insert_mail(
             serde_json::to_string(links).unwrap_or_else(|_| "[]".into()),
             verified as i64,
             platform,
-            skip_reason
+            skip_reason,
+            // 面板自己的時鐘。排序與保留期只看這欄，寄件者插不上手。
+            now()
         ],
     )?;
     Ok(n == 1)
@@ -1013,7 +1035,7 @@ fn row_to_mail(r: &rusqlite::Row) -> rusqlite::Result<Mail> {
 pub fn recent_mails(db: &Db, limit: i64) -> Result<Vec<Mail>> {
     let conn = db.lock().unwrap();
     let mut stmt = conn.prepare(&format!(
-        "SELECT {MAIL_COLS} FROM mails ORDER BY received_at DESC LIMIT ?1"
+        "SELECT {MAIL_COLS} FROM mails ORDER BY ingested_at DESC, id DESC LIMIT ?1"
     ))?;
     let rows = stmt.query_map(params![limit], row_to_mail)?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -1203,13 +1225,23 @@ pub fn delete_recipient(db: &Db, id: i64) -> Result<usize> {
     Ok(conn.execute("DELETE FROM mail_recipients WHERE id = ?1", params![id])?)
 }
 
-/// 清除逾期信件，保留天數由呼叫端決定。
+/// 信件總量上限。日期可以偽造、Message-ID 可以每封不同，只有列數是寄件者
+/// 控制不了的。
+pub const MAX_MAILS: i64 = 2000;
+
+/// 清除逾期信件並套用總量上限。兩者都只看 `ingested_at`。
 pub fn purge_old_mails(db: &Db, keep_days: i64) -> Result<usize> {
     let conn = db.lock().unwrap();
-    Ok(conn.execute(
-        "DELETE FROM mails WHERE received_at < ?1",
+    let a = conn.execute(
+        "DELETE FROM mails WHERE ingested_at < ?1",
         params![now() - keep_days * 86400],
-    )?)
+    )?;
+    let b = conn.execute(
+        "DELETE FROM mails WHERE id NOT IN
+           (SELECT id FROM mails ORDER BY ingested_at DESC, id DESC LIMIT ?1)",
+        params![MAX_MAILS],
+    )?;
+    Ok(a + b)
 }
 
 /// 取出所有信件的主旨與內文供重新抽取驗證碼。
@@ -3095,7 +3127,7 @@ mod tests {
         migrate(&conn).unwrap();
         migrate(&conn).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 11);
+        assert_eq!(v, 12);
     }
 
     /// ⚠️ 已經跑過 v10 的資料庫必須也拿得到後來補的那幾個欄位。
@@ -3158,5 +3190,88 @@ mod tests {
         let new = mails.iter().find(|m| m.subject.as_deref() == Some("新信")).unwrap();
         assert_eq!(old.verified, None, "舊資料應為未知，而不是未通過");
         assert_eq!(new.verified, Some(false));
+    }
+
+    /// `received_at` 是寄件者說的 `Date:`，寄件者說了算。排序與清除只能用
+    /// 面板自己的時鐘 `ingested_at`，否則一封未來日期的信永遠排第一、永遠不被清。
+    #[test]
+    fn purge_and_ordering_use_ingested_at_not_the_claimed_date() {
+        let db = test_db();
+        let far_future = now() + 10 * 365 * 86400;
+        insert_mail(
+            &db, Some("future"), far_future, None, None, Some("未來"), None, None, None, &[],
+            true, Some("netflix"), None,
+        )
+        .unwrap();
+        insert_mail(
+            &db, Some("normal"), now(), None, None, Some("正常"), None, None, None, &[], true,
+            Some("netflix"), None,
+        )
+        .unwrap();
+
+        let list = recent_mails(&db, 10).unwrap();
+        assert_eq!(list[0].subject.as_deref(), Some("正常"), "後收到的排前面，不看 Date");
+
+        // 把「未來」那封的 ingested_at 撥回 30 天前，保留期 14 天要把它清掉
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE mails SET ingested_at = ?1 WHERE message_id = 'future'",
+                params![now() - 30 * 86400],
+            )
+            .unwrap();
+        assert_eq!(purge_old_mails(&db, 14).unwrap(), 1);
+        assert_eq!(recent_mails(&db, 10).unwrap().len(), 1);
+    }
+
+    /// 升級前就存在的未來日期郵件，不能把偽造的時間原樣搬進可信欄位。
+    /// 造一顆 v11 的庫（跟 `migration_is_idempotent` 同一招：退版號、拿掉欄位）。
+    #[test]
+    fn v12_backfill_clamps_pre_existing_future_dates() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_mails_ingested; ALTER TABLE mails DROP COLUMN ingested_at;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 11).unwrap();
+        let future = now() + 10 * 365 * 86400;
+        conn.execute(
+            "INSERT INTO mails (message_id, received_at) VALUES ('f', ?1), ('p', 100)",
+            params![future],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 12);
+        let f: i64 = conn
+            .query_row("SELECT ingested_at FROM mails WHERE message_id = 'f'", [], |r| r.get(0))
+            .unwrap();
+        let p: i64 = conn
+            .query_row("SELECT ingested_at FROM mails WHERE message_id = 'p'", [], |r| r.get(0))
+            .unwrap();
+        assert!(f <= now(), "未來日期要被夾到遷移當下");
+        assert_eq!(p, 100, "正常的保留原值");
+    }
+
+    /// 總量配額：不管日期怎麼寫，超過上限就從最舊收到的開始丟。
+    #[test]
+    fn mail_table_is_capped_by_row_count() {
+        let db = test_db();
+        for i in 0..(MAX_MAILS + 5) {
+            insert_mail(
+                &db, Some(&format!("m{i}")), now(), None, None, None, None, None, None, &[],
+                true, None, None,
+            )
+            .unwrap();
+        }
+        purge_old_mails(&db, 14).unwrap();
+        let n: i64 = db
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM mails", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, MAX_MAILS);
     }
 }

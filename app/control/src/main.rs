@@ -1262,6 +1262,15 @@ fn require_mail_secret(st: &Shared, headers: &HeaderMap) -> std::result::Result<
     Ok(())
 }
 
+/// 寄件者宣告的日期只當顯示用，而且要夾在合理範圍：一年前到一小時後之外
+/// 一律改用現在。排序與保留期另外看 `ingested_at`（見 db::migrate_v12）。
+fn clamp_received(claimed: Option<i64>, now: i64) -> i64 {
+    match claimed {
+        Some(t) if t <= now + 3600 && t >= now - 365 * 86400 => t,
+        _ => now,
+    }
+}
+
 /// 接收 Worker 推來的原始信件，並回覆這封要轉給誰。
 ///
 /// Worker 先推這裡、拿到 `forward_to` 才轉發 —— 篩選器的關鍵字要比對內文，
@@ -1296,7 +1305,7 @@ async fn mail_ingest(
     let platform = platforms::classify(p.sender.as_deref(), &mailbox, &senders, &mailboxes, &known);
     let skip_reason = p.code.is_none().then_some("未擷取到驗證碼");
 
-    let received = p.date.unwrap_or_else(db::now);
+    let received = clamp_received(p.date, db::now());
     let is_new = db::insert_mail(
         &st.db,
         p.message_id.as_deref(),
@@ -4201,5 +4210,16 @@ mod tests {
     #[test]
     fn router_builds_without_conflicts() {
         let _ = routes(test_state());
+    }
+
+    /// 寄件者宣告的日期只當顯示用，太舊或在未來都改用現在。
+    #[test]
+    fn claimed_dates_are_clamped_to_a_sane_window() {
+        let now = 1_800_000_000;
+        assert_eq!(clamp_received(None, now), now);
+        assert_eq!(clamp_received(Some(now - 60), now), now - 60);
+        assert_eq!(clamp_received(Some(now + 10 * 365 * 86400), now), now);
+        assert_eq!(clamp_received(Some(now - 400 * 86400), now), now);
+        assert_eq!(clamp_received(Some(now + 1800), now), now + 1800, "時鐘誤差一小時內接受");
     }
 }

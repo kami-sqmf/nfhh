@@ -2,6 +2,16 @@
 
 use serde::Serialize;
 
+/// 表頭欄位的上限。RFC 5322 一行是 998 bytes，主旨與位址實務上遠小於此；
+/// 超過的不是正常信，是想撐大資料庫的人。
+pub const MAX_SUBJECT_CHARS: usize = 500;
+pub const MAX_ADDR_CHARS: usize = 320;
+pub const MAX_MSGID_CHARS: usize = 998;
+
+fn cap(s: String, max: usize) -> String {
+    if s.chars().count() <= max { s } else { s.chars().take(max).collect() }
+}
+
 #[derive(Debug, Serialize, Default)]
 pub struct Parsed {
     pub message_id: Option<String>,
@@ -218,23 +228,22 @@ pub fn parse(raw: &[u8], authserv_id: &str) -> Parsed {
         .and_then(|a| a.address())
         .map(|s| s.to_string());
 
+    // envelope_domain 讀的是完整位址，先算完再把 sender 截短交出去。
+    let envelope_domain = sender
+        .as_deref()
+        .and_then(|s| s.split('@').nth(1))
+        .map(|d| d.to_lowercase());
+
     Parsed {
-        auth: SenderAuth {
-            dkim_domains,
-            dmarc_from,
-            envelope_domain: sender
-                .as_deref()
-                .and_then(|s| s.split('@').nth(1))
-                .map(|d| d.to_lowercase()),
-        },
-        message_id: msg.message_id().map(|s| s.to_string()),
-        sender,
+        auth: SenderAuth { dkim_domains, dmarc_from, envelope_domain },
+        message_id: msg.message_id().map(|s| cap(s.to_string(), MAX_MSGID_CHARS)),
+        sender: sender.map(|s| cap(s, MAX_ADDR_CHARS)),
         recipient: msg
             .to()
             .and_then(|a| a.first())
             .and_then(|a| a.address())
-            .map(|s| s.to_string()),
-        subject,
+            .map(|s| cap(s.to_string(), MAX_ADDR_CHARS)),
+        subject: subject.map(|s| cap(s, MAX_SUBJECT_CHARS)),
         date: msg.date().map(|d| d.to_timestamp()),
         code: extract_code(&haystack),
         links: extract_links(&body),
@@ -1054,5 +1063,19 @@ Subject: \xe9\xa9\x97\xe8\xad\x89\xe7\xa2\xbc\r\n\
         assert!(t.contains("KEEP"), "script 區塊之後的內容不該被吞掉");
         assert!(t.contains('y'));
         assert!(!t.contains('a'), "script 內容本身仍要整段丟掉");
+    }
+
+    /// 主旨、寄件者、Message-ID 沒有上限的話，每封信都能帶幾 MB 的表頭進資料庫。
+    #[test]
+    fn header_metadata_is_capped() {
+        let long = "x".repeat(5000);
+        let raw = format!(
+            "From: {long}@example.com\r\nTo: {long}@share.example.com\r\nSubject: {long}\r\nMessage-ID: <{long}@x>\r\n\r\nhi\r\n"
+        );
+        let m = parse(raw.as_bytes(), "mx.cloudflare.net");
+        assert!(m.subject.unwrap().chars().count() <= MAX_SUBJECT_CHARS);
+        assert!(m.sender.is_none_or(|s| s.chars().count() <= MAX_ADDR_CHARS));
+        assert!(m.recipient.is_none_or(|s| s.chars().count() <= MAX_ADDR_CHARS));
+        assert!(m.message_id.is_none_or(|s| s.chars().count() <= MAX_MSGID_CHARS));
     }
 }
