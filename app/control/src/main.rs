@@ -1044,7 +1044,7 @@ async fn allow_add(
     headers: HeaderMap,
     Json(req): Json<AllowReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let (_, username) = require_user(&st, &session).await?;
+    let (uid, username) = require_user(&st, &session).await?;
     let caller_ip = client_ip(&headers);
 
     let ip_str = req
@@ -1063,14 +1063,12 @@ async fn allow_add(
 
     db::purge_expired(&st.db)?;
 
-    // 額度是 per-user 的。已經在自己名下的 IP 是「延長授權」，不佔新額度；
-    // 別人加過的同一個 IP 也不佔 —— 那會變成「改寫別人的條目」，
-    // 由下面的 upsert 決定語意，不在這裡擋。
-    let existing = db::list_allow(&st.db)?;
-    let already_mine = existing
-        .iter()
-        .any(|e| e.ip == ip_str && e.added_by.as_deref() == Some(username.as_str()));
-    if !already_mine {
+    let me = db::get_user(&st.db, &uid)?.context("帳號已不存在")?;
+
+    // 額度只在「全新的 IP」時扣：已在自己名下的是延長；別人的會在下面被
+    // SQL 拒絕，也不該先扣掉呼叫者的額度。
+    let exists = db::list_allow(&st.db)?.iter().any(|e| e.ip == ip_str);
+    if !exists {
         let mine = db::allow_count_by(&st.db, &username)?;
         if mine >= st.cfg.max_per_user {
             return Err(AppError(anyhow::anyhow!(
@@ -1082,14 +1080,19 @@ async fn allow_add(
 
     let ttl_days = req.ttl_days.unwrap_or(st.cfg.default_ttl_days).clamp(1, 30);
     let expires_at = db::now() + ttl_days * 86400;
-    db::upsert_allow(
+    if !db::upsert_allow_owned(
         &st.db,
         &ip_str,
         req.label.as_deref(),
-        Some(&username),
+        &username,
         expires_at,
         ttl_days,
-    )?;
+        me.is_admin(),
+    )? {
+        return Err(AppError(anyhow::anyhow!(
+            "{ip_str} 已由其他成員授權，只有本人或管理員能修改"
+        )));
+    }
 
     let n = nft::sync(&st.db, &st.cfg.clients_nft)?;
     db::audit(
@@ -3858,6 +3861,43 @@ mod tests {
         let out = status(State(st), anon, h, q(Some("4.3.2.1"))).await.map_err(|e| e.0).unwrap().0;
         assert_eq!(out.my_ip.as_deref(), Some("2001:db8:5c07:5ec7::1"));
         assert!(!out.my_ip_allowed, "未登入不得靠 ?ip= 問出白名單內容");
+    }
+
+    /// ⚠️ 別人加過的 IP 不是「延長授權」，而是改寫別人的條目：標籤、到期
+    /// 時間、天數都會被蓋掉，到期提醒也被重設。member 一律擋下，所有權爭議
+    /// 交給 admin。
+    #[tokio::test]
+    async fn a_member_cannot_rewrite_another_members_allow_entry() {
+        let st = test_state();
+        db::create_user_with_platforms(&st.db, "ua", "a@x", "a", "member", Some("a@x"), &[]).unwrap();
+        db::create_user_with_platforms(&st.db, "ub", "b@x", "b", "member", Some("b@x"), &[]).unwrap();
+        db::upsert_allow(&st.db, "4.3.2.1", Some("老家"), Some("a@x"), db::now() + 30 * 86400, 30).unwrap();
+
+        let session = test_session();
+        session.insert(S_USER, "ub".to_string()).await.unwrap();
+        session.insert(S_NAME, "b@x".to_string()).await.unwrap();
+
+        let err = allow_add(
+            State(st.clone()),
+            session,
+            hdrs(&[]),
+            Json(AllowReq {
+                ip: Some("4.3.2.1".into()),
+                label: Some("hijack".into()),
+                ttl_days: Some(1),
+            }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .expect_err("別人名下的 IP 不該讓 member 改寫");
+        assert!(err.to_string().contains("其他成員授權"), "拿到的是：{err}");
+
+        let e = db::list_allow(&st.db).unwrap().into_iter().find(|e| e.ip == "4.3.2.1").unwrap();
+        assert_eq!(
+            (e.added_by.as_deref(), e.label.as_deref(), e.ttl_days),
+            (Some("a@x"), Some("老家"), 30),
+            "被拒絕的請求不得留下任何痕跡"
+        );
     }
 
     /// 前端呼叫的每個端點都必須接受它實際送出的方法。

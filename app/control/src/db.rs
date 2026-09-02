@@ -832,6 +832,36 @@ pub fn upsert_allow(
     Ok(())
 }
 
+/// 新增或改寫一條白名單。既有條目只有擁有者（或 admin）能改寫；別人的 IP
+/// 直接拒絕，回 false 且什麼都不動。
+///
+/// 檢查與寫入是同一句 SQL：`DO UPDATE … WHERE` 不成立時 changes() 是 0，
+/// 沒有「先查 owner 再 UPDATE」中間被人插隊的空隙。admin 改寫時 `added_by`
+/// 保持原擁有者 —— 那是「誰的網路」，不是「誰最後按了按鈕」。
+pub fn upsert_allow_owned(
+    db: &Db,
+    ip: &str,
+    label: Option<&str>,
+    owner: &str,
+    expires_at: i64,
+    ttl_days: i64,
+    is_admin: bool,
+) -> Result<bool> {
+    let conn = db.lock().unwrap();
+    let n = conn.execute(
+        "INSERT INTO allowlist (ip, label, added_by, added_at, expires_at, ttl_days)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(ip) DO UPDATE SET
+             label       = coalesce(excluded.label, allowlist.label),
+             expires_at  = excluded.expires_at,
+             ttl_days    = excluded.ttl_days,
+             expiry_notified_at = NULL
+         WHERE allowlist.added_by = excluded.added_by OR ?7",
+        params![ip, label, owner, now(), expires_at, ttl_days, is_admin],
+    )?;
+    Ok(n == 1)
+}
+
 pub fn remove_allow(db: &Db, ip: &str) -> Result<usize> {
     let conn = db.lock().unwrap();
     Ok(conn.execute("DELETE FROM allowlist WHERE ip = ?1", params![ip])?)
@@ -2082,6 +2112,34 @@ mod tests {
         assert_eq!(e.label.as_deref(), Some("咖啡廳"));
         assert_eq!(e.expires_at, 200);
         assert_eq!(e.ttl_days, 30, "改天數要生效");
+    }
+
+    /// 既有條目只有擁有者或 admin 能改寫；別人的 IP 一律拒絕，而且判斷放在
+    /// 同一句 SQL 裡，沒有「先查 owner 再寫」的競態。
+    #[test]
+    fn only_the_owner_or_an_admin_can_rewrite_an_entry() {
+        let db = test_db();
+        let t30 = now() + 30 * 86400;
+        let find = |db: &Db| list_allow(db).unwrap().into_iter().find(|e| e.ip == "1.2.3.4").unwrap();
+        assert!(upsert_allow_owned(&db, "1.2.3.4", Some("老家"), "a@x", t30, 30, false).unwrap());
+
+        // 別人：拒絕，什麼都不變
+        assert!(!upsert_allow_owned(&db, "1.2.3.4", Some("改名"), "b@x", now() + 86400, 1, false).unwrap());
+        let e = find(&db);
+        assert_eq!(
+            (e.expires_at, e.ttl_days, e.label.as_deref(), e.added_by.as_deref()),
+            (t30, 30, Some("老家"), Some("a@x"))
+        );
+
+        // 擁有者：可改
+        assert!(upsert_allow_owned(&db, "1.2.3.4", None, "a@x", t30 + 86400, 7, false).unwrap());
+        let e = find(&db);
+        assert_eq!((e.expires_at, e.ttl_days, e.label.as_deref()), (t30 + 86400, 7, Some("老家")));
+
+        // admin：可改，但 owner 不變
+        assert!(upsert_allow_owned(&db, "1.2.3.4", Some("管理員改"), "root@x", t30, 30, true).unwrap());
+        let e = find(&db);
+        assert_eq!((e.label.as_deref(), e.added_by.as_deref()), (Some("管理員改"), Some("a@x")));
     }
 
     /// 自動續期要依條目自己的 ttl_days，不是全域預設。
