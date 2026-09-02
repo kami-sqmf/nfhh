@@ -69,8 +69,9 @@ export default {
 /**
  * 推信給面板並分類結果，絕不 throw：
  *   { kind: "ok", panel }            2xx 且 JSON 合法
- *   { kind: "rejected", status }     任何 4xx、或 2xx 但 JSON 壞掉／不是物件 —— 永久性
- *   { kind: "unavailable", reason }  5xx、逾時、連不上 —— 暫時性
+ *   { kind: "rejected", status }     4xx（408／429 除外）、或 2xx 但 JSON
+ *                                    壞掉／不是物件 —— 永久性
+ *   { kind: "unavailable", reason }  5xx、408、429、逾時、連不上 —— 暫時性
  *   { kind: "unconfigured" }         沒有 PANEL_ENDPOINT / PANEL_SECRET —— 部署狀態，
  *                                    不是攻擊面（攻擊者改不了 Worker 的環境變數）。
  *                                    面板還沒上線時 FORWARD_MAP 是唯一的轉發路徑。
@@ -101,9 +102,18 @@ async function pushToPanel(message, env) {
   }
 }
 
+/**
+ * 這兩個 4xx 的語意是「等一下再試」而不是「這封信不收」，跟 5xx 同類：
+ * 408 是面板讀不完請求，429 可能根本不是面板發的 —— 前面的 Cloudflare
+ * Tunnel 自己就會限流。當成拒收會讓一次塞車害家人收不到碼。
+ */
+const RETRYABLE_STATUS = new Set([408, 429]);
+
 /** 把面板的回應分成「可用」「拒收」「不可用」三類。 */
 export async function classifyResponse(res) {
-  if (res.status >= 500) return { kind: "unavailable", reason: `HTTP ${res.status}` };
+  if (res.status >= 500 || RETRYABLE_STATUS.has(res.status)) {
+    return { kind: "unavailable", reason: `HTTP ${res.status}` };
+  }
   if (!res.ok) {
     // 面板的錯誤回應是 {"error": …}，不含信件內容，可安全記錄
     const detail = await res.text().catch(() => "");
@@ -159,10 +169,16 @@ function fallbackRecipients(to, env) {
   return [];
 }
 
-/** FALLBACK_TO 排第一，接上名單並去重、濾空。 */
+/**
+ * FALLBACK_TO 排第一，接上名單並去重、濾空。
+ *
+ * 只展開真的陣列：面板若回了 forward_to: 5 或 {}，展開會拋 TypeError，而這裡
+ * 在 message.forward() 之前、任何 try 之外 —— 整封信會不見。字串更陰險，
+ * 它可迭代，會被拆成一個個字元當成收件人。
+ */
 function withFallback(addrs, env) {
   const out = [];
-  for (const addr of [env.FALLBACK_TO, ...(addrs || [])]) {
+  for (const addr of [env.FALLBACK_TO, ...(Array.isArray(addrs) ? addrs : [])]) {
     if (typeof addr === "string" && addr && !out.includes(addr)) out.push(addr);
   }
   return out;

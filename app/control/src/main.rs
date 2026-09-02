@@ -1237,6 +1237,7 @@ impl From<anyhow::Error> for IngestError {
 /// 密鑰未設定時相關端點一律停用。
 fn require_mail_secret(st: &Shared, headers: &HeaderMap) -> std::result::Result<(), IngestError> {
     if st.cfg.mail_secret.is_empty() {
+        tracing::warn!("信件端點未啟用（NFHH_MAIL_SECRET 為空），已回 503 讓 Worker 照 FORWARD_MAP 轉發");
         return Err(IngestError::Disabled);
     }
     let given = headers
