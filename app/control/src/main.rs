@@ -104,7 +104,10 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .collect(),
             mail_enforce_sender: env_or("NFHH_MAIL_ENFORCE_SENDER", "0") == "1",
-            mail_authserv_id: env_or("NFHH_MAIL_AUTHSERV_ID", "mx.cloudflare.net"),
+            // 前後空白會讓比對永遠不成立 —— 那等於默默扣住所有信件
+            mail_authserv_id: env_or("NFHH_MAIL_AUTHSERV_ID", "mx.cloudflare.net")
+                .trim()
+                .to_string(),
             dns_audit: env_or("NFHH_DNS_AUDIT", "/smartdns-data/audit.log"),
             cf_account: env_or("NFHH_CF_ACCOUNT", ""),
             cf_token: env_or("NFHH_CF_TOKEN", ""),
@@ -3074,6 +3077,9 @@ async fn main() -> Result<()> {
     let _ = db::seed_setting(&db, db::keys::FORWARD_ENFORCE, "1");
     let _ = db::seed_setting(&db, db::keys::MAIL_DOMAIN, &cfg.mail_domain);
     seed_platform_mailboxes(&db, &cfg);
+
+    // 寄件者驗證的信任根。印出來，部署後的 canary 才有東西可以對照。
+    tracing::info!("寄件者驗證只採信 authserv-id = {}", cfg.mail_authserv_id);
 
     let mailer = mailer::Mailer::new(
         cfg.resend_key.clone(),

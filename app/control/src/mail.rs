@@ -59,29 +59,80 @@ fn authserv_matches(value: &str, expected: &str) -> bool {
         .is_some_and(|id| id.eq_ignore_ascii_case(expected))
 }
 
+/// 拿掉 CFWS 註解。`dkim=pass (1024-bit key)` 裡的括號段落是給人看的，
+/// 內容不受限制 —— 留著它等於留一條夾帶判決的路。
+///
+/// 註解在語法上等於一個空白，所以換成空白而不是直接刪掉：`dkim=(x)pass`
+/// 會變成 `dkim= pass`，兩個 token 都不成立，正好落在安全的一邊。
+/// 括號沒有閉合時後面整段丟掉，同樣是往安全的一邊倒。
+fn strip_comments(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut depth = 0usize;
+    for c in raw.chars() {
+        match c {
+            '(' => {
+                if depth == 0 {
+                    out.push(' ');
+                }
+                depth += 1;
+            }
+            ')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// 這個 token 是不是 `method=pass`。RFC 8601 的形狀是
+/// `method [ "/" version ] "=" result`，版本號可有可無。
+fn is_pass(token: &str, method: &str) -> bool {
+    let Some((m, result)) = token.split_once('=') else {
+        return false;
+    };
+    m.split('/').next() == Some(method) && result == "pass"
+}
+
 /// 解析 `Authentication-Results`。各方法以 `;` 分隔，先切段再於段內比對。
+///
+/// 段內一律**以 token 為單位**比對，不做子字串搜尋：判決必須是該段的第一個
+/// token，`header.d=` 這類屬性也必須自成一個 token。理由是 MTA 會把寄件者
+/// 可控的字串原樣抄進自己的表頭 —— `smtp.mailfrom=` 就是信封寄件者 ——
+/// 於是 `dkim=pass.header.d=netflix.com@evil.com` 這個合法信箱名，在子字串
+/// 比對下會被讀成一則「通過」的判決。
 fn parse_auth_results(raw: &str) -> (Vec<String>, Option<String>) {
-    let lower = raw.to_lowercase();
+    let lower = strip_comments(raw).to_lowercase();
     let mut dkim = Vec::new();
     let mut dmarc = None;
     for seg in lower.split(';') {
-        if seg.contains("dkim=pass")
-            && let Some(d) = value_after(seg, "header.d=")
+        // 判決是每段的開頭，之後才是 ptype.property。段首以外的都是資料。
+        let Some(verdict) = seg.split_whitespace().next() else {
+            continue;
+        };
+        if is_pass(verdict, "dkim")
+            && let Some(d) = property_domain(seg, "header.d=")
             && !dkim.contains(&d)
         {
             dkim.push(d);
         }
-        if seg.contains("dmarc=pass") && dmarc.is_none() {
-            dmarc = value_after(seg, "header.from=");
+        if is_pass(verdict, "dmarc") && dmarc.is_none() {
+            dmarc = property_domain(seg, "header.from=");
         }
     }
     (dkim, dmarc)
 }
 
-/// 取出 `key` 之後的網域值，遇到分隔字元就停。
-fn value_after(seg: &str, key: &str) -> Option<String> {
-    let start = seg.find(key)? + key.len();
-    let v: String = seg[start..]
+/// 取出 `key` 這個屬性的網域值。`key` 必須是整個 token 的開頭 ——
+/// 別的屬性的**值**裡出現同名字串不算數。
+fn property_domain(seg: &str, key: &str) -> Option<String> {
+    seg.split_whitespace()
+        .find_map(|t| t.strip_prefix(key))
+        .and_then(domain_value)
+}
+
+/// 只認網域字元，遇到別的就停（`@` 之後是本機部分，不是網域）。
+fn domain_value(raw: &str) -> Option<String> {
+    let v: String = raw
         .chars()
         .skip_while(|c| *c == '"' || *c == '\'')
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-')
@@ -735,6 +786,55 @@ Content-Type: text/html; charset=utf-8\r\n\
         assert!(!a.is_trusted(&allow()));
     }
 
+    /// MTA 會把寄件者可控的字串原樣抄進自己的 AR 表頭，最常見的是
+    /// `smtp.mailfrom=` 的信封位址。`dkim=pass.header.d=netflix.com@evil.com`
+    /// 是一個合法的信封位址 —— 判決只能是每段的**第一個 token**，否則寄件者
+    /// 光靠挑一個信箱名字就能替自己蓋章。
+    #[test]
+    fn sender_controlled_properties_cannot_smuggle_a_verdict() {
+        let a = auth_of(
+            "mx.cloudflare.net; dkim=none; \
+             spf=fail smtp.mailfrom=dkim=pass.header.d=netflix.com@evil.com",
+        );
+        assert!(a.dkim_domains.is_empty(), "smtp.mailfrom 的內容不是判決");
+        assert!(!a.is_trusted(&allow()));
+
+        let a = auth_of(
+            "mx.cloudflare.net; dmarc=none; \
+             spf=fail smtp.mailfrom=dmarc=pass.header.from=netflix.com@evil.com",
+        );
+        assert_eq!(a.dmarc_from, None, "smtp.mailfrom 的內容不是判決");
+        assert!(!a.is_trusted(&allow()));
+    }
+
+    /// 括號內是 CFWS 註解（常見於 `dkim=pass (1024-bit key)`），裡面可以是
+    /// 任何字元，所以它也是一條夾帶路徑。
+    #[test]
+    fn a_verdict_inside_a_comment_is_not_a_verdict() {
+        let a = auth_of("mx.cloudflare.net; dkim=none (dkim=pass header.d=netflix.com)");
+        assert!(a.dkim_domains.is_empty());
+        assert!(!a.is_trusted(&allow()));
+    }
+
+    /// 收緊之後，真實表頭（含 `header.i=` 與 `smtp.mailfrom=` 等額外欄位）
+    /// 仍要判成通過 —— 這條是誤殺的守門員。
+    #[test]
+    fn a_real_header_still_passes_after_token_anchoring() {
+        let a = auth_of(
+            "mx.cloudflare.net; dkim=pass header.d=netflix.com header.i=@netflix.com; \
+             spf=pass smtp.mailfrom=bounce@netflix.com",
+        );
+        assert_eq!(a.dkim_domains, vec!["netflix.com"]);
+        assert!(a.is_trusted(&allow()));
+    }
+
+    /// RFC 8601 的方法可以帶版本號：`method [ "/" version ] "=" result`。
+    #[test]
+    fn a_method_with_a_version_still_passes() {
+        let a = auth_of("mx.cloudflare.net; dkim/1=pass header.d=netflix.com");
+        assert!(a.is_trusted(&allow()));
+    }
+
     #[test]
     fn parses_auth_from_real_message() {
         let raw = b"From: Netflix <info@account.netflix.com>\r\n\
@@ -803,6 +903,23 @@ Subject: \xe9\xa9\x97\xe8\xad\x89\xe7\xa2\xbc\r\n\
             "mx.cloudflare.net",
         );
         assert!(!m.auth.is_trusted(&["netflix.com".into()]));
+    }
+
+    /// 完全沒有 Authentication-Results 的信落在「未通過」。
+    #[test]
+    fn a_message_with_no_authentication_results_is_not_trusted() {
+        let m = parse(&raw_with(""), "mx.cloudflare.net");
+        assert!(!m.auth.is_trusted(&["netflix.com".into()]));
+    }
+
+    /// 表頭名稱大小寫不敏感（RFC 5322），挑表頭時不能因此漏掉。
+    #[test]
+    fn the_header_name_is_matched_case_insensitively() {
+        let m = parse(
+            &raw_with("AUTHENTICATION-RESULTS: mx.cloudflare.net; dkim=pass header.d=netflix.com"),
+            "mx.cloudflare.net",
+        );
+        assert!(m.auth.is_trusted(&["netflix.com".into()]));
     }
 
     /// RFC 8601 允許 authserv-id 後面帶版本號。
