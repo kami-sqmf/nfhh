@@ -1234,7 +1234,9 @@ async fn mail_ingest(
     require_mail_secret(&st, &headers)?;
 
     let p = mail::parse(&body, &st.cfg.mail_authserv_id);
-    let verified = p.auth.is_trusted(&st.cfg.mail_allowed_senders);
+    // 以面板設定為準：環境變數只是首次啟動的種子（見 seed_settings）。
+    // 以前這裡讀 Config，UI 撤銷的網域會一直被信任到下次重啟。
+    let verified = p.auth.is_trusted(&db::get_setting_list(&st.db, db::keys::SENDER_DOMAINS));
 
     let mailbox = routing_mailbox(&headers, p.recipient.as_deref());
 
@@ -2788,6 +2790,19 @@ fn seed_platform_mailboxes(db: &db::Db, cfg: &Config) {
     let _ = db::set_setting_str_map(db, db::keys::PLATFORM_MAILBOXES, &boxes, None);
 }
 
+/// 環境變數只是**種子**：面板改過的設定不該被下一次重啟蓋回去，所以一律
+/// 只在鍵不存在時寫入。測試的 state 也要走這裡，否則 ingest 讀到空清單。
+fn seed_settings(db: &db::Db, cfg: &Config) {
+    let _ = db::seed_setting(db, db::keys::SENDER_MODE, if cfg.mail_enforce_sender { "enforce" } else { "observe" });
+    let _ = db::set_setting_list_if_absent(db, db::keys::SENDER_DOMAINS, &cfg.mail_allowed_senders);
+    let _ = db::set_setting_list_if_absent(db, db::keys::CODE_KEYWORDS, &[]);
+    let _ = db::set_setting_list_if_absent(db, db::keys::CODE_EXCLUDES, &[]);
+    // 預設只轉發通過寄件者驗證的信
+    let _ = db::seed_setting(db, db::keys::FORWARD_ENFORCE, "1");
+    let _ = db::seed_setting(db, db::keys::MAIL_DOMAIN, &cfg.mail_domain);
+    seed_platform_mailboxes(db, cfg);
+}
+
 /// 排除私有／保留位址。
 fn is_public(ip: &IpAddr) -> bool {
     match ip {
@@ -3063,20 +3078,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    // 環境變數只是**種子**：面板改過的設定不該被下一次重啟蓋回去。
-    // 所以這裡一律用 seed_setting（僅在鍵不存在時寫入）。
-    let _ = db::seed_setting(
-        &db,
-        db::keys::SENDER_MODE,
-        if cfg.mail_enforce_sender { "enforce" } else { "observe" },
-    );
-    let _ = db::set_setting_list_if_absent(&db, db::keys::SENDER_DOMAINS, &cfg.mail_allowed_senders);
-    let _ = db::set_setting_list_if_absent(&db, db::keys::CODE_KEYWORDS, &[]);
-    let _ = db::set_setting_list_if_absent(&db, db::keys::CODE_EXCLUDES, &[]);
-    // 預設只轉發通過寄件者驗證的信
-    let _ = db::seed_setting(&db, db::keys::FORWARD_ENFORCE, "1");
-    let _ = db::seed_setting(&db, db::keys::MAIL_DOMAIN, &cfg.mail_domain);
-    seed_platform_mailboxes(&db, &cfg);
+    seed_settings(&db, &cfg);
 
     // 寄件者驗證的信任根。印出來，部署後的 canary 才有東西可以對照。
     tracing::info!("寄件者驗證只採信 authserv-id = {}", cfg.mail_authserv_id);
@@ -3296,6 +3298,28 @@ mod tests {
 
         assert_eq!(out["actionable"], false);
         assert_eq!(db::recent_mails(&st.db, 60).unwrap().len(), 1, "信要留在管理收件匣");
+    }
+
+    /// 管理介面存的是 DB，ingest 以前讀的是啟動時的環境變數 —— 兩個權威來源。
+    /// UI 移除的網域必須立刻失效，新增的必須立刻生效，不需要重啟。
+    #[tokio::test]
+    async fn sender_domains_edited_in_the_panel_take_effect_immediately() {
+        let mut cfg = Config::from_env().unwrap();
+        cfg.mail_secret = "s3cret".into();
+        let st = state_with(cfg);
+        let h = || hdrs(&[("authorization", "Bearer s3cret"), ("x-nfhh-mailbox", "netflix@share.example.com")]);
+        let ingest = |id: &'static str| {
+            let st = st.clone();
+            async move {
+                mail_ingest(State(st), h(), eml("code", "code 123456", id)).await.map_err(|e| e.0).unwrap().0
+            }
+        };
+
+        db::set_setting_list(&st.db, db::keys::SENDER_DOMAINS, &["example.org".into()], None).unwrap();
+        assert_eq!(ingest("d1").await["verified"], false, "UI 移除 netflix.com 後要立刻不信任");
+
+        db::set_setting_list(&st.db, db::keys::SENDER_DOMAINS, &["netflix.com".into()], None).unwrap();
+        assert_eq!(ingest("d2").await["verified"], true);
     }
 
     /// 刪除是全域硬刪，規則必須跟清單一模一樣：同平台但清單看不到的信
@@ -3581,8 +3605,10 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
+        let db = db::test_db();
+        seed_settings(&db, &cfg);
         Arc::new(AppState {
-            db: db::test_db(),
+            db,
             webauthn,
             cfg,
             mailer: mailer::Mailer::new(String::new(), "a@b.c".into(), "tpl".into()),
