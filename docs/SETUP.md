@@ -133,9 +133,22 @@ sudo cp /opt/nfhh/deploy/nfhh-*.{service,timer,path} /etc/systemd/system/ && sud
 > [!WARNING]
 > 這是刻意的 fail-closed：nft 規則載入失敗時整套服務（含管理面板）都不會起來。
 > 用 `systemctl status nfhh-firewall.service` 看原因、修好後
-> `sudo systemctl restart nfhh-firewall.service && sudo systemctl start docker.service`
+> `sudo systemctl restart nfhh-firewall.service && sudo systemctl reset-failed docker.service && sudo systemctl start docker.service`
 > （是 `restart` 不是 `start`：這個 unit 是 `RemainAfterExit=yes` 的 oneshot，
-> 表被刪掉後它仍是 active，`start` 什麼都不會做）。
+> 表被刪掉後它仍是 active，`start` 什麼都不會做。多了 `reset-failed` 是因為
+> docker.service 設了 `Restart=always`／`RestartSec=2`／`StartLimitBurst=3`／
+> `StartLimitIntervalSec=60`—— `ExecStartPre` 失敗一樣算一次重試，nft 表消失時
+> Docker 會在幾秒內燒完 3 次配額並進入 `failed`，之後 60 秒內手動
+> `systemctl start` 都會被拒絕：「start request repeated too quickly」）。
+>
+> 這條相依是雙向的：`stop`／`restart` `nfhh-firewall.service` 現在也會連帶
+> 停／重啟 Docker（nft 規則本身不會因此消失，理由見 docs/DECISIONS.md）。
+> 只是要讓改過的規則生效，用 `sudo nft -f /opt/nfhh/config/nft/nfhh.nft`
+> （白名單另外 `sudo nft -f /opt/nfhh/generated/nft/clients.nft`），不要
+> `restart` 這個 unit —— 那會連 Docker 一起重啟。
+>
+> 緊急時要解除這條相依（例如要單獨除錯 Docker、暫時不想連動防火牆）：
+> `sudo rm /etc/systemd/system/docker.service.d/10-nfhh-firewall.conf && sudo systemctl daemon-reload`。
 
 <details>
 <summary>驗證 drop-in 真的擋得住（維護時段、需要 console 進入方式）</summary>
@@ -143,20 +156,20 @@ sudo cp /opt/nfhh/deploy/nfhh-*.{service,timer,path} /etc/systemd/system/ && sud
 > [!CAUTION]
 > 這段會停掉 Docker 並刪除正式的 nft 表幾十秒：所有樓層的 DNS／proxy 會斷。
 > 順序是**先停 Docker 再刪表**（刪表瞬間 `:53` 若還開著就是 open resolver）。
-> 整段用 `trap` 包起來，任何一步失敗都會把防火牆與 Docker 帶回來。
+> 整段用 `trap` 包起來，連線中斷或 shell 結束時 trap 會自動復原。
 
 ```bash
 set +e
-trap 'sudo systemctl restart nfhh-firewall.service; sudo systemctl start docker.service; echo "已復原：$(systemctl is-active nfhh-firewall.service docker.service | tr "\n" " ")"' EXIT
+trap 'sudo systemctl restart nfhh-firewall.service; sudo systemctl reset-failed docker.service; sudo systemctl start docker.service; echo "已復原：$(systemctl is-active nfhh-firewall.service docker.service | tr "\n" " ")"' EXIT
 sudo systemctl daemon-reload
 echo "requires/after: $(systemctl show docker.service -p Requires -p After | grep -c nfhh-firewall)"   # 預期 2
 sudo systemctl stop docker.service
 sudo nft delete table inet nfhh
-sudo systemctl start docker.service; echo "docker: $(systemctl is-active docker.service)"          # 預期 start 報錯、印出 failed 或 inactive
-echo "public listeners: $(sudo ss -ltnp | grep -cE ':53 |:443 |:853 ')"                            # 預期 0
-sudo systemctl restart nfhh-firewall.service && sudo nft list table inet nfhh >/dev/null && sudo systemctl start docker.service
+sudo systemctl start docker.service; echo "docker: $(systemctl is-active docker.service)"          # 預期 start 報錯，is-active 印出 activating、failed 或 inactive（docker 會自己重試幾次）
+echo "public listeners: $(sudo ss -ltunp | grep -cE '[:.](53|443|853)\s')"                          # 預期 0
+sudo systemctl restart nfhh-firewall.service && sudo nft list table inet nfhh >/dev/null && sudo systemctl reset-failed docker.service && sudo systemctl start docker.service
 systemctl is-active docker.service nfhh-firewall.service                                            # 預期兩行 active
-trap - EXIT
+systemctl is-active --quiet docker.service && systemctl is-active --quiet nfhh-firewall.service && trap - EXIT
 ```
 
 </details>

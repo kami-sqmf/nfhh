@@ -165,9 +165,11 @@ pub fn preflight() -> Result<()> {
         .output()
         .context("找不到 nft 執行檔")?;
     if !out.status.success() {
+        // 用 restart 不是 start：這個 unit 是 RemainAfterExit=yes 的 oneshot，
+        // 表被手動刪掉後它仍是 active，start 對已 active 的 unit 什麼都不會做。
         bail!(
             "nft 表 inet nfhh 不存在。請先啟動防火牆服務：\n  \
-             sudo systemctl start nfhh-firewall.service"
+             sudo systemctl restart nfhh-firewall.service"
         );
     }
     Ok(())

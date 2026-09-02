@@ -48,6 +48,8 @@ cat <<'EOF'
   2. ./nfhh apply                              # 填入對外 IP
   3. sudo nft -f config/nft/nfhh.nft           # 建立防火牆表
   4. sudo cp deploy/nfhh-*.{service,timer,path} /etc/systemd/system/
+     sudo mkdir -p /etc/systemd/system/docker.service.d
+     sudo cp deploy/docker.service.d/10-nfhh-firewall.conf /etc/systemd/system/docker.service.d/
      sudo systemctl daemon-reload
      sudo systemctl enable --now nfhh-firewall.service nfhh-sync-ip.timer nfhh-cert.path
   5. ./nfhh cert                               # 啟用 DoT（需先有 acme.sh 憑證）
