@@ -9,7 +9,7 @@ const S = {
     my_platforms: ['disneyplus', 'netflix'],
     needs_bootstrap: false, passkey_count: 1, is_admin: true,
     dot_host: 'dns.example.com', dot_ready: true, mail_enabled: true,
-    join_enabled: true, needs_email: false, cf_enabled: true,
+    join_enabled: true, cf_enabled: true,
     entries: [
       { ip: '198.51.100.7', label: '咖啡廳', added_by: 'alex@example.com', added_at: now - 86400,
         expires_at: now + 6 * 86400 + 82800, ttl_days: 7, renewed_at: null,

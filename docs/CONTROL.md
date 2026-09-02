@@ -213,7 +213,7 @@ cargo test -- --ignored smoke_send_invite
 > [!CAUTION]
 > **Worker 的 `FORWARD_MAP` 要自己去拿掉。** 那是面板停機時生效的那份名單，面板碰不到它 —— 不拿掉的話，面板一停機，已經被移除的人又會開始收到碼。移除的確認對話框會提醒這件事。
 
-`added_by` 存的是**顯示名稱**而不是 user_id（v1 就留下的形狀）。舊帳號補填 email 時 `rename_owner` 會把它對齊，所以刪除比對得上 —— 這也是為什麼那支函式不能拿掉。
+`added_by` 存的是**顯示名稱**而不是 user_id（v1 就留下的形狀）。所有帳號的稱呼都是 email、註冊後不變，所以比對得上；v6 遷移期的 `rename_owner` 已隨補填流程一起移除。
 
 ### 裝置遺失
 
@@ -525,7 +525,6 @@ Cloudflare 那步失敗**不回滾登記**，跟寄信失敗同一個原則：�
 | POST | `/api/login/any/start` `/finish` | 公開；可探索憑證 |
 | POST | `/api/login/start` `/finish` | 公開；信箱 + passkey（退路） |
 | POST | `/api/logout` | 登入 |
-| POST | `/api/me/email` | 登入；v6 遷移用，補填信箱且只能填一次 |
 | GET | `/api/passkeys` | 登入；只列自己的，不含憑證材料 |
 | POST | `/api/passkeys/{id}` | 登入；重新命名，限自己的 |
 | DELETE | `/api/passkeys/{id}` | 登入；限自己的，**擋掉刪到剩零把** |

@@ -31,7 +31,6 @@ check POST   /api/login/finish
 check POST   /api/register/start
 check POST   /api/register/finish
 check POST   /api/logout
-check POST   /api/me/email
 check GET    /api/passkeys
 check POST   /api/passkeys/x
 check DELETE /api/passkeys/x

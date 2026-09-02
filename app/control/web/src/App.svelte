@@ -4,7 +4,6 @@
   import BottomNav from './components/BottomNav.svelte'
 
   import Bootstrap from './screens/Bootstrap.svelte'
-  import NeedEmail from './screens/NeedEmail.svelte'
   import Login from './screens/Login.svelte'
   import Join from './screens/Join.svelte'
   import JoinCode from './screens/JoinCode.svelte'
@@ -38,9 +37,6 @@
 {:else if !app.status.logged_in}
   <Msg />
   <Auth />
-{:else if app.status.needs_email}
-  <Msg />
-  <NeedEmail />
 {:else}
   <Msg />
   <Screen />

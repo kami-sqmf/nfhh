@@ -96,7 +96,7 @@
         autocomplete="username webauthn"
         autocapitalize="off"
         spellcheck="false"
-        placeholder="Email 或帳號"
+        placeholder="Email"
         onkeydown={(e) => e.key === 'Enter' && byEmail()}
         class="w-full px-4 py-3.5 rounded-md bg-surface border-[1.5px] border-line-firm
                font-mono outline-none focus:border-fg"
@@ -106,11 +106,6 @@
         disabled={busy}
         class="mt-2 w-full py-3.5 rounded-md border-[1.5px] border-line-firm text-item font-medium disabled:opacity-50"
       >登入</button>
-      <!-- v6 之前的帳號還沒有信箱，登入要用原本的帳號名。
-           後端會先查 email、查不到再退回 username。 -->
-      <p class="mt-2 text-label leading-relaxed text-fg-faint text-pretty">
-        改版前建立的帳號還沒有信箱，請填原本的帳號名稱；登入後面板會請你補上 Email。
-      </p>
     </div>
   {:else}
     <button

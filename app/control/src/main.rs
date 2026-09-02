@@ -699,12 +699,7 @@ async fn login_start(
 ) -> ApiResult<Json<RequestChallengeResponse>> {
     clear_auth_flows(&session).await?;
     let ident = req.email.trim().to_lowercase();
-    // 先查 email；查不到再退回 username，讓 v6 之前註冊、還沒補信箱的
-    // 帳號仍然登得進來。
-    let user = match db::find_user_by_email(&st.db, &ident)? {
-        Some(u) => u,
-        None => db::find_user(&st.db, &ident)?.context("查無此帳號")?,
-    };
+    let user = db::find_user_by_email(&st.db, &ident)?.context("查無此帳號")?;
 
     let passkeys: Vec<Passkey> = db::credentials_for(&st.db, &user.id)?
         .iter()
@@ -817,8 +812,6 @@ struct Status {
     mail_enabled: bool,
     /// 「用 Email 加入」是否可用（要有寄信金鑰）
     join_enabled: bool,
-    /// v6 之前註冊的帳號還沒有信箱，要先補填才能用平台分權與轉發。
-    needs_email: bool,
     /// 轉發收件人的驗證狀態查得到嗎。false 時前端顯示「未查詢」，
     /// 不可顯示成「尚未驗證」—— 那是兩件不同的事。
     cf_enabled: bool,
@@ -894,11 +887,6 @@ async fn status(
         _ => None,
     };
 
-    // v6 之前註冊的帳號還沒有信箱。要先補填，平台分權與轉發才對得上人。
-    let needs_email = user.as_ref().is_some_and(|(uid, _)| {
-        db::get_user(&st.db, uid).ok().flatten().is_some_and(|u| u.email.is_none())
-    });
-
     Ok(Json(Status {
         logged_in: user.is_some(),
         username: user.map(|(_, n)| n),
@@ -919,7 +907,6 @@ async fn status(
         dot_ready: dot_ready(&st.cfg.dot_conf),
         mail_enabled: !st.cfg.mail_secret.is_empty(),
         join_enabled: st.mailer.enabled(),
-        needs_email,
         cf_enabled: st.cf.enabled(),
     }))
 }
@@ -2250,54 +2237,6 @@ async fn passkey_rename(
     Ok(Json(serde_json::json!({ "ok": n > 0 })))
 }
 
-// ── 補填 Email（v6 遷移用）────────────────────────────
-
-/// 讓 v6 之前註冊的帳號補上自己的信箱。
-///
-/// 那些帳號的 `email` 是 NULL，而面板現在一律以信箱稱呼使用者、
-/// 平台授權與轉發也都靠它。沒有這條路徑的話舊帳號會卡在半途 ——
-/// 登得進來，但畫面上顯示的是舊的 username。
-///
-/// 只能設定**自己的**，而且只能設定一次（已經有信箱的要換得走別的流程，
-/// 目前沒有 —— 換信箱牽涉到重新驗證，不是這支端點該做的事）。
-async fn set_my_email(
-    State(st): State<Shared>,
-    session: Session,
-    headers: HeaderMap,
-    Json(req): Json<EmailReq>,
-) -> ApiResult<Json<serde_json::Value>> {
-    let (uid, _) = require_user(&st, &session).await?;
-    let me = db::get_user(&st.db, &uid)?.context("帳號已不存在")?;
-    if me.email.is_some() {
-        return Err(AppError(anyhow::anyhow!("這個帳號已經有信箱了")));
-    }
-
-    let email = req.email.trim().to_lowercase();
-    if !email.contains('@') {
-        return Err(AppError(anyhow::anyhow!("請輸入完整的 Email 位址")));
-    }
-    if db::find_user_by_email(&st.db, &email)?.is_some() {
-        return Err(AppError(anyhow::anyhow!("這個位址已經被別的帳號用了")));
-    }
-
-    db::set_user_email(&st.db, &uid, &email)?;
-    // 白名單的擁有者標記存的是稱呼不是 id，稱呼變了要一起搬 ——
-    // 否則這個人既有的條目會變成「不是我的」，額度也會跟著歸零。
-    let moved = db::rename_owner(&st.db, &me.username, &email)?;
-    session.insert(S_NAME, &email).await?;
-    if moved > 0 {
-        tracing::info!("補填 email 後，{moved} 筆白名單條目的擁有者標記已一併更新");
-    }
-    db::audit(
-        &st.db,
-        Some(&email),
-        "email_backfilled",
-        Some(&me.username),
-        client_ip(&headers).as_deref(),
-    );
-    Ok(Json(serde_json::json!({ "ok": true })))
-}
-
 // ── 面板設定（僅管理員）───────────────────────────────
 //
 // 這些以前是環境變數，改一次要重啟容器。搬進 DB 之後 UI 存檔即生效，
@@ -2920,7 +2859,6 @@ fn routes(state: Shared) -> Router {
         .route("/api/allow/{ip}/queries", get(allow_queries))
         .route("/api/audit", get(audit_list))
         .route("/api/settings", get(settings_get).put(settings_put))
-        .route("/api/me/email", post(set_my_email))
         .route("/api/passkeys", get(passkey_list))
         .route("/api/push/key", get(push_key))
         .route("/api/push/subs", get(push_list).post(push_subscribe))
@@ -2993,6 +2931,14 @@ async fn main() -> Result<()> {
 
     nft::preflight()?;
     let db = db::open(&cfg.db_path)?;
+
+    // v6 遷移路徑（補填 Email、username 登入）已移除。還有這種帳號的話它
+    // 登不進來，只能由 admin 刪掉後重新邀請。
+    match db::users_without_email(&db) {
+        Ok(0) => {}
+        Ok(n) => tracing::error!("{n} 個帳號沒有 email，無法登入；請刪除後重新邀請"),
+        Err(e) => tracing::warn!("檢查缺 email 的帳號失敗: {e:#}"),
+    }
 
     // 還沒有任何使用者時，發一組一次性註冊碼並印在日誌
     if db::user_count(&db)? == 0 && !db::has_unused_bootstrap(&db)? {
@@ -3731,6 +3677,37 @@ mod tests {
         assert!(err.0.to_string().contains("已失效"), "拿到的是：{}", err.0);
         assert_eq!(db::credentials_for(&st.db, "admin").unwrap().len(), 1, "admin 不得多出憑證");
         assert!(db::credentials_for(&st.db, "mem").unwrap().is_empty(), "也不該偷偷寫給 member 自己");
+    }
+
+    /// 遷移期結束：登入只認 email，不再退回 username。退路留著，等於一個
+    /// 不需要信箱證明就能指定登入目標的入口。
+    #[tokio::test]
+    async fn login_no_longer_falls_back_to_username() {
+        let st = test_state();
+        db::create_user_with_platforms(&st.db, "u1", "alex", "alex", "member", Some("alex@example.com"), &[]).unwrap();
+
+        let err = login_start(State(st.clone()), test_session(), Json(EmailReq { email: "alex".into() }))
+            .await
+            .map_err(|e| e.0)
+            .unwrap_err();
+        assert!(err.to_string().contains("查無此帳號"), "{err}");
+
+        // 用 email 查得到（沒有 passkey 所以停在下一關，錯誤訊息不同）
+        let err = login_start(State(st.clone()), test_session(), Json(EmailReq { email: "alex@example.com".into() }))
+            .await
+            .map_err(|e| e.0)
+            .unwrap_err();
+        assert!(err.to_string().contains("沒有已註冊的 passkey"), "{err}");
+    }
+
+    /// 部署前的假設是「沒有任何帳號缺 email」。啟動時要把違反假設的帳號點名。
+    #[test]
+    fn users_without_email_are_counted() {
+        let db = db::test_db();
+        db::create_user_with_platforms(&db, "a", "a", "a", "member", Some("a@x"), &[]).unwrap();
+        assert_eq!(db::users_without_email(&db).unwrap(), 0);
+        db::create_user_with_platforms(&db, "b", "b", "b", "member", None, &[]).unwrap();
+        assert_eq!(db::users_without_email(&db).unwrap(), 1);
     }
 
     /// 上面那條攻擊鏈其實停在 `clear_auth_flows`，走不到 owner 檢查。

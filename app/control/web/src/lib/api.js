@@ -29,7 +29,6 @@ export const api = {
   joinVerify: (email, code) => req('/api/join/verify', { body: { email, code } }),
   // 邀請函連結：兌換成功等於信箱已驗證，下一步直接建 Passkey
   joinInvite: (token) => req('/api/join/invite', { body: { token } }),
-  setMyEmail: (email) => req('/api/me/email', { body: { email } }),
 
   // 個人的 Passkey。一律只操作自己的 —— admin 也碰不到別人的憑證。
   passkeys: () => req('/api/passkeys'),

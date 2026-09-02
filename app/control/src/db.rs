@@ -435,8 +435,8 @@ pub struct User {
     pub display_name: String,
     /// "admin" 可管理邀請碼並移除任何人的白名單；"member" 只能管自己加的
     pub role: String,
-    /// 面板一律以 email 稱呼使用者。v6 之前註冊的帳號為 None，
-    /// 首次登入時會被要求補填。
+    /// 面板一律以 email 稱呼使用者。v6 之後建立的帳號一定有值 ——
+    /// 補填流程已隨遷移期一起移除，欄位可空只是 schema 還留著的形狀。
     pub email: Option<String>,
 }
 
@@ -445,10 +445,16 @@ impl User {
         self.role == "admin"
     }
 
-    /// 畫面上顯示用。舊帳號還沒補 email 之前退回 username。
+    /// 畫面上顯示用。email 是可空欄位，沒有值就退回 username。
     pub fn label(&self) -> &str {
         self.email.as_deref().unwrap_or(&self.username)
     }
+}
+
+/// 遷移期已結束，不該再有沒有 email 的帳號。啟動時點名，方便發現漏網的。
+pub fn users_without_email(db: &Db) -> Result<i64> {
+    let conn = db.lock().unwrap();
+    Ok(conn.query_row("SELECT count(*) FROM users WHERE email IS NULL", [], |r| r.get(0))?)
 }
 
 pub fn user_count(db: &Db) -> Result<i64> {
@@ -466,17 +472,6 @@ fn row_to_user(r: &rusqlite::Row) -> rusqlite::Result<User> {
         role: r.get(3)?,
         email: r.get(4)?,
     })
-}
-
-pub fn find_user(db: &Db, username: &str) -> Result<Option<User>> {
-    let conn = db.lock().unwrap();
-    Ok(conn
-        .query_row(
-            &format!("SELECT {USER_COLS} FROM users WHERE username = ?1"),
-            params![username],
-            row_to_user,
-        )
-        .optional()?)
 }
 
 /// 登入以 email 為入口。位址一律正規化後比對。
@@ -509,15 +504,6 @@ pub fn list_users(db: &Db) -> Result<Vec<User>> {
     ))?;
     let rows = stmt.query_map([], row_to_user)?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
-}
-
-pub fn set_user_email(db: &Db, id: &str, email: &str) -> Result<()> {
-    let conn = db.lock().unwrap();
-    conn.execute(
-        "UPDATE users SET email = ?2 WHERE id = ?1",
-        params![id, norm(email)],
-    )?;
-    Ok(())
 }
 
 /// 角色升降。呼叫端負責擋掉「拿掉最後一個 admin」——
@@ -777,21 +763,6 @@ pub fn allow_count_by(db: &Db, added_by: &str) -> Result<i64> {
         "SELECT COUNT(*) FROM allowlist WHERE added_by = ?1",
         params![added_by],
         |r| r.get(0),
-    )?)
-}
-
-/// 把白名單的擁有者標記從舊的稱呼改成新的。
-///
-/// `added_by` 存的是**顯示名稱**而不是 user_id —— 這是 v1 就留下的形狀，
-/// 而額度與「只能移除自己加的」都靠它比對。舊帳號補填 email 之後稱呼會變，
-/// 不一起改的話那個人的條目會突然變成「不是我的」，額度也會歸零。
-///
-/// 稽核紀錄刻意**不改**：那是歷史，當時的 actor 就是叫那個名字。
-pub fn rename_owner(db: &Db, from: &str, to: &str) -> Result<usize> {
-    let conn = db.lock().unwrap();
-    Ok(conn.execute(
-        "UPDATE allowlist SET added_by = ?2 WHERE added_by = ?1",
-        params![from, to],
     )?)
 }
 
@@ -2350,25 +2321,6 @@ mod tests {
         assert_eq!(u.id, "u1");
         assert_eq!(u.email.as_deref(), Some("alex@example.com"));
         assert_eq!(u.label(), "alex@example.com", "有 email 就以 email 稱呼");
-    }
-
-    /// 補填 email 之後，這個人既有的白名單條目不能變成「不是我的」。
-    /// added_by 存的是稱呼不是 id，稱呼變了要一起搬。
-    #[test]
-    fn backfilling_email_moves_ownership() {
-        let db = mem();
-        create_user_with_platforms(&db, "u1", "alex", "alex", "admin", None, &[]).unwrap();
-        upsert_allow(&db, "1.1.1.1", Some("家裡"), Some("alex"), 999, 7).unwrap();
-        upsert_allow(&db, "2.2.2.2", None, Some("someone-else"), 999, 7).unwrap();
-        assert_eq!(allow_count_by(&db, "alex").unwrap(), 1);
-
-        set_user_email(&db, "u1", "alex@example.com").unwrap();
-        assert_eq!(rename_owner(&db, "alex", "alex@example.com").unwrap(), 1);
-
-        assert_eq!(allow_count_by(&db, "alex@example.com").unwrap(), 1);
-        assert_eq!(allow_count_by(&db, "alex").unwrap(), 0);
-        // 別人的條目不能被順手搬走
-        assert_eq!(allow_count_by(&db, "someone-else").unwrap(), 1);
     }
 
     /// credential id 會出現在登入回應裡，不是機密。刪除必須綁上擁有者，
