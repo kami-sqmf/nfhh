@@ -325,7 +325,10 @@ fn html_to_text(html: &str) -> String {
 
     while let Some((i, c)) = chars.next() {
         if c == '<' {
-            // script / style 的內容整段丟掉
+            // script / style 的內容整段丟掉。跳過之後直接 continue 外層迴圈 ——
+            // 不然會落到下面「吃到下一個 `>` 為止」那段，把區塊之後的正常內容
+            // 一起當成標籤內容吞掉。
+            let mut skipped = false;
             for tag in ["script", "style"] {
                 if lower[i..].starts_with(&format!("<{tag}")) {
                     if let Some(e) = lower[i..].find(&format!("</{tag}>")) {
@@ -334,8 +337,12 @@ fn html_to_text(html: &str) -> String {
                             if *j >= skip_to { break; }
                             chars.next();
                         }
+                        skipped = true;
                     }
                 }
+            }
+            if skipped {
+                continue;
             }
             // 區塊標籤換行
             if lower[i..].starts_with("<br") || lower[i..].starts_with("<p")
@@ -760,5 +767,18 @@ Subject: \xe9\xa9\x97\xe8\xad\x89\xe7\xa2\xbc\r\n\
             let _ = html_to_text(s);
             let _ = decode_entities(s);
         }
+    }
+
+    /// 迴歸：跳過 script/style 區塊後，原本會誤吞到「下一個」`>` 為止，
+    /// 把區塊之後的內容一起吃掉。
+    #[test]
+    fn text_after_a_script_or_style_block_is_kept() {
+        let t = html_to_text("<style>x{}</style>487261 is your code");
+        assert!(t.contains("487261"), "style 區塊之後的內容不該被吞掉");
+
+        let t = html_to_text("<script>a</script>KEEP<p>y</p>");
+        assert!(t.contains("KEEP"), "script 區塊之後的內容不該被吞掉");
+        assert!(t.contains('y'));
+        assert!(!t.contains('a'), "script 內容本身仍要整段丟掉");
     }
 }
