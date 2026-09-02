@@ -59,24 +59,48 @@ fn authserv_matches(value: &str, expected: &str) -> bool {
         .is_some_and(|id| id.eq_ignore_ascii_case(expected))
 }
 
-/// 拿掉 CFWS 註解。`dkim=pass (1024-bit key)` 裡的括號段落是給人看的，
-/// 內容不受限制 —— 留著它等於留一條夾帶判決的路。
+/// 把表頭正規化成「只剩結構」的樣子，之後才好照 `;` 與空白切開。做兩件事：
 ///
-/// 註解在語法上等於一個空白，所以換成空白而不是直接刪掉：`dkim=(x)pass`
-/// 會變成 `dkim= pass`，兩個 token 都不成立，正好落在安全的一邊。
-/// 括號沒有閉合時後面整段丟掉，同樣是往安全的一邊倒。
-fn strip_comments(raw: &str) -> String {
+/// 1. 拿掉 CFWS 註解。`dkim=pass (1024-bit key)` 裡的括號段落是給人看的，
+///    內容不受限制 —— 留著它等於留一條夾帶判決的路。註解在語法上等於一個
+///    空白，所以換成空白而不是直接刪掉：`dkim=(x)pass` 變成 `dkim= pass`，
+///    兩個 token 都不成立，正好落在安全的一邊。括號沒閉合時後面整段丟掉，
+///    同樣往安全的一邊倒。
+/// 2. 吃掉引號字串裡的結構字元（`;` 與空白類）。`;`、空白、`=` 都是 RFC 5321
+///    引號本地部的合法字元，所以 `smtp.mailfrom="; dkim=pass header.d=x"@evil`
+///    這種**合法**的信封位址，會在切段之後長出一段假的判決。反過來，RFC 8601
+///    的 `reason=` 本來就是引號字串、裡面本來就可能有 `;`，把它當段落分隔會
+///    誤殺真信。兩邊的解法是同一個：引號內不留任何能開段落或開 token 的字元。
+///
+/// 引號內的**內容**保留（不是抹掉），`header.d="netflix.com"` 才照樣讀得出來。
+/// `\` 跳脫的下一個字元一律換成 `_`，`\"` 因此不會提早結束字串。
+///
+/// 這個轉換是冪等的，重複跑不會改變結果。
+fn strip_cfws(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
-    let mut depth = 0usize;
+    let (mut depth, mut quoted, mut esc) = (0usize, false, false);
     for c in raw.chars() {
+        if esc {
+            esc = false;
+            if depth == 0 {
+                out.push('_');
+            }
+            continue;
+        }
         match c {
-            '(' => {
+            '\\' if quoted => esc = true,
+            '"' if depth == 0 => {
+                quoted = !quoted;
+                out.push('"');
+            }
+            '(' if !quoted => {
                 if depth == 0 {
                     out.push(' ');
                 }
                 depth += 1;
             }
-            ')' => depth = depth.saturating_sub(1),
+            ')' if !quoted => depth = depth.saturating_sub(1),
+            ';' | ' ' | '\t' | '\r' | '\n' if quoted && depth == 0 => {}
             _ if depth == 0 => out.push(c),
             _ => {}
         }
@@ -101,7 +125,7 @@ fn is_pass(token: &str, method: &str) -> bool {
 /// 於是 `dkim=pass.header.d=netflix.com@evil.com` 這個合法信箱名，在子字串
 /// 比對下會被讀成一則「通過」的判決。
 fn parse_auth_results(raw: &str) -> (Vec<String>, Option<String>) {
-    let lower = strip_comments(raw).to_lowercase();
+    let lower = strip_cfws(raw).to_lowercase();
     let mut dkim = Vec::new();
     let mut dmarc = None;
     for seg in lower.split(';') {
@@ -157,14 +181,18 @@ pub fn parse(raw: &[u8], authserv_id: &str) -> Parsed {
     // 先挑出第一個同名表頭、再讀它的值：兩步不能合成一步。合起來寫的話，
     // 第一個表頭的值是空的（`as_text()` 給 None）就會靜靜地滑到第二個，
     // 而那個第二個正是寄件者塞的。
-    let auth_raw = msg
+    //
+    // 挑段之前先正規化：authserv-id 前面可以合法地帶一段 CFWS 註解
+    // （`(added by cf) mx.cloudflare.net; …`），不先拿掉會把真信判成別人寫的。
+    let auth = msg
         .headers()
         .iter()
         .find(|h| h.name().eq_ignore_ascii_case("authentication-results"))
         .and_then(|h| h.value().as_text())
+        .map(strip_cfws)
         .filter(|v| authserv_matches(v, authserv_id))
         .unwrap_or_default();
-    let (dkim_domains, dmarc_from) = parse_auth_results(auth_raw);
+    let (dkim_domains, dmarc_from) = parse_auth_results(&auth);
 
     let subject = msg.subject().map(|s| s.to_string());
 
@@ -828,6 +856,43 @@ Content-Type: text/html; charset=utf-8\r\n\
         assert!(a.is_trusted(&allow()));
     }
 
+    /// `;`、空白、`=` 都是 RFC 5321 引號本地部的合法字元，所以一個合法的
+    /// 信封位址可以在表頭裡「長出」一個新段落。引號內的東西不管長什麼樣，
+    /// 都不能開出新的段落或新的 token。
+    #[test]
+    fn a_quoted_property_value_cannot_open_a_segment() {
+        let a = auth_of(
+            r#"mx.cloudflare.net; spf=pass smtp.mailfrom="; dkim=pass header.d=netflix.com"@evil.com"#,
+        );
+        assert!(a.dkim_domains.is_empty(), "引號內的內容不能自成一段");
+        assert!(!a.is_trusted(&allow()));
+
+        // `\"` 是跳脫過的引號，不結束字串 —— 否則從這裡就能溜出去
+        let a = auth_of(
+            r#"mx.cloudflare.net; spf=pass smtp.mailfrom="\"; dkim=pass header.d=netflix.com"@evil.com"#,
+        );
+        assert!(a.dkim_domains.is_empty(), "跳脫的引號不結束字串");
+        assert!(!a.is_trusted(&allow()));
+
+        // token 的分隔不只有空格
+        let a = auth_of(
+            "mx.cloudflare.net; spf=pass smtp.mailfrom=\";\tdkim=pass\theader.d=netflix.com\"@evil.com",
+        );
+        assert!(a.dkim_domains.is_empty(), "tab 也是分隔字元");
+        assert!(!a.is_trusted(&allow()));
+    }
+
+    /// 反過來也要成立：RFC 8601 的 `reason=` 是引號字串，裡面本來就可能有
+    /// `;`。把引號內的分號當成段落分隔，真信會被判成沒通過。
+    #[test]
+    fn a_quoted_reason_with_a_semicolon_is_still_a_pass() {
+        let a = auth_of(
+            r#"mx.cloudflare.net; dkim=pass reason="key retrieved; ok" header.d=netflix.com"#,
+        );
+        assert_eq!(a.dkim_domains, vec!["netflix.com"]);
+        assert!(a.is_trusted(&allow()));
+    }
+
     /// RFC 8601 的方法可以帶版本號：`method [ "/" version ] "=" result`。
     #[test]
     fn a_method_with_a_version_still_passes() {
@@ -910,6 +975,20 @@ Subject: \xe9\xa9\x97\xe8\xad\x89\xe7\xa2\xbc\r\n\
     fn a_message_with_no_authentication_results_is_not_trusted() {
         let m = parse(&raw_with(""), "mx.cloudflare.net");
         assert!(!m.auth.is_trusted(&["netflix.com".into()]));
+    }
+
+    /// authserv-id 前面可以合法地帶一段 CFWS 註解。那是註解，不是別人的
+    /// 收信端 —— 不能因此把整封信扣住。
+    #[test]
+    fn a_leading_comment_before_the_authserv_id_is_fine() {
+        let m = parse(
+            &raw_with(
+                "Authentication-Results: (added by cf) mx.cloudflare.net; \
+                 dkim=pass header.d=netflix.com",
+            ),
+            "mx.cloudflare.net",
+        );
+        assert!(m.auth.is_trusted(&["netflix.com".into()]));
     }
 
     /// 表頭名稱大小寫不敏感（RFC 5322），挑表頭時不能因此漏掉。
