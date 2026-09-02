@@ -1090,7 +1090,7 @@ async fn allow_add(
         me.is_admin(),
     )? {
         return Err(AppError(anyhow::anyhow!(
-            "{ip_str} 已由其他成員授權，只有本人或管理員能修改"
+            "{ip_str} 不是你新增的，只有新增者或管理員能修改"
         )));
     }
 
@@ -3890,7 +3890,7 @@ mod tests {
         .await
         .map_err(|e| e.0)
         .expect_err("別人名下的 IP 不該讓 member 改寫");
-        assert!(err.to_string().contains("其他成員授權"), "拿到的是：{err}");
+        assert!(err.to_string().contains("不是你新增的"), "拿到的是：{err}");
 
         let e = db::list_allow(&st.db).unwrap().into_iter().find(|e| e.ip == "4.3.2.1").unwrap();
         assert_eq!(
@@ -3898,6 +3898,33 @@ mod tests {
             (Some("a@x"), Some("老家"), 30),
             "被拒絕的請求不得留下任何痕跡"
         );
+    }
+
+    /// 額度只在「全新的 IP」時扣，但那條路要真的擋得住 —— 額度滿了就不能
+    /// 再授權沒看過的網路。
+    #[tokio::test]
+    async fn a_full_quota_rejects_a_new_ip() {
+        let mut cfg = Config::from_env().unwrap();
+        cfg.max_per_user = 1;
+        let st = state_with(cfg);
+        db::create_user_with_platforms(&st.db, "ua", "a@x", "a", "member", Some("a@x"), &[]).unwrap();
+        db::upsert_allow(&st.db, "4.3.2.1", None, Some("a@x"), db::now() + 86400, 1).unwrap();
+
+        let session = test_session();
+        session.insert(S_USER, "ua".to_string()).await.unwrap();
+        session.insert(S_NAME, "a@x".to_string()).await.unwrap();
+
+        let err = allow_add(
+            State(st.clone()),
+            session,
+            hdrs(&[]),
+            Json(AllowReq { ip: Some("1.2.3.4".into()), label: None, ttl_days: Some(1) }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .expect_err("額度滿了就不該再收新的 IP");
+        assert!(err.to_string().contains("額度已滿"), "拿到的是：{err}");
+        assert_eq!(db::list_allow(&st.db).unwrap().len(), 1, "被擋下的請求不得留下條目");
     }
 
     /// 前端呼叫的每個端點都必須接受它實際送出的方法。

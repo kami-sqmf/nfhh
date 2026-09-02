@@ -807,6 +807,9 @@ pub fn purge_expired(db: &Db) -> Result<usize> {
     Ok(conn.execute("DELETE FROM allowlist WHERE expires_at <= ?1", params![now()])?)
 }
 
+/// ⚠️ 這支**不做任何所有權檢查**，任何呼叫者都能改寫任何人的條目。
+/// 只給 `nft::import_legacy`（開機匯入，當下還沒有使用者）與測試用；
+/// handler 一律走 `upsert_allow_owned`。
 pub fn upsert_allow(
     db: &Db,
     ip: &str,
@@ -836,8 +839,10 @@ pub fn upsert_allow(
 /// 直接拒絕，回 false 且什麼都不動。
 ///
 /// 檢查與寫入是同一句 SQL：`DO UPDATE … WHERE` 不成立時 changes() 是 0，
-/// 沒有「先查 owner 再 UPDATE」中間被人插隊的空隙。admin 改寫時 `added_by`
-/// 保持原擁有者 —— 那是「誰的網路」，不是「誰最後按了按鈕」。
+/// 沒有「先查 owner 再 UPDATE」中間被人插隊的空隙。admin 改寫**有主**的條目
+/// 時 `added_by` 保持原擁有者 —— 那是「誰的網路」，不是「誰最後按了按鈕」；
+/// 只有**無主**的條目（`clients.nft` 匯入的沒有 added_by）會就這樣認到
+/// admin 名下，讓它從此有人負責。`coalesce` 保證這不會奪走別人的條目。
 pub fn upsert_allow_owned(
     db: &Db,
     ip: &str,
@@ -855,6 +860,7 @@ pub fn upsert_allow_owned(
              label       = coalesce(excluded.label, allowlist.label),
              expires_at  = excluded.expires_at,
              ttl_days    = excluded.ttl_days,
+             added_by    = coalesce(allowlist.added_by, excluded.added_by),
              expiry_notified_at = NULL
          WHERE allowlist.added_by = excluded.added_by OR ?7",
         params![ip, label, owner, now(), expires_at, ttl_days, is_admin],
@@ -2140,6 +2146,29 @@ mod tests {
         assert!(upsert_allow_owned(&db, "1.2.3.4", Some("管理員改"), "root@x", t30, 30, true).unwrap());
         let e = find(&db);
         assert_eq!((e.label.as_deref(), e.added_by.as_deref()), (Some("管理員改"), Some("a@x")));
+    }
+
+    /// `clients.nft` 匯入的條目沒有 added_by。無主不等於大家的：member 一樣
+    /// 改不動，而 admin 改寫時順手認領，讓它從此有人負責（也才刪得掉）。
+    #[test]
+    fn ownerless_legacy_rows_are_admin_only() {
+        let db = test_db();
+        let t7 = now() + 7 * 86400;
+        let find = |db: &Db| list_allow(db).unwrap().into_iter().find(|e| e.ip == "5.6.7.8").unwrap();
+        upsert_allow(&db, "5.6.7.8", Some("由 clients.nft 匯入"), None, t7, 7).unwrap();
+
+        // member：改不動，也不能靠「延長」把它變成自己的
+        assert!(!upsert_allow_owned(&db, "5.6.7.8", Some("我的"), "b@x", t7 + 86400, 30, false).unwrap());
+        let e = find(&db);
+        assert_eq!(
+            (e.added_by.as_deref(), e.label.as_deref(), e.expires_at),
+            (None, Some("由 clients.nft 匯入"), t7)
+        );
+
+        // admin：改得動，而且順手認領
+        assert!(upsert_allow_owned(&db, "5.6.7.8", None, "root@x", t7 + 86400, 30, true).unwrap());
+        let e = find(&db);
+        assert_eq!((e.added_by.as_deref(), e.expires_at, e.ttl_days), (Some("root@x"), t7 + 86400, 30));
     }
 
     /// 自動續期要依條目自己的 ttl_days，不是全域預設。
