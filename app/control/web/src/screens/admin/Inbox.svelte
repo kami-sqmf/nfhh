@@ -45,8 +45,20 @@
     unknown: { tone: 'none', text: '無驗證資訊' },
   }
 
-  async function load() {
-    try { mails = await api.inbox() } catch (e) { fail(e) }
+  // 慢回應不能跟下一次 interval 疊加：上一次還沒回來就不再發
+  let inflight = null
+  function load() {
+    if (inflight) return inflight
+    inflight = api.inbox()
+      .then((r) => { mails = r })
+      .catch(fail)
+      .finally(() => { inflight = null })
+    return inflight
+  }
+
+  // 清單只有摘要，全文點開時才拿
+  async function view(m) {
+    try { viewing = await api.mail(m.id) } catch (e) { fail(e) }
   }
 
   async function del(id) {
@@ -106,7 +118,7 @@
         </div>
         <div class="flex gap-1.5 shrink-0">
           <button
-            onclick={() => (viewing = m)}
+            onclick={() => view(m)}
             class="px-2.5 py-2 min-h-0 rounded-sm border-[1.5px] border-line-firm text-label font-medium"
           >原始信件</button>
           <button

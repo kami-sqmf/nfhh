@@ -69,6 +69,8 @@ export const api = {
 
   // 驗證碼
   mails: () => req('/api/mail'),
+  // 清單只有摘要，全文（body / html / links）只從這支單封端點拿
+  mail: (id) => req(`/api/mail/${id}`),
   inbox: () => req('/api/mail/inbox'),
   deleteMail: (id) => req(`/api/mail/${id}`, { method: 'DELETE' }),
   purgeMails: () => req('/api/mail', { method: 'DELETE' }),

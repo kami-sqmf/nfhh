@@ -123,6 +123,12 @@ window.fetch = async (url, opts) => {
     ]), { headers: { 'content-type': 'application/json' } })
   if (path in S)
     return new Response(JSON.stringify(S[path]), { headers: { 'content-type': 'application/json' } })
+  // 清單只有摘要，全文走單封端點 —— 收件匣那份是所有信的母集
+  const one = path.match(/^\/api\/mail\/(\d+)$/)
+  if (one && (opts?.method ?? 'GET') === 'GET') {
+    const m = S['/api/mail/inbox'].find((x) => x.id === Number(one[1]))
+    if (m) return new Response(JSON.stringify(m), { headers: { 'content-type': 'application/json' } })
+  }
   if (path.startsWith('/api/'))
     return new Response(JSON.stringify({ ok: true }), { headers: { 'content-type': 'application/json' } })
   return orig(url, opts)

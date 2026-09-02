@@ -12,8 +12,20 @@
   const platform = (code) => app.status?.platforms?.find((p) => p.code === code)
   const platformName = (code) => platform(code)?.name ?? code
 
-  async function load() {
-    try { mails = await api.mails() } catch (e) { fail(e) }
+  // 慢回應不能跟下一次 interval 疊加：上一次還沒回來就不再發
+  let inflight = null
+  function load() {
+    if (inflight) return inflight
+    inflight = api.mails()
+      .then((r) => { mails = r })
+      .catch(fail)
+      .finally(() => { inflight = null })
+    return inflight
+  }
+
+  // 清單只有摘要，全文點開時才拿
+  async function view(m) {
+    try { viewing = await api.mail(m.id) } catch (e) { fail(e) }
   }
 
   async function del(id) {
@@ -38,7 +50,7 @@
 <div class="px-5 pt-3.5 flex flex-col gap-2.5">
   {#each mails as m (m.id)}
     <CodeCard mail={m} platformName={platformName(m.platform)} platformColor={platform(m.platform)?.color} ondelete={del}
-              onview={(x) => (viewing = x)} />
+              onview={view} />
   {:else}
     <div class="bg-surface rounded-lg p-5 text-body leading-relaxed text-fg-muted text-pretty">
       {#if !app.status?.my_platforms?.length}

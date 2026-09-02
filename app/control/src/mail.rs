@@ -8,6 +8,9 @@ pub const MAX_SUBJECT_CHARS: usize = 500;
 pub const MAX_ADDR_CHARS: usize = 320;
 pub const MAX_MSGID_CHARS: usize = 998;
 
+/// 單一 URL 的上限。再長的不是要按的連結，是要塞進資料庫的酬載。
+pub const MAX_LINK_LEN: usize = 2048;
+
 /// 主旨純粹給人看，截斷不會讓任何判斷讀出錯誤結論。
 fn cap(s: String, max: usize) -> String {
     if s.chars().count() <= max { s } else { s.chars().take(max).collect() }
@@ -19,6 +22,10 @@ fn cap(s: String, max: usize) -> String {
 /// 剛好切在第 320 個字就成了 `evil@netflix.com`；而 Message-ID 是去重鍵，
 /// 截短等於讓寄件者自由製造碰撞，用一封信蓋掉另一封。
 /// 超長的本來就不是正常信，寧可當它沒有這個表頭。
+///
+/// 代價講明白：拒收超長的 Message-ID 等於那封信沒有去重鍵（SQLite 的
+/// UNIQUE 容許多個 NULL），Worker 重送幾次就進幾筆。比讓寄件者拿碰撞
+/// 蓋掉別人的信好 —— 而超長本身已經被表頭上限攔在正常信之外。
 fn reject_over(s: String, max: usize) -> Option<String> {
     (s.chars().count() <= max).then_some(s)
 }
@@ -224,6 +231,9 @@ pub fn parse(raw: &[u8], authserv_id: &str) -> Parsed {
 
     // 顯示用取比較有料的那份
     let body = if html.chars().count() > text.chars().count() { html.clone() } else { text.clone() };
+    // 先截斷再抽連結：以前是對完整 body 抽，body 的 20k 上限對 links 沒有效果
+    let body: String = body.chars().take(20_000).collect();
+    let links = extract_links(&body);
 
     // 搜尋範圍涵蓋主旨與兩段內文
     let haystack = format!(
@@ -260,8 +270,8 @@ pub fn parse(raw: &[u8], authserv_id: &str) -> Parsed {
         subject: subject.map(|s| cap(s, MAX_SUBJECT_CHARS)),
         date: msg.date().map(|d| d.to_timestamp()),
         code: extract_code(&haystack),
-        links: extract_links(&body),
-        body: body.chars().take(20_000).collect(),
+        links,
+        body,
         // 上限避免夾帶大量內嵌圖片的信把資料庫撐爆
         html: raw_html.map(|h| h.chars().take(400_000).collect()),
     }
@@ -375,7 +385,7 @@ pub fn extract_links(text: &str) -> Vec<String> {
             .find(|c: char| c.is_whitespace() || c == '"' || c == '<' || c == '>' || c == ')')
             .unwrap_or(tail.len());
         let url: String = tail[..end].trim_end_matches(['.', ',', ';']).to_string();
-        if url.len() > 12 && !out.contains(&url) {
+        if url.len() > 12 && url.len() <= MAX_LINK_LEN && !out.contains(&url) {
             out.push(url);
         }
         rest = &tail[end.max(1)..];
@@ -757,6 +767,14 @@ Content-Type: text/html; charset=utf-8\r\n\
     fn extracts_links() {
         let l = extract_links(r#"go <a href="https://netflix.com/verify?x=1">here</a>"#);
         assert_eq!(l, vec!["https://netflix.com/verify?x=1"]);
+    }
+
+    /// 一個 URL 沒有長度上限，一封信就能帶 8 MiB 進 links 欄位與清單回應。
+    #[test]
+    fn oversized_links_are_dropped() {
+        let huge = format!("https://x.example/{}", "a".repeat(MAX_LINK_LEN));
+        let text = format!("{huge} https://ok.example/path");
+        assert_eq!(extract_links(&text), vec!["https://ok.example/path"]);
     }
 
     // ── 寄件者驗證（網域取自實際日誌）────────────────

@@ -62,8 +62,20 @@
   const latest = $derived(mails[0] ?? null)
   const rest = $derived(Math.max(0, mails.length - 1))
 
-  async function load() {
-    try { mails = await api.mails() } catch (e) { fail(e) }
+  // 慢回應不能跟下一次 interval 疊加：上一次還沒回來就不再發
+  let inflight = null
+  function load() {
+    if (inflight) return inflight
+    inflight = api.mails()
+      .then((r) => { mails = r })
+      .catch(fail)
+      .finally(() => { inflight = null })
+    return inflight
+  }
+
+  // 清單只有摘要，全文點開時才拿
+  async function view(m) {
+    try { viewing = await api.mail(m.id) } catch (e) { fail(e) }
   }
 
   $effect(() => { load() })
@@ -120,7 +132,7 @@
 
   {#if latest}
     <CodeCard mail={latest} platformName={platformName(latest.platform)} platformColor={platform(latest.platform)?.color}
-              showMailbox onview={(m) => (viewing = m)} />
+              showMailbox onview={view} />
     <div class="flex items-baseline justify-between px-1">
       <span class="text-body text-fg-faint">
         {rest > 0 ? `14 天內還有 ${rest} 組` : '14 天內沒有其他驗證碼'}

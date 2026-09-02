@@ -1661,15 +1661,29 @@ impl MailScope {
 /// 套上那條規則、截成一頁。
 ///
 /// admin 想看全部要去管理的收件匣，那支端點是另一條路徑。
-async fn mail_list(State(st): State<Shared>, session: Session) -> ApiResult<Json<Vec<db::Mail>>> {
+///
+/// 回的是摘要（[`db::MailSummary`]）而不是全文：這支每 20 秒被每個開著的
+/// 分頁輪詢一次，body / html / links 一起送等於讓寄件者決定要吃多少流量。
+/// 全文走 [`mail_get`]，點開原始信件時才拿一封。
+async fn mail_list(
+    State(st): State<Shared>,
+    session: Session,
+) -> ApiResult<Json<Vec<db::MailSummary>>> {
     let (uid, _) = require_user(&st, &session).await?;
     let _ = db::purge_old_mails(&st.db, st.cfg.mail_keep_days);
 
     let scope = MailScope::load(&st, &uid)?;
-
-    let mails = db::recent_mails(&st.db, 60)?
+    let mails = db::recent_mail_summaries(&st.db, Some(&scope.granted), 60)?
         .into_iter()
-        .filter(|m| scope.allows_mail(m))
+        .filter(|m| {
+            scope.allows(
+                m.platform.as_deref(),
+                m.verified,
+                m.subject.as_deref(),
+                m.body.as_deref(),
+                m.code.is_some(),
+            )
+        })
         .take(30)
         .collect();
 
@@ -1678,9 +1692,29 @@ async fn mail_list(State(st): State<Shared>, session: Session) -> ApiResult<Json
 
 /// 管理收件匣：不做平台過濾也不做驗證過濾，什麼都看得到。
 /// 這是 admin 診斷「為什麼某封信沒出現在驗證碼分頁」的地方（設計 1n）。
-async fn mail_inbox(State(st): State<Shared>, session: Session) -> ApiResult<Json<Vec<db::Mail>>> {
+async fn mail_inbox(
+    State(st): State<Shared>,
+    session: Session,
+) -> ApiResult<Json<Vec<db::MailSummary>>> {
     require_admin(&st, &session).await?;
-    Ok(Json(db::recent_mails(&st.db, 60)?))
+    Ok(Json(db::recent_mail_summaries(&st.db, None, 60)?))
+}
+
+/// 全文的唯一出口。授權跟清單、刪除同一個 [`MailScope`] ——
+/// 分開寫的話，清單看不到的信可以用猜 id 的方式讀到。
+async fn mail_get(
+    State(st): State<Shared>,
+    session: Session,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<db::Mail>> {
+    let (uid, _) = require_user(&st, &session).await?;
+    let me = db::get_user(&st.db, &uid)?.context("帳號已不存在")?;
+    let m = db::get_mail(&st.db, id)?.context("查無此信件")?;
+    if !me.is_admin() && !MailScope::load(&st, &uid)?.allows_mail(&m) {
+        // 不分辨「不存在」與「不是你的」：不給枚舉 id 的人存在性 oracle
+        return Err(AppError(anyhow::anyhow!("查無此信件")));
+    }
+    Ok(Json(m))
 }
 
 async fn mail_delete(
@@ -3106,7 +3140,7 @@ fn routes(state: Shared) -> Router {
         )
         .route("/api/mail", get(mail_list).delete(mail_delete_all))
         .route("/api/mail/inbox", get(mail_inbox))
-        .route("/api/mail/{id}", delete(mail_delete))
+        .route("/api/mail/{id}", get(mail_get).delete(mail_delete))
         .route("/api/recipients", get(recipient_list).post(recipient_add))
         .route("/api/recipients/{id}", delete(recipient_remove))
         .route("/api/recipients/{id}/enabled", post(recipient_toggle))
@@ -3585,6 +3619,45 @@ mod tests {
         let mut subjects: Vec<&str> = left.iter().filter_map(|m| m.subject.as_deref()).collect();
         subjects.sort_unstable();
         assert_eq!(subjects, ["code", "diag", "新片上架"], "留下的是清單看不到的那三封");
+    }
+
+    /// 單封端點是全文的唯一出口，授權要跟清單一模一樣（同一個 MailScope）。
+    #[tokio::test]
+    async fn mail_detail_reapplies_the_list_scope() {
+        let st = test_state();
+        db::create_user_with_platforms(&st.db, "m", "m@x", "m@x", "member", Some("m@x"), &["netflix".into()]).unwrap();
+        let ins = |id: &str, pf: &str, subject: &str, code: Option<&str>, verified: bool| {
+            db::insert_mail(&st.db, Some(id), db::now(), None, None, Some(subject), code, None, None, &[], verified, Some(pf), None).unwrap()
+        };
+        ins("n", "netflix", "code", Some("123456"), false);
+        ins("ad", "netflix", "新片上架", None, true);
+        ins("d", "disneyplus", "code", Some("111111"), true);
+        // 兩封的主旨都是 code —— key 要連平台一起，否則查到的是別人平台那封
+        let ids: std::collections::BTreeMap<(String, String), i64> = db::recent_mails(&st.db, 10)
+            .unwrap()
+            .into_iter()
+            .map(|m| ((m.platform.unwrap(), m.subject.unwrap()), m.id))
+            .collect();
+        let id = |pf: &str, subject: &str| ids[&(pf.to_string(), subject.to_string())];
+
+        let session = test_session();
+        session.insert(S_USER, &"m".to_string()).await.unwrap();
+        session.insert(S_NAME, &"m@x".to_string()).await.unwrap();
+        let get = |id: i64| {
+            let (st, s) = (st.clone(), session.clone());
+            async move { mail_get(State(st), s, Path(id)).await.map_err(|e| e.0) }
+        };
+
+        let full = get(id("netflix", "code")).await.expect("自己平台、observe 模式：看得到");
+        assert_eq!(full.0.code.as_deref(), Some("123456"), "單封回的是全文那顆 Mail");
+        assert!(
+            get(id("netflix", "新片上架")).await.is_err(),
+            "同平台但清單看不到的信，單封也看不到"
+        );
+        assert!(get(id("disneyplus", "code")).await.is_err(), "別的平台");
+
+        db::set_setting(&st.db, db::keys::SENDER_MODE, "enforce", None).unwrap();
+        assert!(get(id("netflix", "code")).await.is_err(), "enforce 下未通過驗證的信不給看");
     }
 
     /// 邀請連結兌換之後，接上的是跟驗證碼**完全一樣**的那道關卡 ——
@@ -4523,6 +4596,8 @@ mod tests {
             ("POST", "/api/me/forwarding"),
             // ⚠️ 這支不帶 body —— api.js 必須明寫 method: 'POST'
             ("POST", "/api/me/forwarding/resend"),
+            // 全文只從這支出去（清單只有摘要），跟同路徑的 DELETE 併在一條路由上
+            ("GET", "/api/mail/1"),
         ];
 
         for (method, path) in cases {

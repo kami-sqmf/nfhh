@@ -984,6 +984,67 @@ pub struct Mail {
     pub primary_link: Option<String>,
 }
 
+/// 清單用的瘦身版：沒有 html / links，body 只用來跑篩選器、不序列化。
+/// 全文只在點開原始信件時才以 [`get_mail`] 單封取得。
+///
+/// 首頁與驗證碼分頁每 20 秒輪詢一次，把 body（20k 字）、html（400k 字）
+/// 與無上限的 links 一起送出去，等於讓寄件者決定每個開著的分頁要吃多少流量。
+#[derive(Debug, Serialize)]
+pub struct MailSummary {
+    pub id: i64,
+    pub received_at: i64,
+    pub sender: Option<String>,
+    pub recipient: Option<String>,
+    pub subject: Option<String>,
+    pub code: Option<String>,
+    /// 只給 [`crate::MailScope`] 跑關鍵字篩選用。刻意不在 ingest 時把
+    /// 「這封算不算驗證碼信」存成欄位：關鍵字與排除字改了要立刻生效。
+    #[serde(skip_serializing)]
+    pub body: Option<String>,
+    pub verified: Option<bool>,
+    pub platform: Option<String>,
+    pub skip_reason: Option<String>,
+    pub primary_link: Option<String>,
+}
+
+/// 清單查詢。`platforms` = None 表示不過濾（管理收件匣）；Some 只取這些
+/// 平台的信 —— 過濾放進 SQL 而不是先取 N 封再過濾，否則別的平台塞滿前
+/// N 封時，成員自己的信會從清單消失。
+pub fn recent_mail_summaries(
+    db: &Db,
+    platforms: Option<&[String]>,
+    limit: i64,
+) -> Result<Vec<MailSummary>> {
+    let conn = db.lock().unwrap();
+    let json = platforms.map(|p| serde_json::to_string(p).unwrap_or_else(|_| "[]".into()));
+    let mut stmt = conn.prepare(
+        "SELECT id, received_at, sender, recipient, subject, code, body, verified,
+                platform, skip_reason, links
+         FROM mails
+         WHERE (?2 IS NULL OR platform IN (SELECT value FROM json_each(?2)))
+         ORDER BY ingested_at DESC, id DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit, json], |r| {
+        let links: Vec<String> =
+            serde_json::from_str(&r.get::<_, String>(10).unwrap_or_else(|_| "[]".into()))
+                .unwrap_or_default();
+        Ok(MailSummary {
+            id: r.get(0)?,
+            received_at: r.get(1)?,
+            sender: r.get(2)?,
+            recipient: r.get(3)?,
+            subject: r.get(4)?,
+            code: r.get(5)?,
+            body: r.get(6)?,
+            verified: r.get::<_, Option<i64>>(7).unwrap_or(None).map(|v| v != 0),
+            platform: r.get(8)?,
+            skip_reason: r.get(9)?,
+            primary_link: crate::mail::primary_link(&links),
+        })
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
 /// 回傳 true 表示是新信件；false 表示 Message-ID 已存在（Worker 重送）。
 #[allow(clippy::too_many_arguments)]
 pub fn insert_mail(
@@ -1053,6 +1114,10 @@ fn row_to_mail(r: &rusqlite::Row) -> rusqlite::Result<Mail> {
     })
 }
 
+/// 測試用：整批取全文。正式路徑上沒有這種東西了 —— 清單只回
+/// [`MailSummary`]，全文一次只給一封（[`get_mail`]）。測試要驗的常是
+/// 「這幾封信的欄位長怎樣」，留一支整批取比每筆各查一次好讀。
+#[cfg(test)]
 pub fn recent_mails(db: &Db, limit: i64) -> Result<Vec<Mail>> {
     let conn = db.lock().unwrap();
     let mut stmt = conn.prepare(&format!(
@@ -1062,9 +1127,8 @@ pub fn recent_mails(db: &Db, limit: i64) -> Result<Vec<Mail>> {
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
-/// 單封讀取。目前還沒有呼叫點 —— 「單封驗證碼」端點會用它，
-/// 屆時走的就是跟清單、刪除同一條可見性規則。
-#[allow(dead_code)]
+/// 單封讀取：全文（body / html / links）的唯一出口。走的是跟清單、
+/// 刪除同一條可見性規則，可見性判斷在 `/api/mail/{id}` 那支重跑一次。
 pub fn get_mail(db: &Db, id: i64) -> Result<Option<Mail>> {
     let conn = db.lock().unwrap();
     Ok(conn
@@ -3507,5 +3571,53 @@ mod tests {
             .query_row("SELECT ingested_at FROM mails WHERE message_id = 'dup'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(got, backdated, "重送不得把收信時間往後推，那等於免死金牌");
+    }
+
+    /// 首頁每 20 秒輪詢一次清單，清單裡不能有 body / html / links ——
+    /// 一封信最大 8 MiB，30 封就是每 20 秒幾百 MB。
+    #[test]
+    fn mail_summaries_carry_no_content_fields() {
+        let db = test_db();
+        insert_mail(
+            &db, Some("a"), now(), None, None, Some("s"), None, Some("body"), Some("<b>h</b>"),
+            &["https://x.example/y".into()], true, Some("netflix"), None,
+        )
+        .unwrap();
+
+        let v = serde_json::to_value(recent_mail_summaries(&db, None, 10).unwrap()).unwrap();
+        let row = &v[0];
+        assert!(row.get("body").is_none(), "body 只用來跑篩選器，不得序列化出去");
+        assert!(row.get("html").is_none());
+        assert!(row.get("links").is_none());
+        assert_eq!(row["subject"], "s");
+        assert_eq!(row["primary_link"], "https://x.example/y", "要按的那顆連結還是得給");
+    }
+
+    /// 平台過濾要進 SQL：先取 60 封再過濾，別的平台塞滿前 60 封，
+    /// 成員自己的信就從清單消失。
+    #[test]
+    fn summaries_filter_by_platform_before_the_limit() {
+        let db = test_db();
+        for i in 0..70 {
+            insert_mail(
+                &db, Some(&format!("d{i}")), now(), None, None, None, None, None, None, &[],
+                true, Some("disneyplus"), None,
+            )
+            .unwrap();
+        }
+        insert_mail(
+            &db, Some("n"), now() - 100, None, None, Some("我的"), None, None, None, &[], true,
+            Some("netflix"), None,
+        )
+        .unwrap();
+
+        let mine = recent_mail_summaries(&db, Some(&["netflix".into()]), 60).unwrap();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].subject.as_deref(), Some("我的"));
+        assert!(
+            recent_mail_summaries(&db, Some(&[]), 60).unwrap().is_empty(),
+            "沒有授權就什麼都看不到"
+        );
+        assert_eq!(recent_mail_summaries(&db, None, 60).unwrap().len(), 60, "admin 不過濾");
     }
 }
