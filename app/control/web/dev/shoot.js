@@ -63,7 +63,7 @@ for (const s of steps) {
   }
   if (s.shot) {
     const { data } = await send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true })
-    await Bun.write(`/tmp/shots/${s.shot}.png`, Buffer.from(data, 'base64'))
+    await Bun.write(`${process.env.OUT ?? '/tmp/shots'}/${s.shot}.png`, Buffer.from(data, 'base64'))
     console.log('📸', s.shot)
   }
 }
