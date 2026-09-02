@@ -3609,6 +3609,19 @@ mod tests {
         assert!(row.get("links").is_none());
         assert_eq!(row["subject"], "s");
         assert_eq!(row["primary_link"], "https://x.example/y", "要按的那顆連結還是得給");
+
+        // 上面幾條斷言在 `{body}` 那個三元運算子寫反時照樣通過 —— 序列化本來
+        // 就不帶 body。所以這裡分別釘住兩條路徑：成員清單要撈得到 body，
+        // 否則 MailScope 的關鍵字篩選對每封信都當作空內文，抽不到碼的
+        // 「暫時存取碼」信會從清單靜靜消失。
+        assert!(
+            recent_mail_summaries(&db, Some(&["netflix".into()]), 1).unwrap()[0].body.is_some(),
+            "成員清單要跑關鍵字篩選，body 得讀出來"
+        );
+        assert!(
+            recent_mail_summaries(&db, None, 1).unwrap()[0].body.is_none(),
+            "管理收件匣不撈 body"
+        );
     }
 
     /// 上限是後加的，只擋得住之後進來的信。部署前就進庫的那些列還帶著

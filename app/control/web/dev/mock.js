@@ -22,16 +22,19 @@ const MAILS = [
         + '<p><a href="https://netflix.com/login">前往登入</a></p></div>',
     links: ['https://netflix.com/login'], verified: true, platform: 'netflix', skip_reason: null },
   { id: 2, received_at: now - 200, sender: 'no-reply@disneyplus.com', recipient: 'disney@share.example.com', subject: '一次性密碼',
-    code: '207415', body: null, html: null, links: [], verified: false, platform: 'disneyplus', skip_reason: null },
+    code: '207415', body: null, html: null, links: [], primary_link: null,
+    verified: false, platform: 'disneyplus', skip_reason: null },
   { id: 3, received_at: now - 700000, sender: 'info@netflix.com', recipient: 'netflix@share.example.com', subject: '登入驗證碼',
-    code: '5501', body: null, html: null, links: [], verified: null, platform: 'netflix', skip_reason: null },
+    code: '5501', body: null, html: null, links: [], primary_link: null,
+    verified: null, platform: 'netflix', skip_reason: null },
 ]
 
 // 命中排除字，因此不進任何人的驗證碼分頁 —— 只有管理收件匣看得到（設計 1n）
 const INBOX_ONLY = [
-  { id: 4, received_at: now - 90000, sender: 'info@netflix.com', subject: '本月精選片單',
-    code: null, body: '本月新片⋯⋯', html: null, links: [], verified: true, platform: 'netflix',
-    skip_reason: '命中排除字 電子報' },
+  { id: 4, received_at: now - 90000, sender: 'info@netflix.com',
+    recipient: 'netflix@share.example.com', subject: '本月精選片單',
+    code: null, body: '本月新片⋯⋯', html: null, links: [], primary_link: null,
+    verified: true, platform: 'netflix', skip_reason: '命中排除字 電子報' },
 ]
 
 // 清單 DTO：後端的 MailSummary 就是少了這三個欄位
