@@ -120,8 +120,16 @@ impl Config {
             mail_from: env_or("NFHH_MAIL_FROM", "share@example.com"),
             mail_domain: env_or("NFHH_MAIL_DOMAIN", "share.example.com"),
             invite_template: env_or("NFHH_INVITE_TEMPLATE", "ott-share-invitation"),
-            audit_keep_days: env_or("NFHH_AUDIT_KEEP_DAYS", "90").parse().unwrap_or(90),
-            audit_max_rows: env_or("NFHH_AUDIT_MAX_ROWS", "20000").parse().unwrap_or(20000),
+            // 夾範圍：0 天等於每次清光，0 列的 LIMIT 也一樣，而 -1 在 SQLite
+            // 的 LIMIT 是「不限」—— 打錯一個字不該讓稽核整張消失或永不清理
+            audit_keep_days: env_or("NFHH_AUDIT_KEEP_DAYS", "90")
+                .parse()
+                .unwrap_or(90)
+                .clamp(1, 3650),
+            audit_max_rows: env_or("NFHH_AUDIT_MAX_ROWS", "20000")
+                .parse()
+                .unwrap_or(20000)
+                .clamp(100, 1_000_000),
         })
     }
 }
@@ -141,7 +149,7 @@ struct AppState {
     push: push::Push,
     /// smartdns 查詢的記憶體滾動視窗，由背景 tail 任務餵。
     dns: Arc<dnslog::Window>,
-    /// 公開的 join/start 限流器。沒有登入可擋，只剩來源 IP 可數。
+    /// 不需要登入的那幾支端點共用的限流器。沒有帳號可擋，只剩來源 IP 可數。
     join_limiter: ratelimit::Limiter,
 }
 
@@ -268,13 +276,33 @@ async fn require_admin(st: &Shared, session: &Session) -> ApiResult<db::User> {
 const MAX_EMAIL_LEN: usize = 254;
 /// 白名單標籤、裝置名稱等可顯示文字的上限。
 const MAX_LABEL_LEN: usize = 128;
-/// 公開端點 join/start 的限流：每個來源 IP 每 10 分鐘 10 次、全域 200 次。
+/// 不需要登入的端點（join/start、join/invite、register/start）共用的限流：
+/// 每個來源 IP 每 10 分鐘 10 次、全域 200 次。名字沿用 join，計數是共用的。
 const JOIN_LIMIT_WINDOW_SECS: i64 = 600;
 const JOIN_LIMIT_PER_IP: u32 = 10;
 const JOIN_LIMIT_GLOBAL: u32 = 200;
 
 fn valid_email(s: &str) -> bool {
     s.len() <= MAX_EMAIL_LEN && s.contains('@') && !s.contains(char::is_whitespace)
+}
+
+/// 不需要登入的端點共用這道門。三支都會在失敗時寫一列稽核，而稽核有列數
+/// 上限 —— 只擋其中一支，洪水換個門牌就能把真正的稽核軌跡整批擠掉。
+///
+/// 要在任何 DB 存取之前呼叫，被擋掉的請求才是真的什麼都沒碰到。
+fn throttle_public(st: &Shared, ip: Option<&str>) -> ApiResult<()> {
+    if !st.join_limiter.allow(ip.unwrap_or("?"), db::now()) {
+        return Err(AppError(anyhow::anyhow!("請求太頻繁，請稍後再試")));
+    }
+    Ok(())
+}
+
+/// 可顯示文字的長度檢查。傳進來的要是**真的會存下去**的那個值。
+fn check_label_len(label: Option<&str>) -> ApiResult<()> {
+    if label.is_some_and(|l| l.chars().count() > MAX_LABEL_LEN) {
+        return Err(AppError(anyhow::anyhow!("名稱最多 {MAX_LABEL_LEN} 個字")));
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -322,9 +350,7 @@ async fn join_start(
     if !valid_email(&email) {
         return Err(AppError(anyhow::anyhow!("請輸入完整的 Email 位址")));
     }
-    if !st.join_limiter.allow(ip.as_deref().unwrap_or("?"), db::now()) {
-        return Err(AppError(anyhow::anyhow!("請求太頻繁，請稍後再試")));
-    }
+    throttle_public(&st, ip.as_deref())?;
     if !st.mailer.enabled() {
         return Err(AppError(anyhow::anyhow!("尚未設定寄信服務，請聯絡管理員")));
     }
@@ -403,6 +429,7 @@ async fn join_invite(
     Json(req): Json<InviteTokenReq>,
 ) -> ApiResult<Json<InviteOpened>> {
     let ip = client_ip(&headers);
+    throttle_public(&st, ip.as_deref())?;
     let hash = invite::hash(&st.db, &req.token)?;
 
     // 撤銷過、已註冊過、或根本不存在的權杖，在這裡都是同一種結果。
@@ -467,10 +494,12 @@ async fn register_start(
     Json(req): Json<RegisterStart>,
 ) -> ApiResult<Json<CreationChallengeResponse>> {
     let ip = client_ip(&headers);
+    throttle_public(&st, ip.as_deref())?;
     clear_auth_flows(&session).await?;
     let logged_in = current_user(&session).await;
     let email = req.email.as_deref().map(|e| e.trim().to_lowercase());
     let nickname = req.nickname.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    check_label_len(nickname.as_deref())?;
 
     // 三種合法情境，其餘一律拒絕（不開放自助註冊）：
     //   1. 已登入 → 在這台裝置加註備援 passkey
@@ -489,6 +518,9 @@ async fn register_start(
         }
     } else {
         let email = email.context("需要 Email 位址")?;
+        if !valid_email(&email) {
+            return Err(AppError(anyhow::anyhow!("請輸入完整的 Email 位址")));
+        }
         if db::find_user_by_email(&st.db, &email)?.is_some() {
             return Err(AppError(anyhow::anyhow!("這個位址已經有帳號了")));
         }
@@ -1079,9 +1111,8 @@ async fn allow_add(
     let (uid, username) = require_user(&st, &session).await?;
     let caller_ip = client_ip(&headers);
 
-    if req.label.as_deref().is_some_and(|l| l.chars().count() > MAX_LABEL_LEN) {
-        return Err(AppError(anyhow::anyhow!("名稱最多 {MAX_LABEL_LEN} 個字")));
-    }
+    // 存下去的就是 req.label 本身（沒有 trim），檢查的也是它
+    check_label_len(req.label.as_deref())?;
 
     let ip_str = req
         .ip
@@ -1200,9 +1231,7 @@ async fn allow_rename(
     }
 
     let label = req.label.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    if req.label.as_deref().is_some_and(|l| l.chars().count() > MAX_LABEL_LEN) {
-        return Err(AppError(anyhow::anyhow!("名稱最多 {MAX_LABEL_LEN} 個字")));
-    }
+    check_label_len(label)?;
     db::rename_allow(&st.db, &ip, label)?;
     db::audit(
         &st.db,
@@ -2365,6 +2394,7 @@ async fn passkey_rename(
 ) -> ApiResult<Json<serde_json::Value>> {
     let (uid, _) = require_user(&st, &session).await?;
     let label = req.label.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    check_label_len(label)?;
     let n = db::rename_credential(&st.db, &uid, &id, label)?;
     Ok(Json(serde_json::json!({ "ok": n > 0 })))
 }
@@ -3164,7 +3194,11 @@ async fn main() -> Result<()> {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
             loop {
                 tick.tick().await;
-                let _ = db::purge_old_audit(&db, keep, max);
+                match db::purge_old_audit(&db, keep, max) {
+                    Ok(n) if n > 0 => tracing::debug!("清掉 {n} 列逾期或超量的稽核"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("清理稽核失敗: {e:#}"),
+                }
                 if let Err(e) = nft::sync(&db, &path) {
                     tracing::error!("定期同步失敗: {e:#}");
                 }
@@ -3746,11 +3780,14 @@ mod tests {
             .unwrap();
         let db = db::test_db();
         seed_settings(&db, &cfg);
+        // cfg 等一下就被搬走了，先抄一份：NFHH_RESEND_KEY 預設是空的，
+        // 所以除了刻意設過的測試，寄信服務照舊是停用狀態
+        let cfg_mailer_key = cfg.resend_key.clone();
         Arc::new(AppState {
             db,
             webauthn,
             cfg,
-            mailer: mailer::Mailer::new(String::new(), "a@b.c".into(), "tpl".into()),
+            mailer: mailer::Mailer::new(cfg_mailer_key, "a@b.c".into(), "tpl".into()),
             push: push::Push::new("a@b.c"),
             cf: cloudflare::Cloudflare::new(String::new(), String::new()),
             dns: Arc::new(dnslog::Window::new(DNS_WINDOW_SECS)),
@@ -3964,18 +4001,93 @@ mod tests {
         assert!(!valid_email(&format!("{}@x", "a".repeat(MAX_EMAIL_LEN))));
     }
 
+    fn audit_rows(db: &db::Db) -> i64 {
+        db.lock().unwrap().query_row("SELECT count(*) FROM audit", [], |r| r.get(0)).unwrap()
+    }
+
+    /// 寄信服務啟用的 state。未受邀的位址在 `join_not_invited` 就結束，
+    /// 走不到真的要連外的 `send_code` —— 稽核那一列卻已經寫進去了。
+    fn state_with_mailer() -> Shared {
+        let mut cfg = Config::from_env().unwrap();
+        cfg.resend_key = "dummy".into();
+        state_with(cfg)
+    }
+
     /// 公開的 join/start 每次失敗都寫一列稽核；沒有限流就是一台免費寫入機。
     #[tokio::test]
     async fn join_start_is_rate_limited_per_ip() {
-        let st = test_state();
+        let st = state_with_mailer();
         let h = || hdrs(&[("cf-connecting-ip", "203.0.113.9")]);
         let mut last = None;
         for _ in 0..(JOIN_LIMIT_PER_IP + 1) {
             last = Some(join_start(State(st.clone()), h(), Json(EmailReq { email: "x@y.z".into() })).await.map_err(|e| e.0).unwrap_err());
         }
         assert!(last.unwrap().to_string().contains("太頻繁"));
-        let n: i64 = st.db.lock().unwrap().query_row("SELECT count(*) FROM audit", [], |r| r.get(0)).unwrap();
-        assert!(n <= JOIN_LIMIT_PER_IP as i64, "被限流的請求不能再寫稽核");
+        assert_eq!(
+            audit_rows(&st.db),
+            JOIN_LIMIT_PER_IP as i64,
+            "放行的每一次都該寫一列，被限流的那次一列都不能寫"
+        );
+    }
+
+    /// register/start 與 join/invite 同樣不需要登入、同樣每次失敗寫一列稽核。
+    /// 只擋 join/start 等於把洪水改個門牌就放進來 —— 而列數上限會讓這波洪水
+    /// 在下一次清理時把真正的稽核軌跡整批擠掉。
+    #[tokio::test]
+    async fn register_start_and_join_invite_are_rate_limited_too() {
+        // register/start：庫裡先有帳號，未受邀的位址才走得到 register_not_invited
+        let st = test_state();
+        db::create_user_with_platforms(&st.db, "u1", "a@x.tw", "a@x.tw", "admin", Some("a@x.tw"), &[])
+            .unwrap();
+        let h = || hdrs(&[("cf-connecting-ip", "203.0.113.7")]);
+        let body = || RegisterStart {
+            email: Some("nobody@x.tw".into()),
+            bootstrap_token: None,
+            nickname: None,
+        };
+        let mut last = None;
+        for _ in 0..JOIN_LIMIT_PER_IP {
+            last = Some(
+                register_start(State(st.clone()), test_session(), h(), Json(body()))
+                    .await
+                    .map_err(|e| e.0)
+                    .unwrap_err(),
+            );
+        }
+        assert!(last.unwrap().to_string().contains("沒有被邀請"), "前 N 次要真的跑到業務邏輯");
+        let before = audit_rows(&st.db);
+        assert_eq!(before, JOIN_LIMIT_PER_IP as i64, "每一次未受邀都寫一列");
+
+        let err = register_start(State(st.clone()), test_session(), h(), Json(body()))
+            .await
+            .map_err(|e| e.0)
+            .unwrap_err();
+        assert!(err.to_string().contains("太頻繁"), "{err}");
+        assert_eq!(audit_rows(&st.db), before, "被限流的請求不能再寫稽核");
+
+        // join/invite：亂猜的權杖每次都寫一列 invite_link_bad
+        let st = test_state();
+        let h = || hdrs(&[("cf-connecting-ip", "203.0.113.8")]);
+        let body = || InviteTokenReq { token: "not-a-real-token".into() };
+        let mut last = None;
+        for _ in 0..JOIN_LIMIT_PER_IP {
+            last = Some(
+                join_invite(State(st.clone()), test_session(), h(), Json(body()))
+                    .await
+                    .map_err(|e| e.0)
+                    .unwrap_err(),
+            );
+        }
+        assert!(last.unwrap().to_string().contains("無效或已經用過"), "前 N 次要真的跑到業務邏輯");
+        let before = audit_rows(&st.db);
+        assert_eq!(before, JOIN_LIMIT_PER_IP as i64);
+
+        let err = join_invite(State(st.clone()), test_session(), h(), Json(body()))
+            .await
+            .map_err(|e| e.0)
+            .unwrap_err();
+        assert!(err.to_string().contains("太頻繁"), "{err}");
+        assert_eq!(audit_rows(&st.db), before, "被限流的請求不能再寫稽核");
     }
 
     /// 上面那條攻擊鏈其實停在 `clear_auth_flows`，走不到 owner 檢查。

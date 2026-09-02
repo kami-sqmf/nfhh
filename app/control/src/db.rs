@@ -2865,6 +2865,26 @@ mod tests {
         assert!(oldest > 0, "0 秒那幾筆要先因保留期被清");
     }
 
+    /// 上面那條在列數上限比總列數小的時候，光靠上限也會湊巧通過。
+    /// 這裡把上限放到用不到的位置，逼保留期自己交出成績。
+    #[test]
+    fn audit_retention_deletes_old_rows_even_when_the_row_cap_is_slack() {
+        let db = test_db();
+        for i in 0..30 {
+            audit(&db, None, "t", Some(&i.to_string()), None);
+        }
+        db.lock().unwrap().execute("UPDATE audit SET at = 0 WHERE id <= 5", []).unwrap();
+        assert_eq!(purge_old_audit(&db, 90, 100).unwrap(), 5, "只有逾期的那 5 列該消失");
+        let n: i64 = db.lock().unwrap().query_row("SELECT count(*) FROM audit", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 25);
+        let stale: i64 = db
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM audit WHERE at = 0", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stale, 0, "保留期沒生效的話這裡還會是 5");
+    }
+
     /// 別台裝置撤掉之後，這台要問得出來「我已經不在名單裡了」。
     #[test]
     fn a_revoked_device_can_tell_that_it_is_gone() {

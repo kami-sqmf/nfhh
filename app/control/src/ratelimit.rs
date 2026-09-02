@@ -34,7 +34,9 @@ impl Limiter {
     /// 回 true = 放行並計數。視窗到期時整組歸零，所以 HashMap 不會無限長。
     pub fn allow(&self, key: &str, now: i64) -> bool {
         let mut s = self.inner.lock().unwrap();
-        if now - s.window_start >= self.window_secs {
+        // 時鐘往回跳（NTP 校正）也算視窗結束。只用 `>=` 判斷的話差值是負數，
+        // 視窗永遠不會重開，限流器就卡在滿的狀態把正常人一起關在門外。
+        if now < s.window_start || now - s.window_start >= self.window_secs {
             s.window_start = now;
             s.total = 0;
             s.per_key.clear();
@@ -64,6 +66,16 @@ mod tests {
         assert!(!l.allow("a", 2), "第三次要擋");
         assert!(l.allow("b", 2), "別的 key 不受影響");
         assert!(l.allow("a", 60), "視窗過了要放行");
+    }
+
+    /// NTP 把時鐘往回撥時，`now - window_start` 是負數 —— 用 `>=` 判斷到期
+    /// 的話視窗永遠不會重開，限流器就卡在滿的狀態，把正常人一起關在門外。
+    #[test]
+    fn a_backwards_clock_step_does_not_freeze_the_limiter() {
+        let l = Limiter::new(60, 1, 100);
+        assert!(l.allow("a", 1_000));
+        assert!(!l.allow("a", 1_001));
+        assert!(l.allow("a", 500), "時鐘倒退等於換了一個視窗");
     }
 
     #[test]
