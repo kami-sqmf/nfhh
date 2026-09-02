@@ -451,10 +451,14 @@ impl User {
     }
 }
 
-/// 遷移期已結束，不該再有沒有 email 的帳號。啟動時點名，方便發現漏網的。
-pub fn users_without_email(db: &Db) -> Result<i64> {
+/// 遷移期已結束，不該再有沒有 email 的帳號。啟動時點名漏網的 ——
+/// 回的是 username，因為那種帳號正好沒有 email 可以稱呼。
+pub fn users_without_email(db: &Db) -> Result<Vec<String>> {
     let conn = db.lock().unwrap();
-    Ok(conn.query_row("SELECT count(*) FROM users WHERE email IS NULL", [], |r| r.get(0))?)
+    let mut stmt =
+        conn.prepare("SELECT username FROM users WHERE email IS NULL ORDER BY username")?;
+    let rows = stmt.query_map([], |r| r.get(0))?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
 pub fn user_count(db: &Db) -> Result<i64> {
@@ -2321,6 +2325,16 @@ mod tests {
         assert_eq!(u.id, "u1");
         assert_eq!(u.email.as_deref(), Some("alex@example.com"));
         assert_eq!(u.label(), "alex@example.com", "有 email 就以 email 稱呼");
+    }
+
+    /// 遷移期結束後不該再有缺 email 的帳號，啟動檢查靠這支點名。
+    #[test]
+    fn users_without_email_are_listed() {
+        let db = mem();
+        create_user_with_platforms(&db, "a", "a", "a", "member", Some("a@x"), &[]).unwrap();
+        assert!(users_without_email(&db).unwrap().is_empty());
+        create_user_with_platforms(&db, "b", "b", "b", "member", None, &[]).unwrap();
+        assert_eq!(users_without_email(&db).unwrap(), vec!["b"]);
     }
 
     /// credential id 會出現在登入回應裡，不是機密。刪除必須綁上擁有者，

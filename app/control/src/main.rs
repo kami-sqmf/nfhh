@@ -2932,11 +2932,15 @@ async fn main() -> Result<()> {
     nft::preflight()?;
     let db = db::open(&cfg.db_path)?;
 
-    // v6 遷移路徑（補填 Email、username 登入）已移除。還有這種帳號的話它
-    // 登不進來，只能由 admin 刪掉後重新邀請。
+    // v6 遷移路徑（補填 Email、username 登入）已移除。這種帳號仍然可以用
+    // 可探索登入進來，只是不能用 Email 登入、也對不上平台分權與轉發。
     match db::users_without_email(&db) {
-        Ok(0) => {}
-        Ok(n) => tracing::error!("{n} 個帳號沒有 email，無法登入；請刪除後重新邀請"),
+        Ok(list) if !list.is_empty() => tracing::error!(
+            "{} 個帳號沒有 email（{}）：無法用 Email 登入，面板會以舊 username 稱呼；請刪除後重新邀請",
+            list.len(),
+            list.join(", ")
+        ),
+        Ok(_) => {}
         Err(e) => tracing::warn!("檢查缺 email 的帳號失敗: {e:#}"),
     }
 
@@ -3698,16 +3702,6 @@ mod tests {
             .map_err(|e| e.0)
             .unwrap_err();
         assert!(err.to_string().contains("沒有已註冊的 passkey"), "{err}");
-    }
-
-    /// 部署前的假設是「沒有任何帳號缺 email」。啟動時要把違反假設的帳號點名。
-    #[test]
-    fn users_without_email_are_counted() {
-        let db = db::test_db();
-        db::create_user_with_platforms(&db, "a", "a", "a", "member", Some("a@x"), &[]).unwrap();
-        assert_eq!(db::users_without_email(&db).unwrap(), 0);
-        db::create_user_with_platforms(&db, "b", "b", "b", "member", None, &[]).unwrap();
-        assert_eq!(db::users_without_email(&db).unwrap(), 1);
     }
 
     /// 上面那條攻擊鏈其實停在 `clear_auth_flows`，走不到 owner 檢查。
