@@ -102,12 +102,15 @@ pub fn parse(raw: &[u8], authserv_id: &str) -> Parsed {
     // 只採信**第一個**、且 authserv-id 是我們自己收信端的 Authentication-Results。
     // 寄件者可以在原始信裡塞任意同名表頭，但收信端的表頭永遠加在最頂端；
     // 把全部串起來看，等於讓寄件者替自己蓋「已認證」的章。
+    //
+    // 先挑出第一個同名表頭、再讀它的值：兩步不能合成一步。合起來寫的話，
+    // 第一個表頭的值是空的（`as_text()` 給 None）就會靜靜地滑到第二個，
+    // 而那個第二個正是寄件者塞的。
     let auth_raw = msg
         .headers()
         .iter()
-        .filter(|h| h.name().eq_ignore_ascii_case("authentication-results"))
-        .filter_map(|h| h.value().as_text())
-        .next()
+        .find(|h| h.name().eq_ignore_ascii_case("authentication-results"))
+        .and_then(|h| h.value().as_text())
         .filter(|v| authserv_matches(v, authserv_id))
         .unwrap_or_default();
     let (dkim_domains, dmarc_from) = parse_auth_results(auth_raw);
@@ -773,6 +776,33 @@ Subject: \xe9\xa9\x97\xe8\xad\x89\xe7\xa2\xbc\r\n\
             "mx.cloudflare.net",
         );
         assert!(m.auth.dkim_domains.is_empty());
+    }
+
+    /// 第一個表頭不是我們的收信端時就到此為止，不會往下找到一個「合格」的。
+    #[test]
+    fn a_forged_header_below_a_non_matching_first_one_is_ignored() {
+        let m = parse(
+            &raw_with(
+                "Authentication-Results: other.example; dkim=none\r\n\
+                 Authentication-Results: mx.cloudflare.net; dkim=pass header.d=netflix.com",
+            ),
+            "mx.cloudflare.net",
+        );
+        assert!(!m.auth.is_trusted(&["netflix.com".into()]));
+    }
+
+    /// 第一個表頭的值是空的，也仍然是「第一個」—— 不得跳過它去讀第二個，
+    /// 否則寄件者只要在信頂塞一行空的同名表頭就能讓自己那行被採信。
+    #[test]
+    fn an_empty_first_header_does_not_fall_through_to_the_second() {
+        let m = parse(
+            &raw_with(
+                "Authentication-Results:\r\n\
+                 Authentication-Results: mx.cloudflare.net; dkim=pass header.d=netflix.com",
+            ),
+            "mx.cloudflare.net",
+        );
+        assert!(!m.auth.is_trusted(&["netflix.com".into()]));
     }
 
     /// RFC 8601 允許 authserv-id 後面帶版本號。
