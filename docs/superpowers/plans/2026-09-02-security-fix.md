@@ -885,7 +885,8 @@ git commit -m "郵件 HTML 解析：改 ASCII 小寫與字元視窗，任意 Uni
 > [!WARNING]
 > 這個修正**嚴格優於現狀**（不再把寄件者塞的表頭全部串起來看），但它依賴一件
 > Cloudflare 沒有文件保證的事：收信端的 `Authentication-Results` 永遠在最上面、
-> 而且寄件者自己塞的同名表頭不會排在它前面。`authserv-id` 不是秘密。另有回報指出
+> 而且寄件者自己塞的同名表頭不會排在它前面。`authserv-id` 不是秘密。收信端也會把寄件者可控的欄位（`smtp.mailfrom=` 等）回寫進自己的表頭，
+> 所以段內比對必須以 token 錨定（見補強 commit）。另有回報指出
 > Worker 收到的信可能根本沒有這個表頭（[workerd#6740](https://github.com/cloudflare/workerd/issues/6740)）——
 > 那種情況會被判成未驗證，方向是安全的。Worker 端做不到「正規化外來表頭再送
 > attestation」：它拿不到任何獨立於原始信的驗證結果。所以這項發現的關閉條件是
@@ -945,12 +946,13 @@ fn the_real_authserv_still_passes() {
     // 只採信**第一個**、且 authserv-id 是我們自己收信端的 Authentication-Results。
     // 寄件者可以在原始信裡塞任意同名表頭，但收信端的表頭永遠加在最頂端；
     // 把全部串起來看，等於讓寄件者替自己蓋「已認證」的章。
+    // 先以名稱選出第一個表頭、再讀它的值，兩步不能合併：第一個表頭若值是空的，
+    // `filter_map(as_text).next()` 會跳過它、拿到寄件者塞的第二個。
     let auth_raw = msg
         .headers()
         .iter()
-        .filter(|h| h.name().eq_ignore_ascii_case("authentication-results"))
-        .filter_map(|h| h.value().as_text())
-        .next()
+        .find(|h| h.name().eq_ignore_ascii_case("authentication-results"))
+        .and_then(|h| h.value().as_text())
         .filter(|v| authserv_matches(v, authserv_id))
         .unwrap_or_default();
     let (dkim_domains, dmarc_from) = parse_auth_results(auth_raw);
@@ -1021,9 +1023,14 @@ curl -s https://api.resend.com/emails -H "Authorization: Bearer $RESEND_API_KEY"
 docker compose logs --since 5m control | grep -A1 'authserv canary'
 ```
 
-預期：那封信的日誌是 `verified=false`，且稽核有一筆 `mail_sender_unverified`（`grep -c` 面板 `/api/audit`）。
+再寄第二封，**不帶**偽造表頭，但寄件位址的 local part 夾帶 token：
+`"from": "dkim=pass.header.d=netflix.com@'"$NFHH_MAIL_DOMAIN"'"`（Resend 若拒絕這個位址，
+改用任何你能控制的網域寄出）。這封測的是收信端把 `smtp.mailfrom=` 回寫進自己的
+`Authentication-Results` 時，解析器不會被夾帶的 `dkim=pass header.d=` 騙到。
 
-- 若 `verified=false`：Cloudflare 確實把自己的表頭放在最前面（或剝掉了外來的）。在 DECISIONS.md 的「只採信第一個 Authentication-Results」一節記下 canary 日期與結果，這項發現關閉。
+預期：兩封信的日誌都是 `verified=false`，且稽核各有一筆 `mail_sender_unverified`（`grep -c` 面板 `/api/audit`）。
+
+- 若兩封都 `verified=false`：Cloudflare 確實把自己的表頭放在最前面（或剝掉了外來的），而且解析器對回寫的寄件者欄位免疫。在 DECISIONS.md 的「只採信第一個 Authentication-Results」一節記下 canary 日期與結果，這項發現關閉。
 - 若 `verified=true`：偽造成功，程式端沒有更多可做的事。記為**未關閉的殘餘風險**，向專案擁有者提出決策：要嘛把 `sender_verify_mode` 與 `forward_enforce` 視為不可信（等於沒有寄件者驗證，只剩 `platform_senders` 的信封比對），要嘛換一個會提供獨立驗證結果的收信服務。
 
 - [ ] **步驟 6：Commit**
@@ -2770,7 +2777,7 @@ Passkey」、再對 admin 的 Email 啟動登入、最後提交註冊回應，�
 補填 Email 的端點、`username` 登入退路與 `rename_owner` 都拿掉了。它們讓一個
 只有舊 Passkey 的帳號可以自填任意信箱、搶走家人的身分與轉發控制。
 `users.username` 欄位仍在（WebAuthn user handle 與歷史稽核的 actor），但不再
-是登入識別。啟動時若發現沒有 email 的帳號會記 error，那種帳號只能刪掉重邀。
+是登入識別。啟動時若發現沒有 email 的帳號會記 error 並列出 username：那種帳號仍可用可探索登入進來，但不能用 Email 登入、也對不上平台分權與轉發，只能刪掉重邀。
 
 → 別把 `find_user(username)` 加回登入流程。
 
@@ -2794,6 +2801,10 @@ FORWARD_MAP；前者只轉 FALLBACK_TO。以前所有失敗都是 400、都走 F
 不是秘密。部署後要用任務 7 的 canary 證實；結果與日期記在這裡：
 
 - （canary 日期）：（verified=false／true）
+
+解析器已對 token 錨定、註解與引號字串免疫。唯一無法在解析器端處理的情況：收信端
+把寄件者可控的欄位**不加引號**地回寫、而該欄位含原始 `;`（違反 RFC 8601 §2.2）——
+任何以 `;` 切段的解析器都會多出一段。canary 的第二封信測的就是這件事。
 
 → canary 若失敗，程式端沒有更多可做的事；決策見任務 7 步驟 5。
 
@@ -2825,7 +2836,7 @@ open resolver 上 Internet。跟 `nfhh-firewall.service` 刻意沒有 `ExecStop`
 | GET POST | `/api/push/subs` | 登入；列出或新增自己的裝置訂閱，**每人 8 筆** |
 ```
 
-§2「註冊」段落補一句：「所有認證流程開始時清除其他流程的 session 狀態；`register_finish` 檢查目標等於目前登入者。」§5 補：「清單是摘要，全文走 `/api/mail/{id}`；品牌取碼按鈕只在寄件者通過驗證且連結 host 落在該平台網域時顯示。」§11 補配額。§9 設定補「可信寄件網域以 DB 為準、即時生效」。§10 資料庫補 `mails.ingested_at`（v12）與 audit 保留期。
+§2「註冊」段落補一句：「所有認證流程開始時清除其他流程的 session 狀態；`register_finish` 檢查目標等於目前登入者。」§6「寄件者驗證」把「先以 `;` 切段再於段內比對」改寫成現況：只採信**第一個**、authserv-id 等於 `NFHH_MAIL_AUTHSERV_ID` 的 `Authentication-Results`；段內以 token 錨定比對 `dkim=pass`／`header.d=`，寄件者可控的 `smtp.mailfrom=` 等欄位夾帶的字串不算數。§5 補：「清單是摘要，全文走 `/api/mail/{id}`；品牌取碼按鈕只在寄件者通過驗證且連結 host 落在該平台網域時顯示。」§11 補配額。§9 設定補「可信寄件網域以 DB 為準、即時生效」。§10 資料庫補 `mails.ingested_at`（v12）與 audit 保留期。
 
 - [ ] **步驟 3：README 安全須知**
 
