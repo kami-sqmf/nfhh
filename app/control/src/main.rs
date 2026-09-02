@@ -16,6 +16,7 @@ mod nft;
 mod otp;
 mod platforms;
 mod push;
+mod ratelimit;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -77,6 +78,9 @@ struct Config {
     mail_domain: String,
     /// 邀請函樣板在 Resend 上的 id 或別名。樣板要先發布，草稿寄不出去。
     invite_template: String,
+    /// 稽核的保留期與列數上限。公開端點的每次失敗都寫一列，沒有上限就是免費的磁碟。
+    audit_keep_days: i64,
+    audit_max_rows: i64,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -116,6 +120,8 @@ impl Config {
             mail_from: env_or("NFHH_MAIL_FROM", "share@example.com"),
             mail_domain: env_or("NFHH_MAIL_DOMAIN", "share.example.com"),
             invite_template: env_or("NFHH_INVITE_TEMPLATE", "ott-share-invitation"),
+            audit_keep_days: env_or("NFHH_AUDIT_KEEP_DAYS", "90").parse().unwrap_or(90),
+            audit_max_rows: env_or("NFHH_AUDIT_MAX_ROWS", "20000").parse().unwrap_or(20000),
         })
     }
 }
@@ -135,6 +141,8 @@ struct AppState {
     push: push::Push,
     /// smartdns 查詢的記憶體滾動視窗，由背景 tail 任務餵。
     dns: Arc<dnslog::Window>,
+    /// 公開的 join/start 限流器。沒有登入可擋，只剩來源 IP 可數。
+    join_limiter: ratelimit::Limiter,
 }
 
 type Shared = Arc<AppState>;
@@ -256,6 +264,19 @@ async fn require_admin(st: &Shared, session: &Session) -> ApiResult<db::User> {
 // 這組碼只證明信箱是本人的，通過後仍要建 Passkey 才算有帳號。
 // 完整的威脅模型見 otp.rs。
 
+/// RFC 5321 的位址上限。再長的不是信箱，是想撐大資料庫的人。
+const MAX_EMAIL_LEN: usize = 254;
+/// 白名單標籤、裝置名稱等可顯示文字的上限。
+const MAX_LABEL_LEN: usize = 128;
+/// 公開端點 join/start 的限流：每個來源 IP 每 10 分鐘 10 次、全域 200 次。
+const JOIN_LIMIT_WINDOW_SECS: i64 = 600;
+const JOIN_LIMIT_PER_IP: u32 = 10;
+const JOIN_LIMIT_GLOBAL: u32 = 200;
+
+fn valid_email(s: &str) -> bool {
+    s.len() <= MAX_EMAIL_LEN && s.contains('@') && !s.contains(char::is_whitespace)
+}
+
 #[derive(Deserialize)]
 struct EmailReq {
     email: String,
@@ -280,7 +301,7 @@ struct InviteOpened {
     platforms: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct JoinRes {
     /// 冷卻中剩餘秒數。1o 的「重新寄送（0:42）」倒數用這個值。
     cooldown: i64,
@@ -298,8 +319,11 @@ async fn join_start(
 ) -> ApiResult<Json<JoinRes>> {
     let ip = client_ip(&headers);
     let email = req.email.trim().to_lowercase();
-    if !email.contains('@') {
+    if !valid_email(&email) {
         return Err(AppError(anyhow::anyhow!("請輸入完整的 Email 位址")));
+    }
+    if !st.join_limiter.allow(ip.as_deref().unwrap_or("?"), db::now()) {
+        return Err(AppError(anyhow::anyhow!("請求太頻繁，請稍後再試")));
     }
     if !st.mailer.enabled() {
         return Err(AppError(anyhow::anyhow!("尚未設定寄信服務，請聯絡管理員")));
@@ -1055,6 +1079,10 @@ async fn allow_add(
     let (uid, username) = require_user(&st, &session).await?;
     let caller_ip = client_ip(&headers);
 
+    if req.label.as_deref().is_some_and(|l| l.chars().count() > MAX_LABEL_LEN) {
+        return Err(AppError(anyhow::anyhow!("名稱最多 {MAX_LABEL_LEN} 個字")));
+    }
+
     let ip_str = req
         .ip
         .clone()
@@ -1172,6 +1200,9 @@ async fn allow_rename(
     }
 
     let label = req.label.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if req.label.as_deref().is_some_and(|l| l.chars().count() > MAX_LABEL_LEN) {
+        return Err(AppError(anyhow::anyhow!("名稱最多 {MAX_LABEL_LEN} 個字")));
+    }
     db::rename_allow(&st.db, &ip, label)?;
     db::audit(
         &st.db,
@@ -3127,10 +3158,13 @@ async fn main() -> Result<()> {
     {
         let db = db.clone();
         let path = cfg.clients_nft.clone();
+        // cfg 稍後會被搬進 AppState，先把要用的兩個數字抄走
+        let (keep, max) = (cfg.audit_keep_days, cfg.audit_max_rows);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
             loop {
                 tick.tick().await;
+                let _ = db::purge_old_audit(&db, keep, max);
                 if let Err(e) = nft::sync(&db, &path) {
                     tracing::error!("定期同步失敗: {e:#}");
                 }
@@ -3161,7 +3195,20 @@ async fn main() -> Result<()> {
     }
 
     let push = push::Push::new(&cfg.mail_from);
-    let state = Arc::new(AppState { db, webauthn, cfg, mailer, cf, push, dns: dns.clone() });
+    let state = Arc::new(AppState {
+        db,
+        webauthn,
+        cfg,
+        mailer,
+        cf,
+        push,
+        dns: dns.clone(),
+        join_limiter: ratelimit::Limiter::new(
+            JOIN_LIMIT_WINDOW_SECS,
+            JOIN_LIMIT_PER_IP,
+            JOIN_LIMIT_GLOBAL,
+        ),
+    });
 
     // 背景工作：tail smartdns 稽核檔，餵查詢視窗
     tokio::spawn(dnslog::tail(dns, audit_path));
@@ -3707,6 +3754,11 @@ mod tests {
             push: push::Push::new("a@b.c"),
             cf: cloudflare::Cloudflare::new(String::new(), String::new()),
             dns: Arc::new(dnslog::Window::new(DNS_WINDOW_SECS)),
+            join_limiter: ratelimit::Limiter::new(
+                JOIN_LIMIT_WINDOW_SECS,
+                JOIN_LIMIT_PER_IP,
+                JOIN_LIMIT_GLOBAL,
+            ),
         })
     }
 
@@ -3902,6 +3954,28 @@ mod tests {
             .map_err(|e| e.0)
             .unwrap_err();
         assert!(err.to_string().contains("沒有已註冊的 passkey"), "{err}");
+    }
+
+    #[test]
+    fn email_must_look_like_an_address_and_fit_rfc_5321() {
+        assert!(valid_email("a@b.c"));
+        assert!(!valid_email("no-at"));
+        assert!(!valid_email("a b@c"));
+        assert!(!valid_email(&format!("{}@x", "a".repeat(MAX_EMAIL_LEN))));
+    }
+
+    /// 公開的 join/start 每次失敗都寫一列稽核；沒有限流就是一台免費寫入機。
+    #[tokio::test]
+    async fn join_start_is_rate_limited_per_ip() {
+        let st = test_state();
+        let h = || hdrs(&[("cf-connecting-ip", "203.0.113.9")]);
+        let mut last = None;
+        for _ in 0..(JOIN_LIMIT_PER_IP + 1) {
+            last = Some(join_start(State(st.clone()), h(), Json(EmailReq { email: "x@y.z".into() })).await.map_err(|e| e.0).unwrap_err());
+        }
+        assert!(last.unwrap().to_string().contains("太頻繁"));
+        let n: i64 = st.db.lock().unwrap().query_row("SELECT count(*) FROM audit", [], |r| r.get(0)).unwrap();
+        assert!(n <= JOIN_LIMIT_PER_IP as i64, "被限流的請求不能再寫稽核");
     }
 
     /// 上面那條攻擊鏈其實停在 `clear_auth_flows`，走不到 owner 檢查。

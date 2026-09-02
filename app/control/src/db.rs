@@ -913,7 +913,11 @@ pub struct AuditRow {
     pub client_ip: Option<String>,
 }
 
+/// 稽核明細的上限。detail 可能夾帶攻擊者控制的輸入。
+pub const AUDIT_DETAIL_MAX_CHARS: usize = 512;
+
 pub fn audit(db: &Db, actor: Option<&str>, action: &str, detail: Option<&str>, ip: Option<&str>) {
+    let detail = detail.map(|d| d.chars().take(AUDIT_DETAIL_MAX_CHARS).collect::<String>());
     if let Ok(conn) = db.lock() {
         let _ = conn.execute(
             "INSERT INTO audit (at, actor, action, detail, client_ip) VALUES (?1,?2,?3,?4,?5)",
@@ -940,6 +944,17 @@ pub fn recent_audit(db: &Db, limit: i64) -> Result<Vec<AuditRow>> {
         })
     })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// 稽核的保留期與列數上限。這張表以前只進不出，公開端點的每一次失敗都永久佔一列。
+pub fn purge_old_audit(db: &Db, keep_days: i64, max_rows: i64) -> Result<usize> {
+    let conn = db.lock().unwrap();
+    let a = conn.execute("DELETE FROM audit WHERE at < ?1", params![now() - keep_days * 86400])?;
+    let b = conn.execute(
+        "DELETE FROM audit WHERE id NOT IN (SELECT id FROM audit ORDER BY at DESC, id DESC LIMIT ?1)",
+        params![max_rows],
+    )?;
+    Ok(a + b)
 }
 
 // ── 驗證碼信件 ────────────────────────────────────────
@@ -2824,6 +2839,30 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_ne!(rows[0].id, rows[1].id);
         assert!(rows[0].id > rows[1].id, "同秒的兩列要照 id 由新到舊，順序不能隨機");
+    }
+
+    /// detail 會夾帶攻擊者控制的輸入（未受邀的 Email、白名單標籤）。
+    /// 不截斷等於讓公開端點無限寫入磁碟。
+    #[test]
+    fn audit_detail_is_truncated() {
+        let db = test_db();
+        audit(&db, None, "t", Some(&"é".repeat(10_000)), None);
+        let row = recent_audit(&db, 1).unwrap().remove(0);
+        assert_eq!(row.detail.unwrap().chars().count(), AUDIT_DETAIL_MAX_CHARS);
+    }
+
+    #[test]
+    fn audit_is_pruned_by_age_and_row_count() {
+        let db = test_db();
+        for i in 0..30 {
+            audit(&db, None, "t", Some(&i.to_string()), None);
+        }
+        db.lock().unwrap().execute("UPDATE audit SET at = 0 WHERE id <= 5", []).unwrap();
+        purge_old_audit(&db, 90, 20).unwrap();
+        let n: i64 = db.lock().unwrap().query_row("SELECT count(*) FROM audit", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 20);
+        let oldest: i64 = db.lock().unwrap().query_row("SELECT min(at) FROM audit", [], |r| r.get(0)).unwrap();
+        assert!(oldest > 0, "0 秒那幾筆要先因保留期被清");
     }
 
     /// 別台裝置撤掉之後，這台要問得出來「我已經不在名單裡了」。
