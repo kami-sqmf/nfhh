@@ -3660,6 +3660,37 @@ mod tests {
         assert!(get(id("netflix", "code")).await.is_err(), "enforce 下未通過驗證的信不給看");
     }
 
+    /// admin 走的是繞過 [`MailScope`] 的那條分支：收件匣列得出來的信
+    /// —— 認不出平台的、別人平台的 —— 點「原始信件」也必須拿得到全文，
+    /// 否則診斷頁上有列表卻讀不到內容。
+    #[tokio::test]
+    async fn admins_read_every_mail_the_inbox_lists() {
+        let st = test_state();
+        db::create_user_with_platforms(&st.db, "a", "a@x", "a@x", "admin", Some("a@x"), &[]).unwrap();
+        let ins = |id: &str, pf: Option<&str>, subject: &str| {
+            db::insert_mail(&st.db, Some(id), db::now(), None, None, Some(subject), None, None, None, &[], true, pf, None).unwrap()
+        };
+        ins("u", None, "認不出平台"); // 只在管理收件匣出現
+        ins("d", Some("disneyplus"), "別人的平台");
+
+        let session = test_session();
+        session.insert(S_USER, &"a".to_string()).await.unwrap();
+        session.insert(S_NAME, &"a@x".to_string()).await.unwrap();
+
+        // 這位 admin 一個平台都沒被授權 —— 讀得到就證明走的是 admin 分支，
+        // 不是碰巧通過了 MailScope
+        assert!(db::platforms_for(&st.db, "a").unwrap().is_empty());
+        let listed = mail_inbox(State(st.clone()), session.clone()).await.map_err(|e| e.0).unwrap().0;
+        assert_eq!(listed.len(), 2, "收件匣兩封都列得出來");
+        for m in listed {
+            let got = mail_get(State(st.clone()), session.clone(), Path(m.id))
+                .await
+                .map_err(|e| e.0)
+                .unwrap_or_else(|e| panic!("admin 讀不到「{:?}」：{e}", m.subject));
+            assert_eq!(got.0.id, m.id);
+        }
+    }
+
     /// 邀請連結兌換之後，接上的是跟驗證碼**完全一樣**的那道關卡 ——
     /// 這條測試盯的就是「跳過驗證碼」不等於「跳過檢查」。
     #[tokio::test]

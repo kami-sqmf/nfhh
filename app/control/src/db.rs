@@ -1010,6 +1010,11 @@ pub struct MailSummary {
 /// 清單查詢。`platforms` = None 表示不過濾（管理收件匣）；Some 只取這些
 /// 平台的信 —— 過濾放進 SQL 而不是先取 N 封再過濾，否則別的平台塞滿前
 /// N 封時，成員自己的信會從清單消失。
+///
+/// None 同時代表「不需要 body」：管理收件匣看得到全部，不跑
+/// [`crate::MailScope`] 的關鍵字篩選，於是 `body` 也不從庫裡撈出來。
+/// 反過來說，將來若有「不過濾平台但要篩關鍵字」的呼叫點，
+/// 得先把這個相依關係拆成獨立參數，不能直接傳 None。
 pub fn recent_mail_summaries(
     db: &Db,
     platforms: Option<&[String]>,
@@ -1017,13 +1022,13 @@ pub fn recent_mail_summaries(
 ) -> Result<Vec<MailSummary>> {
     let conn = db.lock().unwrap();
     let json = platforms.map(|p| serde_json::to_string(p).unwrap_or_else(|_| "[]".into()));
-    let mut stmt = conn.prepare(
-        "SELECT id, received_at, sender, recipient, subject, code, body, verified,
-                platform, skip_reason, links
+    let cols = SUMMARY_COLS.replace("{body}", if json.is_some() { "body" } else { "NULL" });
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {cols}
          FROM mails
          WHERE (?2 IS NULL OR platform IN (SELECT value FROM json_each(?2)))
-         ORDER BY ingested_at DESC, id DESC LIMIT ?1",
-    )?;
+         ORDER BY ingested_at DESC, id DESC LIMIT ?1"
+    ))?;
     let rows = stmt.query_map(params![limit, json], |r| {
         let links: Vec<String> =
             serde_json::from_str(&r.get::<_, String>(10).unwrap_or_else(|_| "[]".into()))
@@ -1088,15 +1093,28 @@ pub fn insert_mail(
     Ok(n == 1)
 }
 
-/// 讀信件的欄位清單。清單、單封讀取、刪除前的取列共用同一串 ——
+/// 讀**全文**的欄位清單。單封讀取與刪除前的取列共用同一串 ——
 /// 欄位順序一旦跟 [`row_to_mail`] 的索引對不上就是全體對不上，
-/// 不會只有其中一支悄悄讀錯。
+/// 不會只有其中一支悄悄讀錯。清單走的是另一串（[`SUMMARY_COLS`]），
+/// 因為它刻意不讀 html。
 const MAIL_COLS: &str = "id, received_at, sender, subject, code, body, links, html, verified,
                          platform, skip_reason, recipient";
 
+/// 讀**摘要**的欄位清單，紀律跟 [`MAIL_COLS`] 一樣：順序對不上
+/// [`recent_mail_summaries`] 的索引就是全體對不上。
+///
+/// `{body}` 由呼叫端填：只有要跑關鍵字篩選的路徑需要 body，管理收件匣
+/// 不篩選，那 60 列的 body 讀出來沒人用（一列上限 20k 字，60 列就是
+/// 幾 MB 在鎖裡搬）。
+const SUMMARY_COLS: &str = "id, received_at, sender, recipient, subject, code, {body}, verified,
+                            platform, skip_reason, links";
+
 fn row_to_mail(r: &rusqlite::Row) -> rusqlite::Result<Mail> {
     let links_json: String = r.get(6).unwrap_or_else(|_| "[]".into());
-    let links: Vec<String> = serde_json::from_str(&links_json).unwrap_or_default();
+    let mut links: Vec<String> = serde_json::from_str(&links_json).unwrap_or_default();
+    // mail::MAX_LINK_LEN 是後加的，只擋得住之後進來的信；在那之前進庫的
+    // 列還帶著超長連結，讀出來一樣會原樣送到前端。
+    links.retain(|u| u.len() <= crate::mail::MAX_LINK_LEN);
     Ok(Mail {
         id: r.get(0)?,
         received_at: r.get(1)?,
@@ -3591,6 +3609,41 @@ mod tests {
         assert!(row.get("links").is_none());
         assert_eq!(row["subject"], "s");
         assert_eq!(row["primary_link"], "https://x.example/y", "要按的那顆連結還是得給");
+    }
+
+    /// 上限是後加的，只擋得住之後進來的信。部署前就進庫的那些列還帶著
+    /// 超長連結 —— 讀取端不擋，清單的 primary_link 與單封的 links
+    /// 照樣把那 8 MiB 送出去。
+    #[test]
+    fn oversized_links_are_dropped_on_read_too() {
+        let db = test_db();
+        let huge = format!("https://x.example/{}", "a".repeat(3 * 1024));
+        insert_mail(
+            &db, Some("only"), now(), None, None, Some("只有超長那條"), None, None, None,
+            std::slice::from_ref(&huge), true, Some("netflix"), None,
+        )
+        .unwrap();
+        insert_mail(
+            &db, Some("both"), now(), None, None, Some("還有一條正常的"), None, None, None,
+            &[huge.clone(), "https://ok.example/go".into()], true, Some("netflix"), None,
+        )
+        .unwrap();
+
+        let sums = recent_mail_summaries(&db, None, 10).unwrap();
+        let find = |subject: &str| {
+            sums.iter().find(|m| m.subject.as_deref() == Some(subject)).unwrap()
+        };
+        assert_eq!(find("只有超長那條").primary_link, None, "超長的不是要按的連結");
+        assert_eq!(
+            find("還有一條正常的").primary_link.as_deref(),
+            Some("https://ok.example/go"),
+            "跳過超長那條，換下一條"
+        );
+
+        let m = get_mail(&db, find("只有超長那條").id).unwrap().unwrap();
+        assert!(m.links.is_empty(), "全文的 links 也不得帶著它");
+        let m = get_mail(&db, find("還有一條正常的").id).unwrap().unwrap();
+        assert_eq!(m.links, vec!["https://ok.example/go".to_string()]);
     }
 
     /// 平台過濾要進 SQL：先取 60 封再過濾，別的平台塞滿前 60 封，

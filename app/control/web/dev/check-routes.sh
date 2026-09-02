@@ -42,6 +42,7 @@ check GET    /api/audit
 check GET    /api/mail
 check DELETE /api/mail
 check GET    /api/mail/inbox
+check GET    /api/mail/1
 check DELETE /api/mail/1
 check GET    /api/settings
 check PUT    /api/settings

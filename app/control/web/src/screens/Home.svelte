@@ -1,6 +1,7 @@
 <script>
   import { app, go, fail, notify, refresh } from '../lib/state.svelte.js'
   import { api } from '../lib/api.js'
+  import { mailList } from '../lib/mail.svelte.js'
   import CodeCard from '../components/CodeCard.svelte'
   import AccountSheet from '../components/AccountSheet.svelte'
   import AllowSheet from '../components/AllowSheet.svelte'
@@ -11,10 +12,13 @@
 
   // 1a：首頁以最新驗證碼為主，授權入口收在「遇到同戶裝置問題？」區塊裡。
   // 家人多數時候只是要一組碼，不該先被防火牆概念擋住。
-  let mails = $state([])
+  //
+  // 清單、輪詢與「點開才取全文」跟驗證碼分頁、收件匣一字不差，
+  // 共用 lib/mail.svelte.js 那一份。
+  const list = mailList(api.mails)
+  const mails = $derived(list.mails)
   let account = $state(false)
   let authorize = $state(false)
-  let viewing = $state(null)
   let askPush = $state(false)
   let fwd = $state(null)
 
@@ -62,23 +66,7 @@
   const latest = $derived(mails[0] ?? null)
   const rest = $derived(Math.max(0, mails.length - 1))
 
-  // 慢回應不能跟下一次 interval 疊加：上一次還沒回來就不再發
-  let inflight = null
-  function load() {
-    if (inflight) return inflight
-    inflight = api.mails()
-      .then((r) => { mails = r })
-      .catch(fail)
-      .finally(() => { inflight = null })
-    return inflight
-  }
-
-  // 清單只有摘要，全文點開時才拿
-  async function view(m) {
-    try { viewing = await api.mail(m.id) } catch (e) { fail(e) }
-  }
-
-  $effect(() => { load() })
+  $effect(() => { list.load() })
   $effect(() => {
     maybeAskPush()
     api.myForwarding().then((r) => (fwd = r)).catch(() => {})
@@ -86,7 +74,7 @@
 
   // 驗證碼時效很短，自動輪詢；切到背景就停，不浪費家人的電池與流量。
   $effect(() => {
-    const t = setInterval(() => { if (!document.hidden) load() }, 20000)
+    const t = setInterval(() => { if (!document.hidden) list.load() }, 20000)
     return () => clearInterval(t)
   })
 </script>
@@ -132,7 +120,7 @@
 
   {#if latest}
     <CodeCard mail={latest} platformName={platformName(latest.platform)} platformColor={platform(latest.platform)?.color}
-              showMailbox onview={view} />
+              showMailbox onview={list.view} />
     <div class="flex items-baseline justify-between px-1">
       <span class="text-body text-fg-faint">
         {rest > 0 ? `14 天內還有 ${rest} 組` : '14 天內沒有其他驗證碼'}
@@ -180,5 +168,5 @@
 
 <AccountSheet open={account} onclose={() => (account = false)} />
 <PushSheet open={askPush} onclose={() => (askPush = false)} />
-<MailView mail={viewing} onclose={() => (viewing = null)} />
+<MailView mail={list.viewing} onclose={() => (list.viewing = null)} />
 <AllowSheet open={authorize} onclose={() => (authorize = false)} ondone={refresh} />

@@ -231,7 +231,10 @@ pub fn parse(raw: &[u8], authserv_id: &str) -> Parsed {
 
     // 顯示用取比較有料的那份
     let body = if html.chars().count() > text.chars().count() { html.clone() } else { text.clone() };
-    // 先截斷再抽連結：以前是對完整 body 抽，body 的 20k 上限對 links 沒有效果
+    // 先截斷再抽連結：以前是對完整 body 抽，body 的 20k 上限對 links 沒有效果。
+    // 代價：只出現在第 20 000 字之後的連結會抽不到 —— 那種信的行動按鈕
+    // （primary_link）就沒了，使用者只剩內文可讀。正常的驗證信遠短於此，
+    // 拿它換掉「一封信塞爆 links 欄位」的路。
     let body: String = body.chars().take(20_000).collect();
     let links = extract_links(&body);
 
@@ -561,6 +564,12 @@ pub fn primary_link(links: &[String]) -> Option<String> {
     links
         .iter()
         .find(|u| {
+            // 上限在讀取端也擋一次：MAX_LINK_LEN 是後加的，比它早進庫的列
+            // 還帶著超長連結，而這顆值是清單回應裡唯一帶連結的欄位。
+            // 長度先判，才不會為了比對樣板去 lowercase 一條 8 MiB 的字串。
+            if u.len() > MAX_LINK_LEN {
+                return false;
+            }
             let low = u.to_lowercase();
             !BOILERPLATE.iter().any(|b| low.contains(b))
         })

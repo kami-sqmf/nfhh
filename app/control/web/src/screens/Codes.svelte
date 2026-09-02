@@ -1,43 +1,28 @@
 <script>
   import { app, notify, fail } from '../lib/state.svelte.js'
   import { api } from '../lib/api.js'
+  import { mailList } from '../lib/mail.svelte.js'
   import CodeCard from '../components/CodeCard.svelte'
   import MailView from '../components/MailView.svelte'
 
   // 設計 1e。這裡只有「我有權限的平台」且「抽得到驗證碼」的信 ——
   // 兩層過濾都在後端做，前端拿到什麼就顯示什麼。
-  let mails = $state([])
-  let viewing = $state(null)
+  const list = mailList(api.mails)
+  const mails = $derived(list.mails)
 
   const platform = (code) => app.status?.platforms?.find((p) => p.code === code)
   const platformName = (code) => platform(code)?.name ?? code
 
-  // 慢回應不能跟下一次 interval 疊加：上一次還沒回來就不再發
-  let inflight = null
-  function load() {
-    if (inflight) return inflight
-    inflight = api.mails()
-      .then((r) => { mails = r })
-      .catch(fail)
-      .finally(() => { inflight = null })
-    return inflight
-  }
-
-  // 清單只有摘要，全文點開時才拿
-  async function view(m) {
-    try { viewing = await api.mail(m.id) } catch (e) { fail(e) }
-  }
-
   async function del(id) {
     try {
       await api.deleteMail(id)
-      mails = mails.filter((m) => m.id !== id)
+      list.mails = mails.filter((m) => m.id !== id)
     } catch (e) { fail(e) }
   }
 
-  $effect(() => { load() })
+  $effect(() => { list.load() })
   $effect(() => {
-    const t = setInterval(() => { if (!document.hidden) load() }, 20000)
+    const t = setInterval(() => { if (!document.hidden) list.load() }, 20000)
     return () => clearInterval(t)
   })
 </script>
@@ -50,7 +35,7 @@
 <div class="px-5 pt-3.5 flex flex-col gap-2.5">
   {#each mails as m (m.id)}
     <CodeCard mail={m} platformName={platformName(m.platform)} platformColor={platform(m.platform)?.color} ondelete={del}
-              onview={view} />
+              onview={list.view} />
   {:else}
     <div class="bg-surface rounded-lg p-5 text-body leading-relaxed text-fg-muted text-pretty">
       {#if !app.status?.my_platforms?.length}
@@ -63,4 +48,4 @@
   {/each}
 </div>
 
-<MailView mail={viewing} onclose={() => (viewing = null)} />
+<MailView mail={list.viewing} onclose={() => (list.viewing = null)} />
