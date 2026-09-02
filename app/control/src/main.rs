@@ -589,8 +589,6 @@ async fn register_finish(
         if let Some(email) = &p.email {
             let _ = db::clear_otp(&st.db, email);
         }
-        // 信箱證明也一起作廢：留著就能拿同一次驗證再建下一個帳號
-        session.remove::<String>(S_EMAIL_PROOF).await?;
     }
 
     let cred_id = base64_url(passkey.cred_id().as_ref());
@@ -602,9 +600,14 @@ async fn register_finish(
         p.nickname.as_deref(),
     )?;
 
-    // 兩把鍵都清，而且清不掉要報錯：殘留的目標是下一次攻擊的材料
+    // 三把鍵都清，而且清不掉要報錯：殘留的目標是下一次攻擊的材料。
+    // 排在 `add_credential` **之後**：憑證寫失敗就整個請求失敗，這時清掉
+    // 信箱證明只會讓人連重試都不行 —— 帳號建了、邀請消耗了、passkey 卻沒進去。
+    // 信箱證明不分流程無條件清（沒有那把鍵不算錯），加備援金鑰那條路
+    // 順手把殘留的證明一起帶走。
     session.remove::<PasskeyRegistration>(S_REG).await?;
     session.remove::<PendingReg>(S_REG_USER).await?;
+    session.remove::<String>(S_EMAIL_PROOF).await?;
     db::audit(
         &st.db,
         Some(p.label()),
@@ -3350,12 +3353,24 @@ mod tests {
         db::invite_email(&st.db, "mei@example.com", "admin", &[]).unwrap();
         let token = invite::generate();
         db::set_invite_token(&st.db, "mei@example.com", &invite::hash(&st.db, &token).unwrap()).unwrap();
+        // 另一位也被邀請的人 —— 他手上會有一份**別的信箱**的證明
+        db::invite_email(&st.db, "yu@example.com", "admin", &[]).unwrap();
+        let other = invite::generate();
+        db::set_invite_token(&st.db, "yu@example.com", &invite::hash(&st.db, &other).unwrap()).unwrap();
 
+        let redeem = |s: Session, t: String| {
+            let st = st.clone();
+            async move {
+                let _ = join_invite(State(st), s, hdrs(&[]), Json(InviteTokenReq { token: t }))
+                    .await
+                    .map_err(|e| e.0)
+                    .unwrap();
+            }
+        };
         let victim = test_session();
-        let _ = join_invite(State(st.clone()), victim.clone(), hdrs(&[]), Json(InviteTokenReq { token }))
-            .await
-            .map_err(|e| e.0)
-            .unwrap();
+        let neighbour = test_session();
+        redeem(victim.clone(), token).await;
+        redeem(neighbour.clone(), other).await;
 
         let start = |s: Session| {
             let st = st.clone();
@@ -3370,7 +3385,13 @@ mod tests {
         };
 
         let err = start(test_session()).await.unwrap_err();
-        assert!(err.to_string().contains("完成信箱驗證"), "拿到的訊息是：{err}");
+        assert!(err.to_string().contains("在這個瀏覽器"), "拿到的訊息是：{err}");
+
+        // 證明不是「有沒有」而是「是哪個信箱」：換過另一個位址的 session
+        // 一樣進不來，否則把檢查放寬成「有證明就好」也能矇混過去。
+        let err = start(neighbour).await.unwrap_err();
+        assert!(err.to_string().contains("在這個瀏覽器"), "拿到的訊息是：{err}");
+
         let _ = start(victim).await.expect("驗證過的那個 session 要能拿到 challenge");
     }
 
@@ -3416,7 +3437,7 @@ mod tests {
 
         // 旁觀者知道信箱、也知道有人剛驗過，但證明不在他的 session 上
         let err = start(test_session()).await.unwrap_err();
-        assert!(err.to_string().contains("完成信箱驗證"), "拿到的訊息是：{err}");
+        assert!(err.to_string().contains("在這個瀏覽器"), "拿到的訊息是：{err}");
         let _ = start(victim).await.expect("輸入驗證碼的那個 session 要能拿到 challenge");
     }
 
