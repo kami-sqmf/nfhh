@@ -58,6 +58,9 @@ struct Config {
     mail_allowed_senders: Vec<String>,
     /// 未通過驗證時是否真的收掉扇出。預設 false = 觀察期，只記錄不阻擋。
     mail_enforce_sender: bool,
+    /// 收信端在 `Authentication-Results` 裡署名的 authserv-id。只有它寫的
+    /// 驗證結果算數；Cloudflare Email Routing 是 `mx.cloudflare.net`。
+    mail_authserv_id: String,
     /// smartdns 的查詢稽核檔。讀不到時查詢統計為空，其餘功能不受影響。
     dns_audit: String,
     /// Cloudflare 帳戶與 token，用來查轉發收件人的驗證狀態。
@@ -101,6 +104,7 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .collect(),
             mail_enforce_sender: env_or("NFHH_MAIL_ENFORCE_SENDER", "0") == "1",
+            mail_authserv_id: env_or("NFHH_MAIL_AUTHSERV_ID", "mx.cloudflare.net"),
             dns_audit: env_or("NFHH_DNS_AUDIT", "/smartdns-data/audit.log"),
             cf_account: env_or("NFHH_CF_ACCOUNT", ""),
             cf_token: env_or("NFHH_CF_TOKEN", ""),
@@ -1226,7 +1230,7 @@ async fn mail_ingest(
 ) -> ApiResult<Json<serde_json::Value>> {
     require_mail_secret(&st, &headers)?;
 
-    let p = mail::parse(&body);
+    let p = mail::parse(&body, &st.cfg.mail_authserv_id);
     let verified = p.auth.is_trusted(&st.cfg.mail_allowed_senders);
 
     let mailbox = routing_mailbox(&headers, p.recipient.as_deref());

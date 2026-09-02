@@ -51,6 +51,14 @@ impl SenderAuth {
     }
 }
 
+/// RFC 8601：第一個分號前是 authserv-id，可帶版本號，如 `mx.cloudflare.net 1`。
+fn authserv_matches(value: &str, expected: &str) -> bool {
+    let head = value.split(';').next().unwrap_or("");
+    head.split_whitespace()
+        .next()
+        .is_some_and(|id| id.eq_ignore_ascii_case(expected))
+}
+
 /// 解析 `Authentication-Results`。各方法以 `;` 分隔，先切段再於段內比對。
 fn parse_auth_results(raw: &str) -> (Vec<String>, Option<String>) {
     let lower = raw.to_lowercase();
@@ -83,7 +91,7 @@ fn value_after(seg: &str, key: &str) -> Option<String> {
     (!v.is_empty()).then_some(v)
 }
 
-pub fn parse(raw: &[u8]) -> Parsed {
+pub fn parse(raw: &[u8], authserv_id: &str) -> Parsed {
     let Some(msg) = mail_parser::MessageParser::default().parse(raw) else {
         // 解析失敗仍保留原始內容，驗證碼可能還在裡面
         let body = String::from_utf8_lossy(raw).chars().take(20_000).collect::<String>();
@@ -91,15 +99,18 @@ pub fn parse(raw: &[u8]) -> Parsed {
         return Parsed { body, code, ..Default::default() };
     };
 
-    // 可能有多個 Authentication-Results（每一跳一個），全部串起來一起看。
+    // 只採信**第一個**、且 authserv-id 是我們自己收信端的 Authentication-Results。
+    // 寄件者可以在原始信裡塞任意同名表頭，但收信端的表頭永遠加在最頂端；
+    // 把全部串起來看，等於讓寄件者替自己蓋「已認證」的章。
     let auth_raw = msg
         .headers()
         .iter()
         .filter(|h| h.name().eq_ignore_ascii_case("authentication-results"))
         .filter_map(|h| h.value().as_text())
-        .collect::<Vec<_>>()
-        .join("; ");
-    let (dkim_domains, dmarc_from) = parse_auth_results(&auth_raw);
+        .next()
+        .filter(|v| authserv_matches(v, authserv_id))
+        .unwrap_or_default();
+    let (dkim_domains, dmarc_from) = parse_auth_results(auth_raw);
 
     let subject = msg.subject().map(|s| s.to_string());
 
@@ -596,7 +607,7 @@ Content-Type: text/html; charset=utf-8\r\n\
 \r\n\
 <html><body><p>Your verification code is</p><div>4821</div></body></html>\r\n\
 --b1--\r\n";
-        let p = parse(raw);
+        let p = parse(raw, "mx.cloudflare.net");
         assert_eq!(p.code, Some("4821".into()), "純文字段是空殼時要能從 HTML 抽到碼");
     }
 
@@ -731,16 +742,53 @@ Authentication-Results: mx.cloudflare.net;\r\n\
 Subject: \xe9\xa9\x97\xe8\xad\x89\xe7\xa2\xbc\r\n\
 \r\n\
 \xe6\x82\xa8\xe7\x9a\x84\xe9\xa9\x97\xe8\xad\x89\xe7\xa2\xbc\xef\xbc\x9a123456\r\n";
-        let p = parse(raw);
+        let p = parse(raw, "mx.cloudflare.net");
         assert!(p.auth.is_trusted(&allow()), "折行的表頭要能正確解析");
         assert_eq!(p.auth.envelope_domain.as_deref(), Some("account.netflix.com"));
         assert_eq!(p.code, Some("123456".into()));
     }
 
+    fn raw_with(headers: &str) -> Vec<u8> {
+        format!("{headers}\r\nFrom: a@netflix.com\r\nSubject: x\r\n\r\nbody\r\n").into_bytes()
+    }
+
+    /// 寄件者可以自己塞任意同名表頭，但收信端（Cloudflare）的表頭永遠加在
+    /// 最頂端。只看第一個，而且它的 authserv-id 要是我們自己的。
+    #[test]
+    fn forged_auth_results_below_the_real_one_are_ignored() {
+        let m = parse(
+            &raw_with(
+                "Authentication-Results: mx.cloudflare.net; dkim=fail header.d=netflix.com\r\n\
+                 Authentication-Results: mx.cloudflare.net; dkim=pass header.d=netflix.com",
+            ),
+            "mx.cloudflare.net",
+        );
+        assert!(!m.auth.is_trusted(&["netflix.com".into()]));
+    }
+
+    #[test]
+    fn auth_results_from_an_unknown_authserv_are_ignored() {
+        let m = parse(
+            &raw_with("Authentication-Results: evil.example; dkim=pass header.d=netflix.com"),
+            "mx.cloudflare.net",
+        );
+        assert!(m.auth.dkim_domains.is_empty());
+    }
+
+    /// RFC 8601 允許 authserv-id 後面帶版本號。
+    #[test]
+    fn the_real_authserv_still_passes() {
+        let m = parse(
+            &raw_with("Authentication-Results: MX.Cloudflare.NET 1; dkim=pass header.d=netflix.com"),
+            "mx.cloudflare.net",
+        );
+        assert!(m.auth.is_trusted(&["netflix.com".into()]));
+    }
+
     /// 解析失敗時沒有表頭可讀，必須落在「未通過」。
     #[test]
     fn unparseable_mail_is_not_trusted() {
-        let p = parse(b"\xff\xfe not a real message at all");
+        let p = parse(b"\xff\xfe not a real message at all", "mx.cloudflare.net");
         assert!(!p.auth.is_trusted(&allow()));
     }
 
