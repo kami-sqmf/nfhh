@@ -178,6 +178,10 @@ const S_AUTH: &str = "auth_state";
 /// 就被寫進 admin 的資料列。
 const S_LOGIN_USER: &str = "login_user";
 
+/// 這個 session 剛證明過擁有哪個信箱。`register_start` 除了查全域的
+/// `email_otp.verified_at`，還要求證明是**同一個瀏覽器**做的。
+const S_EMAIL_PROOF: &str = "email_proof";
+
 /// 任一認證流程開始時，先把其他流程留下的狀態全部清掉。
 /// 登入與註冊各自是獨立的狀態機，殘留的鍵會讓 finish 讀到另一條流程的目標。
 /// 清不掉就整個請求失敗 —— 帶著殘留狀態繼續，正是這個弱點的成因。
@@ -323,6 +327,7 @@ async fn join_start(
 /// 核對驗證碼。通過後才允許進入 Passkey 註冊。
 async fn join_verify(
     State(st): State<Shared>,
+    session: Session,
     headers: HeaderMap,
     Json(req): Json<VerifyReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
@@ -333,6 +338,9 @@ async fn join_verify(
     let hash = otp::hash(&st.db, &email, &code)?;
     match db::check_otp(&st.db, &email, &hash, otp::MAX_ATTEMPTS)? {
         db::OtpCheck::Ok => {
+            // 證明綁在這個 session 上：全域的 verified_at 只說「有人驗過」，
+            // 說不出是誰的瀏覽器驗的。
+            session.insert(S_EMAIL_PROOF, &email).await?;
             db::audit(&st.db, None, "join_code_ok", Some(&email), ip.as_deref());
             Ok(Json(serde_json::json!({ "ok": true })))
         }
@@ -358,6 +366,7 @@ async fn join_verify(
 /// 位址由連結決定，不由呼叫端給 —— 前端沒有機會拿別人的權杖去換自己的信箱。
 async fn join_invite(
     State(st): State<Shared>,
+    session: Session,
     headers: HeaderMap,
     Json(req): Json<InviteTokenReq>,
 ) -> ApiResult<Json<InviteOpened>> {
@@ -379,6 +388,8 @@ async fn join_invite(
     }
 
     db::mark_email_verified(&st.db, &row.email)?;
+    // 跟驗證碼那條路一樣：兌換連結的是哪個瀏覽器，證明就記在哪個 session。
+    session.insert(S_EMAIL_PROOF, &row.email).await?;
     db::audit(&st.db, None, "invite_link_opened", Some(&row.email), ip.as_deref());
     Ok(Json(InviteOpened { email: row.email, platforms: row.platforms }))
 }
@@ -477,9 +488,14 @@ async fn register_start(
                 db::audit(&st.db, None, "register_not_invited", Some(&email), ip.as_deref());
                 return Err(AppError(anyhow::anyhow!("這個位址沒有被邀請")));
             }
-            if !db::otp_recently_verified(&st.db, &email, otp::VERIFIED_WINDOW_SECS)? {
+            // 全域旗標只證明「這個位址被驗過」，誰都能拿著它來註冊；
+            // 再對一次 session 上的證明，才輪得到真正完成驗證的那個瀏覽器。
+            let proven: Option<String> = session.get(S_EMAIL_PROOF).await?;
+            if proven.as_deref() != Some(email.as_str())
+                || !db::otp_recently_verified(&st.db, &email, otp::VERIFIED_WINDOW_SECS)?
+            {
                 return Err(AppError(anyhow::anyhow!(
-                    "請先完成信箱驗證，或重新寄送一組驗證碼"
+                    "請先在這個瀏覽器完成信箱驗證，或重新寄送一組驗證碼"
                 )));
             }
             PendingReg {
@@ -573,6 +589,8 @@ async fn register_finish(
         if let Some(email) = &p.email {
             let _ = db::clear_otp(&st.db, email);
         }
+        // 信箱證明也一起作廢：留著就能拿同一次驗證再建下一個帳號
+        session.remove::<String>(S_EMAIL_PROOF).await?;
     }
 
     let cred_id = base64_url(passkey.cred_id().as_ref());
@@ -3298,7 +3316,7 @@ mod tests {
         let redeem = |t: String| {
             let st = st.clone();
             async move {
-                join_invite(State(st), hdrs(&[]), Json(InviteTokenReq { token: t }))
+                join_invite(State(st), test_session(), hdrs(&[]), Json(InviteTokenReq { token: t }))
                     .await
                     .map_err(|e| e.0)
             }
@@ -3319,6 +3337,41 @@ mod tests {
         // 註冊完成之後，同一條連結不能再換第二個帳號
         db::consume_invited_email(&st.db, "mei@example.com", "u1").unwrap();
         assert!(redeem(token).await.is_err());
+    }
+
+    /// 驗證碼／邀請連結證明的是「這個瀏覽器的人擁有信箱」，證明不能被
+    /// 另一個瀏覽器拿去用 —— 否則攻擊者只要等真正持有人驗證完就能搶先建帳號。
+    #[tokio::test]
+    async fn email_proof_is_bound_to_the_session_that_earned_it() {
+        let st = test_state();
+        // 面板上得先有人（是 admin 發的邀請），否則 `register_start` 會走
+        // 「建立第一個帳號」那條路，根本碰不到信箱驗證這道關卡。
+        db::create_user_with_platforms(&st.db, "admin", "admin@x", "admin@x", "admin", Some("admin@x"), &[]).unwrap();
+        db::invite_email(&st.db, "mei@example.com", "admin", &[]).unwrap();
+        let token = invite::generate();
+        db::set_invite_token(&st.db, "mei@example.com", &invite::hash(&st.db, &token).unwrap()).unwrap();
+
+        let victim = test_session();
+        let _ = join_invite(State(st.clone()), victim.clone(), hdrs(&[]), Json(InviteTokenReq { token }))
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+
+        let start = |s: Session| {
+            let st = st.clone();
+            async move {
+                register_start(
+                    State(st), s, hdrs(&[]),
+                    Json(RegisterStart { email: Some("mei@example.com".into()), bootstrap_token: None, nickname: None }),
+                )
+                .await
+                .map_err(|e| e.0)
+            }
+        };
+
+        let err = start(test_session()).await.unwrap_err();
+        assert!(err.to_string().contains("完成信箱驗證"), "拿到的訊息是：{err}");
+        let _ = start(victim).await.expect("驗證過的那個 session 要能拿到 challenge");
     }
 
     /// 設定頁的欄位就是前後端的契約。少一個欄位不會有人報錯 ——
