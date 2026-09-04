@@ -97,8 +97,17 @@ fn read_head(path: &Path) -> Option<String> {
 ///
 /// ⚠️ 因此清單裡只能放**平台自己持有**的網域（見 DECISIONS.md）。
 pub fn domains(dir: &str, code: &str) -> Vec<String> {
-    let Ok(text) = std::fs::read_to_string(format!("{dir}/{code}.list")) else {
-        return Vec::new();
+    let path = format!("{dir}/{code}.list");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            // 檔案不在（平台為空、清單被 disabled）是正常情況；權限錯之類的要留下線索，
+            // 否則按鈕集體消失沒人知道為什麼。
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("讀不到平台清單 {path}（{e}），該平台的連結不會有品牌按鈕");
+            }
+            return Vec::new();
+        }
     };
     text.lines()
         .map(str::trim)

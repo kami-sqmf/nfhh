@@ -23,7 +23,8 @@
 
   // 按鈕下方一定露出目的網域：品牌卡片是背書，使用者要看得到背書的是哪裡。
   // URL.hostname 給的是 punycode，同形字網域不會被畫成本尊。
-  const host = (u) => { try { return new URL(u).hostname } catch { return u } }
+  // 後端把關過的連結一定 parse 得動；fallback 只是不讓一串原始文字撐破卡片。
+  const host = (u) => { try { return new URL(u).hostname } catch { return '（無法判讀的網址）' } }
 
   async function copy() {
     try {
@@ -68,14 +69,18 @@
       取得存取碼
     </a>
     <p class="mt-2 text-label leading-relaxed text-fg-muted text-pretty">
-      會開啟 <span class="font-mono">{host(mail.primary_link)}</span>。這封信沒有直接附上號碼，要到平台的頁面取得。
+      會開啟 <span class="font-mono break-all">{host(mail.primary_link)}</span>。這封信沒有直接附上號碼，要到平台的頁面取得。
     </p>
   {:else}
     <p class="mt-3 text-body text-fg-faint">
-      {#if mail.verified !== true}
-        這封信未通過寄件者驗證，連結不會顯示。請開原始信件自行判斷。
+      <!-- verified 是三態：false = 沒過、null = 舊信沒有驗證資訊。灰的措辭不能跟紅的混用（見上方 1a）。
+           連結因 host 不在平台網域而被後端扣下時，卡片只知道「沒有能給的連結」，不能說信裡沒有。 -->
+      {#if mail.verified === false}
+        這封信沒通過寄件者驗證；若信中有連結，這裡也不會顯示。請開原始信件自行判斷。
+      {:else if mail.verified !== true}
+        這封信沒有寄件者驗證資訊；若信中有連結，這裡也不會顯示。請開原始信件自行判斷。
       {:else}
-        這封信沒有可用的號碼或連結，請開原始信件查看。
+        這封信沒有可以直接給你的號碼或連結，請開原始信件查看。
       {/if}
     </p>
   {/if}

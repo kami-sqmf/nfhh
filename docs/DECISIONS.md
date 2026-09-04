@@ -185,7 +185,11 @@ compose 預設用資料夾名當專案名，volume 實際名稱是「專案名_v
 「驗證碼卡片替哪些連結畫品牌按鈕」的依據（`platforms::domains`）。放進第三方
 CDN 或分析服務的網域，等於替它們背書。
 
-→ 影片 CDN 之類的請照既有慣例放 `*-cdn.list.disabled`，不要混進主清單。
+清單條目要寫 ASCII（IDN 用 punycode）：比對的是瀏覽器眼中的 host，`url` crate 會把
+連結的 host 轉成 punycode，清單裡的 unicode 網域永遠對不上、按鈕會靜默消失。
+
+→ 影片 CDN 之類的請放獨立的 `*-cdn.list`（啟不啟用都行，`platforms::domains` 只讀
+`<平台>.list`），不要混進主檔。
 
 ## 登入與註冊的 session 狀態互斥，不能共用鍵
 

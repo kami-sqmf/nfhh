@@ -1671,21 +1671,33 @@ fn brand_link_allowed(verified: Option<bool>, link: &str, domains: &[String]) ->
         return false;
     }
     let Some(host) = u.host_str() else { return false };
+    // `.netflix.com` 會過 ends_with 檢查、卡片卻印出一個前導點；尾點是另一個 origin。
+    // 兩種都不是平台會寄的連結，直接拒絕。
+    if host.starts_with('.') || host.ends_with('.') {
+        return false;
+    }
     domains.iter().any(|d| host == d || host.ends_with(&format!(".{d}")))
+}
+
+/// 不合格就把 `primary_link` 拿掉。清單與單封走的是兩條程式路徑，判斷式只寫這一份。
+fn withhold_unbranded(link: &mut Option<String>, verified: Option<bool>, domains: &[String]) {
+    if link.as_deref().is_some_and(|l| !brand_link_allowed(verified, l, domains)) {
+        *link = None;
+    }
 }
 
 /// 對一批摘要套用 `brand_link_allowed`，不合格的把 `primary_link` 拿掉。
 fn strip_unbranded_links(st: &Shared, mails: &mut [db::MailSummary]) {
     let mut cache: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     for m in mails.iter_mut() {
-        let Some(link) = m.primary_link.clone() else { continue };
+        if m.primary_link.is_none() {
+            continue;
+        }
         let code = m.platform.clone().unwrap_or_default();
         let domains = cache
             .entry(code.clone())
             .or_insert_with(|| platforms::domains(&st.cfg.domain_set_dir, &code));
-        if !brand_link_allowed(m.verified, &link, domains) {
-            m.primary_link = None;
-        }
+        withhold_unbranded(&mut m.primary_link, m.verified, domains);
     }
 }
 
@@ -1753,11 +1765,9 @@ async fn mail_get(
         // 不分辨「不存在」與「不是你的」：不給枚舉 id 的人存在性 oracle
         return Err(AppError(anyhow::anyhow!("查無此信件")));
     }
-    if let Some(link) = m.primary_link.clone() {
+    if m.primary_link.is_some() {
         let domains = platforms::domains(&st.cfg.domain_set_dir, m.platform.as_deref().unwrap_or(""));
-        if !brand_link_allowed(m.verified, &link, &domains) {
-            m.primary_link = None;
-        }
+        withhold_unbranded(&mut m.primary_link, m.verified, &domains);
     }
     Ok(Json(m))
 }
@@ -4069,6 +4079,51 @@ mod tests {
         assert!(!brand_link_allowed(Some(true), "https://evil.example/?u=netflix.com", &nf));
         assert!(!brand_link_allowed(Some(true), "https://nétflix.com/x", &nf), "IDN 同形字：host 會變 punycode，對不上");
         assert!(!brand_link_allowed(Some(true), "http://www.netflix.com/x", &nf), "只接受 https");
+        assert!(!brand_link_allowed(Some(true), "https://.netflix.com/x", &nf), "前導點會過 ends_with，卡片卻印出 .netflix.com");
+        assert!(!brand_link_allowed(Some(true), "https://www.netflix.com./x", &nf), "尾點是另一個 origin");
+    }
+
+    /// 純函式測試只證明判斷式，不證明「handler 真的把連結拿掉了」。
+    /// 這條走 handler：清單與單封都不得把不合格的連結交到前端手上。
+    #[tokio::test]
+    async fn the_handlers_withhold_links_that_have_not_earned_the_brand() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("netflix.list"), "# platform-name: Netflix\nnetflix.com\n").unwrap();
+        let st = state_with(Config {
+            domain_set_dir: dir.path().to_str().unwrap().to_string(),
+            ..Config::from_env().unwrap()
+        });
+        db::create_user_with_platforms(&st.db, "m", "m@x", "m@x", "member", Some("m@x"), &["netflix".into()]).unwrap();
+        // 沒有碼的信才走到那顆按鈕，所以靠關鍵字讓它進得了清單
+        db::set_setting_list(&st.db, db::keys::CODE_KEYWORDS, &["存取碼".into()], None).unwrap();
+
+        let ins = |subject: &str, link: &str, verified: bool| {
+            db::insert_mail(&st.db, Some(subject), db::now(), None, None, Some(subject), None, None,
+                None, &[link.to_string()], verified, Some("netflix"), None).unwrap()
+        };
+        ins("存取碼 A", "https://www.netflix.com/account/access", true);
+        ins("存取碼 B", "https://netflix.com.evil.example/x", true);
+        ins("存取碼 C", "https://www.netflix.com/account/access", false);
+
+        let session = test_session();
+        session.insert(S_USER, &"m".to_string()).await.unwrap();
+        session.insert(S_NAME, &"m@x".to_string()).await.unwrap();
+
+        let listed = mail_list(State(st.clone()), session.clone()).await.map_err(|e| e.0).unwrap().0;
+        let link = |subject: &str| {
+            listed.iter().find(|m| m.subject.as_deref() == Some(subject))
+                .unwrap_or_else(|| panic!("清單少了「{subject}」")).primary_link.clone()
+        };
+        assert_eq!(link("存取碼 A").as_deref(), Some("https://www.netflix.com/account/access"));
+        assert_eq!(link("存取碼 B"), None, "host 不在平台網域，清單不得帶連結");
+        assert_eq!(link("存取碼 C"), None, "未通過寄件者驗證，清單不得帶連結");
+
+        // 單封是另一條程式路徑（沒有 cache），得各自證明
+        for (subject, want) in [("存取碼 A", true), ("存取碼 B", false), ("存取碼 C", false)] {
+            let id = listed.iter().find(|m| m.subject.as_deref() == Some(subject)).unwrap().id;
+            let got = mail_get(State(st.clone()), session.clone(), Path(id)).await.map_err(|e| e.0).unwrap().0;
+            assert_eq!(got.primary_link.is_some(), want, "單封端點對「{subject}」的裁決要跟清單一致");
+        }
     }
 
     /// 扇出對每個訂閱開一個 task 且沒有上限：一個 member 先堆幾千筆訂閱，
