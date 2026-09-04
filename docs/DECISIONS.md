@@ -231,7 +231,7 @@ ingest 回 401／422 = 拒收（永久）；5xx（含端點未啟用的 503）�
 
 ## `received_at` 是寄件者說的，`ingested_at` 才是面板的時鐘
 
-排序、分頁、保留期只看 `ingested_at`；`received_at` 夾在保留期之前
+排序、分頁、保留期只看 `ingested_at`；`received_at` 夾在保留期內（最早 `NFHH_MAIL_KEEP_DAYS` 天前）
 （`NFHH_MAIL_KEEP_DAYS`，預設 14 天）到一小時之後之間，超出就改用現在，而且
 只做顯示（`clamp_received`）。以前用 `received_at`：一封未來日期的信永遠排第一、
 永遠不被清。遷移（v12）回填時取 `min(received_at, now)`，升級前就躺在表裡的
@@ -297,7 +297,7 @@ DB 存取之前。
 ## Docker 依賴 nfhh-firewall 成功：fail-closed 是刻意的
 
 `deploy/docker.service.d/10-nfhh-firewall.conf` 用 `Requires=` 讓 nft 載入失敗時
-Docker 不啟動，連管理面板一起不起來；`ExecStartPre=nft list table inet nfhh` 再驗
+Docker 不啟動，連管理面板一起不起來；`ExecStartPre=nft -t list table inet nfhh` 再驗
 一次規則真的在核心裡（unit 是 `RemainAfterExit` 的 oneshot，表被手動刪掉後它仍是
 active）。代價是「規則檔寫錯就全停」；不這樣做的代價是 open resolver 上 Internet。
 跟 `nfhh-firewall.service` 刻意沒有 `ExecStop` 是同一個判斷的兩面：

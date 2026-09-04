@@ -235,7 +235,7 @@ Worker 收到信後**先** POST `/api/mail/ingest`（5 秒逾時），面板解�
 `forward_to` 為空有兩種成因，靠回應裡的 `verified` 與 `actionable` 分辨：未通過寄件者驗證且 `forward_enforce_sender` 為 `"1"`，或被篩選器擋下。**兩種情況 Worker 都會無條件補上 `FALLBACK_TO`** —— 家人不會收到，但管理員一定收得到，篩選器設錯才看得見。
 
 > [!CAUTION]
-> **面板掛掉絕不能讓信轉不出去。** 只有「面板不可用」才退回 `FORWARD_MAP`：逾時、DNS、面板停機、5xx（含端點未啟用的 503）與 408／429。其餘 4xx（401 密鑰不符、422 解析失敗）是**拒收**，只轉 `FALLBACK_TO`、不走 `FORWARD_MAP` —— 拒收的信本來就不該無過濾地送進家人信箱。驗證碼有時效，寧可設定舊一點，也不能不轉。
+> **面板掛掉絕不能讓信轉不出去。** 只有「面板不可用」才退回 `FORWARD_MAP`：逾時、DNS、面板停機、5xx（含端點未啟用的 503）與 408／429；Worker 自己沒設 `PANEL_ENDPOINT`／`PANEL_SECRET` 時也走 `FORWARD_MAP`（那是部署狀態，不是攻擊面，見 DECISIONS.md）。其餘 4xx（401 密鑰不符、422 解析失敗）是**拒收**，只轉 `FALLBACK_TO`、不走 `FORWARD_MAP` —— 拒收的信本來就不該無過濾地送進家人信箱。驗證碼有時效，寧可設定舊一點，也不能不轉。
 >
 > 代價是那封信**不會有面板紀錄**，Worker 日誌裡的「⚠️ 面板無回應」是唯一信號。
 
@@ -365,9 +365,9 @@ MIME 解析全在面板用 Rust 做（`mail.rs`），Worker 因此可以是一�
 1. `sandbox=""` 的 iframe —— 空值代表全部限制生效（獨立來源、不能執行 script）
 2. 注入 CSP `default-src 'none'` 擋掉所有遠端資源。預設不載入遠端圖片（追蹤像素會洩漏開信時間與 IP），按鈕可放行
 
-保留天數 `NFHH_MAIL_KEEP_DAYS`（預設 14），每次 ingest 與列表時順帶清除逾期，總量另有 2000 封上限。逾期與排序看的是 `ingested_at`（面板收到的時間，v12），不是信上的 `Date:` —— 後者是寄件者說的，只做顯示，而且夾在保留期之前到一小時之後，超出就改用現在；以前拿它排序，一封未來日期的信會永遠置頂、永遠不被清。
+保留天數 `NFHH_MAIL_KEEP_DAYS`（預設 14），每次 ingest 與列表時順帶清除逾期，總量另有 2000 封上限。逾期與排序看的是 `ingested_at`（面板收到的時間，v12），不是信上的 `Date:` —— 後者是寄件者說的，只做顯示，而且夾在保留期內（最早 `NFHH_MAIL_KEEP_DAYS` 天前）到一小時之後，超出就改用現在；以前拿它排序，一封未來日期的信會永遠置頂、永遠不被清。
 
-清單（`GET /api/mail`）是摘要，沒有內文、HTML 與連結；全文走 `GET /api/mail/{id}`，授權跟清單、刪除同一條規則（`MailScope`），猜 id 讀不到清單上看不見的信。品牌取碼按鈕（`primary_link`）只在寄件者通過驗證**且**連結的 host 落在該平台的 domain-set 網域時才顯示 —— 平台是由收件信箱分類的，跟寄件者是誰無關，沒有這道檢查，任何人寄到 `netflix@` 的釣魚連結都會穿上 Netflix 的外衣。
+清單（`GET /api/mail`）是摘要，沒有內文、HTML 與完整連結清單（`links`）；全文走 `GET /api/mail/{id}`，授權跟清單、刪除同一條規則（`MailScope`），猜 id 讀不到清單上看不見的信。品牌取碼按鈕（`primary_link`）只在寄件者通過驗證**且**連結的 host 落在該平台的 domain-set 網域時才顯示 —— 平台是由收件信箱分類的，跟寄件者是誰無關，沒有這道檢查，任何人寄到 `netflix@` 的釣魚連結都會穿上 Netflix 的外衣。
 
 ## 6. Email 轉發（v5 新增）
 
@@ -532,7 +532,7 @@ Cloudflare 那步失敗**不回滾登記**，跟寄信失敗同一個原則：�
 | GET | `/api/status` | 公開；未登入時不揭露白名單內容 |
 | POST | `/api/join/start` `/verify` | 公開；寄與核對 Email 驗證碼。與 `/api/join/invite`、未登入的 `/api/register/start` 共用限流：每 IP 每 10 分鐘 30 次、全域 200 次 |
 | POST | `/api/join/invite` | 公開；兌換邀請連結的權杖，回信箱與平台。限流同上 |
-| POST | `/api/register/start` `/finish` | 依 §2 三種情境；未登入的分支限流同上，finish 檢查目標等於目前登入者 |
+| POST | `/api/register/start` `/finish` | 依 §2 三種情境；未登入的分支限流同上，finish 檢查目標等於目前登入者（建新帳號的分支則要求未登入） |
 | POST | `/api/login/any/start` `/finish` | 公開；可探索憑證 |
 | POST | `/api/login/start` `/finish` | 公開；信箱 + passkey（退路） |
 | POST | `/api/logout` | 登入 |
@@ -569,6 +569,7 @@ Cloudflare 那步失敗**不回滾登記**，跟寄信失敗同一個原則：�
 | GET POST | `/api/push/subs` | 登入；列出或新增自己的裝置訂閱，**每人 8 筆** |
 | DELETE | `/api/push/subs/{id}` | 登入；限自己的 |
 | POST | `/api/push/unsubscribe` | 登入；這台裝置帶著 endpoint 自己退訂 |
+| POST | `/api/push/check` | 登入；帶 endpoint 問「這個訂閱還在嗎」，只回布林 |
 | GET POST | `/api/me/notify` | 登入；兩顆通知開關 |
 | GET POST | `/api/me/forwarding` | 登入；自己的轉發總開關 |
 | POST | `/api/me/forwarding/resend` | 登入；重寄 Cloudflare 驗證信 |
