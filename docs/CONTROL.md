@@ -518,7 +518,7 @@ Cloudflare 那步失敗**不回滾登記**，跟寄信失敗同一個原則：�
 | `member_role_changed` ／ `platform_granted` ／ `platform_revoked` | 成員管理 |
 | `settings_changed` | 面板設定 |
 | `mail_received` | 收到信，detail 含寄件者、主旨、轉發人數 |
-| `mail_sender_unverified` | 寄件者未通過驗證，detail 含驗證摘要與是否收掉扇出 |
+| `mail_sender_unverified` | 寄件者未通過驗證，detail 含驗證摘要，並註明「未轉發給家人」或「觀察期，照常轉發」 |
 
 每筆帶 `actor` 與 `client_ip`，機器來源的動作兩者為 NULL。
 

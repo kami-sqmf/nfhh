@@ -1420,7 +1420,7 @@ async fn mail_ingest(
             "寄件者未通過驗證 mailbox={} {} → {}",
             mailbox,
             p.auth.summary(),
-            if withhold { "已收掉扇出" } else { "觀察期，照常轉發" }
+            if withhold { "未轉發給家人" } else { "觀察期，照常轉發" }
         );
         db::audit(
             &st.db,
@@ -1430,7 +1430,7 @@ async fn mail_ingest(
                 "{} / {} / {}",
                 p.sender.as_deref().unwrap_or("?"),
                 p.auth.summary(),
-                if withhold { "已收掉扇出" } else { "觀察期" }
+                if withhold { "未轉發給家人" } else { "觀察期，照常轉發" }
             )),
             None,
         );
