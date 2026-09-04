@@ -144,9 +144,11 @@ sudo cp /opt/nfhh/deploy/nfhh-*.{service,timer,path} /etc/systemd/system/ && sud
 > 這條相依是雙向的：`stop`／`restart` `nfhh-firewall.service` 現在也會連帶
 > 停／重啟 Docker（nft 規則本身不會因此消失，理由見 docs/DECISIONS.md）。
 > 只是要讓改過的規則生效，不要 `restart` 這個 unit（那會連 Docker 一起重啟），用：
-> `cat /opt/nfhh/config/nft/nfhh.nft /opt/nfhh/generated/nft/clients.nft | sudo nft -f -`
+> `sudo sh -c 'cat /opt/nfhh/config/nft/nfhh.nft /opt/nfhh/generated/nft/clients.nft > /run/nfhh-rules.nft && nft -f /run/nfhh-rules.nft'`
 > —— 一個交易把整張表換掉並補回白名單（`nfhh.nft` 檔頭的「先宣告再 delete」讓它可以
-> 重複套用；只套 `nfhh.nft` 會把動態白名單清空，家人會被擋在外面直到面板下次寫入）。
+> 重複套用；只套 `nfhh.nft` 會把動態白名單清空，家人會被擋在外面直到面板下次寫入，最多
+> 5 分鐘）。先寫成檔再套而不是直接 pipe：`clients.nft` 不在時 `cat` 只會報錯，pipe 裡的
+> `nft -f -` 仍會照第一個檔換表 —— 正是上面那個空窗。
 > 先 `sudo nft -c -f /opt/nfhh/config/nft/nfhh.nft` 可以只檢查語法不套用。
 >
 > 緊急時要解除這條相依（例如要單獨除錯 Docker、暫時不想連動防火牆）：

@@ -103,8 +103,12 @@ pub fn domains(dir: &str, code: &str) -> Vec<String> {
         Err(e) => {
             // 檔案不在（平台為空、清單被 disabled）是正常情況；權限錯之類的要留下線索，
             // 否則按鈕集體消失沒人知道為什麼。
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!("讀不到平台清單 {path}（{e}），該平台的連結不會有品牌按鈕");
+            // 只警告一次：這支在每次清單請求、每個平台都會被叫到，前端又會輪詢。
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if e.kind() != std::io::ErrorKind::NotFound
+                && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                tracing::warn!("讀不到平台清單 {path}（{e}），該平台的連結不會有品牌按鈕；之後同類錯誤不再記錄");
             }
             return Vec::new();
         }

@@ -27,6 +27,10 @@ const MAILS = [
   { id: 3, received_at: now - 700000, sender: 'info@netflix.com', recipient: 'netflix@share.example.com', subject: '登入驗證碼',
     code: '5501', body: null, html: null, links: [], primary_link: null,
     verified: null, platform: 'netflix', skip_reason: null },
+  // 沒碼、沒連結、沒過驗證：卡片的琥珀色措辭只有這種信才走得到（連結被後端扣下也長這樣）
+  { id: 6, received_at: now - 900, sender: 'promo@netflix-rewards.example', recipient: 'netflix@share.example.com', subject: '您的存取碼在這裡',
+    code: null, body: '請點連結取得存取碼。', html: null, links: [], primary_link: null,
+    verified: false, platform: 'netflix', skip_reason: null },
 ]
 
 // 命中排除字，因此不進任何人的驗證碼分頁 —— 只有管理收件匣看得到（設計 1n）

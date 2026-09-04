@@ -35,16 +35,17 @@ docker run -d --name nfhh-shot \
   --disable-dev-shm-usage about:blank >/dev/null
 started=1
 
-# 先等 CDP 起來再驗 uid：Chromium 崩掉時 exec 只會回 No such container，看不出原因
-for _ in $(seq 1 50); do
-  curl -fs --max-time 1 http://127.0.0.1:9333/json/version >/dev/null 2>&1 && break
+# 先等 CDP 起來再驗 uid：Chromium 崩掉時 exec 只會回 No such container，看不出原因。
+# 用時限而不是次數：--max-time 讓每次 curl 最多等 1 秒，數次數的話「10 秒」會變 60 秒。
+deadline=$((SECONDS + 15))
+until curl -fs --max-time 1 http://127.0.0.1:9333/json/version >/dev/null 2>&1; do
+  if (( SECONDS >= deadline )); then
+    echo "CDP 15 秒內沒起來；容器最後的輸出：" >&2
+    docker logs --tail 20 nfhh-shot >&2 || true
+    exit 1
+  fi
   sleep 0.2
 done
-curl -fs --max-time 1 http://127.0.0.1:9333/json/version >/dev/null || {
-  echo "CDP 10 秒內沒起來；容器最後的輸出：" >&2
-  docker logs --tail 20 nfhh-shot >&2 || true
-  exit 1
-}
 
 # 映像預設以 chrome 使用者執行；萬一哪天不是，寧可中止
 uid="$(docker exec nfhh-shot id -u)"
