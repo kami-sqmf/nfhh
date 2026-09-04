@@ -63,6 +63,7 @@
   const platform = (code) => app.status?.platforms?.find((p) => p.code === code)
   const platformName = (code) => platform(code)?.name ?? code
 
+  const allowed = $derived(!!app.status?.my_ip_allowed)
   const latest = $derived(mails[0] ?? null)
   const rest = $derived(Math.max(0, mails.length - 1))
 
@@ -139,21 +140,21 @@
 
   <div class="flex-1 min-h-4"></div>
 
-  <!-- 授權入口。紅底不是警告，是「這裡有個問題可以解」的入口。 -->
-  <div class="rounded-md bg-bad-bg p-4">
-    <div class="text-item font-semibold text-bad-fg">遇到同戶裝置問題？</div>
+  <!-- 授權入口。紅底不是警告，是「這裡有個問題可以解」的入口 ——
+       所以只在還沒授權時是紅的；已授權就退成一般卡片，別讓人以為還有事要做。 -->
+  <div class="rounded-md p-4 {allowed ? 'bg-surface' : 'bg-bad-bg'}">
+    <div class="text-item font-semibold {allowed ? '' : 'text-bad-fg'}">遇到同戶裝置問題？</div>
     <p class="mt-1 text-label leading-relaxed text-fg-muted text-pretty">
       目前只建議電視出現同戶裝置限制再套用。
     </p>
 
-    <div class="mt-2.5 flex items-center justify-between gap-3 px-3.5 py-2.5 rounded-sm bg-surface/75">
+    <div class="mt-2.5 flex items-center justify-between gap-3 px-3.5 py-2.5 rounded-sm {allowed ? 'bg-canvas' : 'bg-surface/75'}">
       <span class="flex items-baseline gap-2 min-w-0">
         <span class="font-mono text-micro font-medium tracking-widest uppercase text-fg-faint shrink-0">出口 IP</span>
         <span class="font-mono text-lead font-medium truncate">{app.status?.my_ip ?? '取不到'}</span>
       </span>
-      <span class="font-mono text-micro font-medium shrink-0
-                   {app.status?.my_ip_allowed ? 'text-ok-fg' : 'text-bad-fg'}">
-        {app.status?.my_ip_allowed ? '已授權' : '尚未授權'}
+      <span class="font-mono text-micro font-medium shrink-0 {allowed ? 'text-ok-fg' : 'text-bad-fg'}">
+        {allowed ? '已授權' : '尚未授權'}
       </span>
     </div>
 
@@ -166,9 +167,10 @@
 
     <button
       onclick={() => (authorize = true)}
-      class="mt-2.5 w-full py-3 rounded-sm border-[1.5px] border-bad/40 text-item font-semibold text-bad-fg"
+      class="mt-2.5 w-full py-3 rounded-sm border-[1.5px] text-item font-semibold
+             {allowed ? 'border-line-firm' : 'border-bad/40 text-bad-fg'}"
     >
-      {app.status?.my_ip_allowed ? '延長授權期限' : '授權這個網路'}
+      {allowed ? '延長授權期限' : '授權這個網路'}
     </button>
   </div>
 </div>
