@@ -2600,9 +2600,14 @@ Unit 表格加一列：
 > [!WARNING]
 > 這是刻意的 fail-closed：nft 規則載入失敗時整套服務（含管理面板）都不會起來。
 > 用 `systemctl status nfhh-firewall.service` 看原因、修好後
-> `sudo systemctl restart nfhh-firewall.service && sudo systemctl start docker.service`
+> `sudo systemctl restart nfhh-firewall.service && sudo systemctl reset-failed docker.service && sudo systemctl start docker.service`
 > （是 `restart` 不是 `start`：這個 unit 是 `RemainAfterExit=yes` 的 oneshot，
-> 表被刪掉後它仍是 active，`start` 什麼都不會做）。
+> 表被刪掉後它仍是 active，`start` 什麼都不會做；`reset-failed` 是因為 docker 自己會
+> 重試三次後鎖住 60 秒）。反過來也成立：`stop`／`restart` 這個 unit 會連帶停掉／重啟
+> Docker（規則本身不會被移除）。只想重載規則請用
+> `sudo sh -c 'cat /opt/nfhh/config/nft/nfhh.nft /opt/nfhh/generated/nft/clients.nft > /run/nfhh-rules.nft && nft -f /run/nfhh-rules.nft'`
+> （`nfhh.nft` 檔頭要有「先宣告再 delete table」才能重複套用；先寫成檔再套，pipe 裡少了 clients.nft 仍會換表、白名單清空）。
+> 緊急解耦：`sudo rm /etc/systemd/system/docker.service.d/10-nfhh-firewall.conf && sudo systemctl daemon-reload`。
 ```
 
 - [ ] **步驟 3：在主機驗證（維護時段）**
@@ -2611,16 +2616,16 @@ Unit 表格加一列：
 
 ```bash
 set +e
-trap 'sudo systemctl restart nfhh-firewall.service; sudo systemctl start docker.service; echo "已復原：$(systemctl is-active nfhh-firewall.service docker.service | tr "\n" " ")"' EXIT
+trap 'sudo systemctl restart nfhh-firewall.service; sudo systemctl reset-failed docker.service; sudo systemctl start docker.service; echo "已復原：$(systemctl is-active nfhh-firewall.service docker.service | tr "\n" " ")"' EXIT
 sudo systemctl daemon-reload
 echo "requires/after: $(systemctl show docker.service -p Requires -p After | grep -c nfhh-firewall)"   # 預期 2
 sudo systemctl stop docker.service
 sudo nft delete table inet nfhh
-sudo systemctl start docker.service; echo "docker: $(systemctl is-active docker.service)"          # 預期 start 報錯、印出 failed 或 inactive
-echo "public listeners: $(sudo ss -ltnp | grep -cE ':53 |:443 |:853 ')"                            # 預期 0
-sudo systemctl restart nfhh-firewall.service && sudo nft list table inet nfhh >/dev/null && sudo systemctl start docker.service
+sudo systemctl start docker.service; echo "docker: $(systemctl is-active docker.service)"          # 預期 start 報錯；is-active 印 activating／failed／inactive（docker 會自己重試幾次）
+echo "public listeners: $(sudo ss -ltunp | grep -vE '127\.0\.0\.|\[::1\]' | grep -cE '[:.](53|443|853)\s')"   # 預期 0（含 UDP 53；loopback stub 不算）
+sudo systemctl restart nfhh-firewall.service && sudo nft list table inet nfhh >/dev/null && sudo systemctl reset-failed docker.service && sudo systemctl start docker.service
 systemctl is-active docker.service nfhh-firewall.service                                            # 預期兩行 active
-trap - EXIT
+systemctl is-active --quiet docker.service && systemctl is-active --quiet nfhh-firewall.service && trap - EXIT
 ```
 
 - [ ] **步驟 4：Commit**
@@ -2747,7 +2752,7 @@ git commit -m "開發截圖：改用 shoot.sh 包裝，CDP 只綁 loopback、非
 ### 任務 17：DECISIONS、CONTROL、README、.env.example
 
 **檔案：**
-- 修改：`docs/DECISIONS.md`（檔尾新增五節）
+- 修改：`docs/DECISIONS.md`（檔尾新增十節；任務 14 已先加了 domain-set 那節）
 - 修改：`docs/CONTROL.md:516-569`（§8 API 一覽）與 §2、§5、§11 對應段落
 - 修改：`README.md:278`（安全須知）
 - 修改：`.env.example`（任務 7、11 已加的變數，這裡只確認）
@@ -2814,6 +2819,36 @@ FORWARD_MAP；前者只轉 FALLBACK_TO。以前所有失敗都是 400、都走 F
 所以它不是攻擊面；而「Worker 先於面板部署」時它是唯一的轉發路徑。分類上它是
 `unconfigured`，跟「面板拒收」（只轉 FALLBACK_TO）與「面板不可用」分開記錄。
 
+## 白名單條目只有新增者或 admin 能改寫；無主條目由 admin 認領
+
+`upsert_allow_owned` 把「檢查擁有者」與「寫入」放在同一句 SQL（`ON CONFLICT … DO UPDATE
+… WHERE added_by = excluded.added_by OR ?is_admin`），沒有先查後寫的空隙。同一個
+NAT 後面的第二個人不能再對同一個 IP 按「延長」——那個網路本來就通了（`my_ip_allowed`
+看全部條目），面板會直接這樣告訴他。`nft::import_legacy` 匯入的無主列（`added_by IS NULL`）
+只有 admin 能改寫，改寫時 admin 成為擁有者（`coalesce`），有主的列永遠不會被搶。
+
+→ handler 一律用 `upsert_allow_owned`；`upsert_allow` 只給匯入與測試。
+
+## 推播訂閱：每人 8 筆，接手別人的 endpoint 算新裝置但仍被允許
+
+配額在同一把鎖內檢查與寫入。接手他人 endpoint（`ON CONFLICT(endpoint)` 轉移 `user_id`）
+在有空位時仍然允許 —— endpoint 不會序列化給前端，要拿到得先有資料庫或那台裝置；
+v2 審查的決定是「計入配額」而不是「禁止」。`p256dh` 只收 65 bytes 未壓縮點：
+壓縮點能通過曲線檢查、推送服務也回 201，但裝置永遠解不開。扇出同時最多 8 個 task、
+整批 60 秒，連續失敗 10 次的訂閱不再參與（含到期提醒）。
+
+## 稽核表有上限，公開端點有限流；兩者一起才守得住
+
+`audit` 表保留 90 天、最多 20 000 列（`NFHH_AUDIT_*` 可調），所有未登入就能寫稽核的
+端點（join/start、join/verify、join/invite、未登入的 register/start）共用一個固定視窗
+限流（每 IP 每 10 分鐘 30 次、全域 200 次）。只有其中一項的話：只設上限，洪水會把
+真正的稽核擠掉；只限流，表仍會無限長大。殘餘：全域 200／10 分鐘 ≈ 每天 28 800 列，
+持續的分散式洪水仍能把歷史壓到約 17 小時 —— 要真的防洪，可以讓 `actor IS NOT NULL`
+的列不受列數上限影響（公開端點寫的列 actor 一律 NULL）。洪水期間公開的加入流程會
+被擋 10 分鐘，登入與已登入的加金鑰不受影響（刻意豁免）。
+
+→ 新增任何不需登入就會寫稽核的端點，都要先過 `throttle_public`。
+
 ## Docker 依賴 nfhh-firewall 成功：fail-closed 是刻意的
 
 `deploy/docker.service.d/10-nfhh-firewall.conf` 讓 nft 載入失敗時 Docker 不啟動，
@@ -2827,8 +2862,8 @@ open resolver 上 Internet。跟 `nfhh-firewall.service` 刻意沒有 `ExecStop`
 §8 表格改動：
 
 ```
-| POST | `/api/join/start` `/verify` | 公開；寄與核對 Email 驗證碼。start 每 IP 每 10 分鐘 10 次 |
-| POST | `/api/mail/ingest` | 共用密鑰；回覆轉發名單。401 = 密鑰不符、422 = 信件解析失敗、5xx = 面板故障（Worker 只在 5xx／逾時走 FORWARD_MAP） |
+| POST | `/api/join/start` `/verify` | 公開；寄與核對 Email 驗證碼。與 `/api/join/invite`、未登入的 `/api/register/start` 共用限流：每 IP 每 10 分鐘 30 次、全域 200 次 |
+| POST | `/api/mail/ingest` | 共用密鑰；回覆轉發名單。401 = 密鑰不符、422 = 信件解析失敗、503 = 端點未啟用（`NFHH_MAIL_SECRET` 為空）、500 = 面板故障。Worker 只在 5xx／408／429／逾時走 FORWARD_MAP，其餘 4xx 只轉 FALLBACK_TO |
 | GET | `/api/mail` | 登入；**摘要**（無內文），經平台分權與顯示策略過濾 |
 | GET | `/api/mail/{id}` | 登入；單封全文，授權同清單 |
 | DELETE | `/api/mail/{id}` | 登入；member 限自己平台的信，`platform` 為空者限管理員 |
@@ -2836,7 +2871,7 @@ open resolver 上 Internet。跟 `nfhh-firewall.service` 刻意沒有 `ExecStop`
 | GET POST | `/api/push/subs` | 登入；列出或新增自己的裝置訂閱，**每人 8 筆** |
 ```
 
-§2「註冊」段落補一句：「所有認證流程開始時清除其他流程的 session 狀態；`register_finish` 檢查目標等於目前登入者。」§6「寄件者驗證」把「先以 `;` 切段再於段內比對」改寫成現況：只採信**第一個**、authserv-id 等於 `NFHH_MAIL_AUTHSERV_ID` 的 `Authentication-Results`；段內以 token 錨定比對 `dkim=pass`／`header.d=`，寄件者可控的 `smtp.mailfrom=` 等欄位夾帶的字串不算數。§5 補：「清單是摘要，全文走 `/api/mail/{id}`；品牌取碼按鈕只在寄件者通過驗證且連結 host 落在該平台網域時顯示。」§11 補配額。§9 設定補「可信寄件網域以 DB 為準、即時生效」。§10 資料庫補 `mails.ingested_at`（v12）與 audit 保留期。
+§2「註冊」段落補一句：「所有認證流程開始時清除其他流程的 session 狀態；`register_finish` 檢查目標等於目前登入者。」§6「寄件者驗證」把「先以 `;` 切段再於段內比對」改寫成現況：只採信**第一個**、authserv-id 等於 `NFHH_MAIL_AUTHSERV_ID` 的 `Authentication-Results`；段內以 token 錨定比對 `dkim=pass`／`header.d=`，寄件者可控的 `smtp.mailfrom=` 等欄位夾帶的字串不算數。§5 補：「清單是摘要，全文走 `/api/mail/{id}`；品牌取碼按鈕只在寄件者通過驗證且連結 host 落在該平台網域時顯示。」§2.5 那句「推送失敗（逾時、DNS、面板停機、**非 2xx**）時 Worker 退回自己的環境變數」改成「逾時、DNS、面板停機、5xx（含端點未啟用的 503）與 408／429 時退回 FORWARD_MAP；4xx 是拒收，只轉 FALLBACK_TO」，`docs/SETUP.md` 第 6 步「推送失敗時 Worker 退回自己的環境變數照送」也同樣改。§11 補配額。§9 設定補「可信寄件網域以 DB 為準、即時生效」，並改掉 §6 開頭「白名單由 `NFHH_MAIL_ALLOWED_SENDERS` 設定」與環境變數表下方「要改需自行加進 `environment:`」那兩句（現在改環境變數對既有資料庫是 no-op，要在面板改）。另外 `NFHH_MAIL_ENFORCE_SENDER` 實際只影響顯示模式（`SENDER_MODE`），轉發閘門 `FORWARD_ENFORCE` 固定種子為 `1` —— `Config` 的欄位註解（「預設 false = 觀察期，只記錄不阻擋」）與 CONTROL.md 的觀察期開關表都寫反了，一併改成「預設會收掉未通過驗證的轉發，觀察期只影響面板顯示」。§10 資料庫補 `mails.ingested_at`（v12）與 audit 保留期。§9 的環境變數表補 `NFHH_MAIL_AUTHSERV_ID`、`NFHH_AUDIT_KEEP_DAYS`、`NFHH_AUDIT_MAX_ROWS` 三列。
 
 - [ ] **步驟 3：README 安全須知**
 
@@ -2869,6 +2904,17 @@ git commit -m "文件：記錄安全性修正帶來的約束與 API 變更"
 
 ---
 
+## 掃描之外、執行中發現的後續項目
+
+審查子代理在執行各任務時另外找到、但不在 17 項發現內、也不該混進本分支的事：
+
+- **session 儲存無上限**：`SessionManagerLayer::new(MemoryStore::default())` 沒有 `with_expiry`，`tower-sessions-memory-store 0.15` 只在 `load` 時懶惰過濾過期紀錄、從不驅逐；公開的 `/api/login/any/start` 每打一次就留一筆 WebAuthn challenge 到行程結束，且 compose 沒給 `control` 記憶體上限。修法與任務 11 同型：對該端點套 `throttle_public`、給 session 設 expiry 並開一個定期 `MemoryStore::continuously_delete_expired`（或改用有 TTL 的 store）。屬於新的發現，另開任務。
+- **全新安裝缺預設驗證碼關鍵字**：`migrate_v8` 的預設值只 `UPDATE` 不 `INSERT`，新資料庫再經 `seed_settings` 得到空清單（已登記為工作卡）。
+- **session id 不輪替**：登入與建立新帳號時沒有 `session.cycle_id()`；`Secure + HttpOnly + SameSite=Strict` 讓固定攻擊很難，但這是整個 app 既有的性質，值得單獨處理。
+- **面板文案寫死「保留 14 天」**：`NFHH_MAIL_KEEP_DAYS` 可調，文案不會跟著變。
+- **推播死列會佔配額**：只在 404／410 時自動刪除；其他方式反覆失敗的訂閱到 10 次後不再探測、也就永遠到不了 404，卻仍佔 8 筆配額。使用者可在帳號頁自行移除；若要自動化，到配額上限時可改為驅逐最舊的 `last_ok_at IS NULL AND fail_count >= 10` 那筆。
+- **接手他人的推播 endpoint 仍被允許**（配額有空位時）：這是 v2 的決定「接手計入配額」而非「禁止接手」；endpoint 不會序列化給前端，要拿到得先有資料庫或那台裝置。記在 DECISIONS。
+
 ## 部署與驗收
 
 ### 部署前（正式主機）
@@ -2893,6 +2939,13 @@ docker run --rm -v smartdns_control-data:/data:ro alpine sh -c 'apk add -q sqlit
 ```
 數字就是會被刪的列數。不接受就先在 `.env` 調 `NFHH_MAIL_KEEP_DAYS`／`NFHH_AUDIT_KEEP_DAYS`／`NFHH_AUDIT_MAX_ROWS`。
 
+另外看一下有沒有人已經在推播訂閱的配額線上（任務 12 的上限是每人 8 筆；已在線上的人下一次重新訂閱會被拒）：
+
+```bash
+docker run --rm -v smartdns_control-data:/data:ro alpine sh -c 'apk add -q sqlite && sqlite3 /data/control.db "SELECT user_id, count(*) FROM push_subscriptions GROUP BY 1 HAVING count(*) >= 8"'
+```
+有結果就先請那些人在帳號頁移除不用的裝置。
+
 4. `.env` 視需要加 `NFHH_MAIL_AUTHSERV_ID`（預設 `mx.cloudflare.net`，可省略）。
 
 5. **復原演練**（一次就好）：用上面的備份檔在一個暫時 volume 還原並開得起來：
@@ -2903,25 +2956,35 @@ docker volume create nfhh-restore-test && docker run --rm -v nfhh-restore-test:/
 
 ### 部署順序
 
-1. 先裝 systemd drop-in（任務 15）並在維護時段完成該任務的驗證。
-2. 後端：
+1. 取回程式碼（只換檔案，什麼都不會重啟）：`git checkout security-fix`。
+2. **維護時段**，先證明新的規則檔在這台的 nft 上可以重複套用（`config/nft/nfhh.nft` 檔頭多了
+   「先宣告再 delete table」；下次開機 `nfhh-firewall.service` 就靠它，它失敗的話 drop-in 會讓 Docker
+   一起不啟動）。前後各看一次白名單，條目數要一樣（timeout 重算是正常的）：
 
 ```bash
-git checkout security-fix && docker compose up -d --build control
+sudo nft list set inet nfhh clients_v4 | grep -c timeout; sudo nft -c -f /opt/nfhh/config/nft/nfhh.nft && sudo sh -c 'cat /opt/nfhh/config/nft/nfhh.nft /opt/nfhh/generated/nft/clients.nft > /run/nfhh-rules.nft && nft -f /run/nfhh-rules.nft' && sudo nft list set inet nfhh clients_v4 | grep -c timeout
+```
+預期：無錯誤、兩個數字相同。這一步同時也是任務 15 文件裡「重載規則」命令的實測。
+
+3. 裝 systemd drop-in（任務 15）並完成該任務的驗證段。
+4. 後端：
+
+```bash
+docker compose up -d --build control
 ```
 `./nfhh apply` 只重產設定並 reload smartdns／nginx，**不會**重建 control。
 
-3. 確認：
+5. 確認：
 
 ```bash
 docker compose ps control && docker compose logs --tail=50 control | grep -E '面板啟動於|沒有 email|error' ; curl -s http://127.0.0.1:8081/api/status | head -c 200; echo; curl -s -o /dev/null -w '%{http_code}\n' -X POST -H 'authorization: Bearer wrong' http://127.0.0.1:8081/api/mail/ingest
 ```
 預期：`running`；日誌有「面板啟動於」、沒有「個帳號沒有 email」與 error；status 回 JSON；最後一行 `401`。
 
-4. 記錄部署版本：`git rev-parse HEAD`。
-5. Worker：把新的 `email-worker.js` 貼進 Cloudflare Dashboard。**後端先、Worker 後**（理由見任務 9 末尾）。
-6. 任務 7 的 canary，結果記進 DECISIONS.md。
-7. Mail smoke：從真實平台觸發一封驗證碼信，確認面板顯示、家人收到轉發、推播送達；再從面板刪掉一封不屬於自己平台的信（應回 `ok: false`）。
+6. 記錄部署版本：`git rev-parse HEAD`。
+7. Worker：把新的 `email-worker.js` 貼進 Cloudflare Dashboard。**後端先、Worker 後**（理由見任務 9 末尾）。
+8. 任務 7 的 canary，結果記進 DECISIONS.md。
+9. Mail smoke：從真實平台觸發一封驗證碼信，確認面板顯示、家人收到轉發、推播送達；再從面板刪掉一封不屬於自己平台的信（應回 `ok: false`）。
 
 ### 復原
 
@@ -2934,6 +2997,8 @@ docker compose stop control && docker run --rm -v smartdns_control-data:/data -v
 
 - Worker：貼回 `git show master:app/cloudflare/email-worker.js`。
 - 防火牆 drop-in：`sudo rm /etc/systemd/system/docker.service.d/10-nfhh-firewall.conf && sudo systemctl daemon-reload`。
+- 規則檔 `config/nft/nfhh.nft` 不必回退：表的內容沒變，只多了讓它可重複套用的兩行；master 版本反而
+  在表存在時套不回去（會疊加規則）。
 
 ### 最終驗收清單
 
@@ -2948,5 +3013,5 @@ docker compose stop control && docker run --rm -v smartdns_control-data:/data -v
 - [ ] `docker compose build control`（正式映像建得起來）
 - [ ] 任務 10 的 `v12_backfill_clamps_pre_existing_future_dates` 通過
 - [ ] 任務 15 的主機驗證、任務 7 的 canary、上面的 smoke 都有紀錄（日期、結果）
-- [ ] `git log --oneline master..security-fix` 核對 17 個 commit 各對應一項發現
+- [ ] `git log --oneline master..security-fix` 核對每個 commit 都對應一項任務或該任務的審查補強（任務 1–17 各一個主 commit，補強 commit 的訊息以「任務 N 補強」或任務名開頭）
 - [ ] 對 `security-fix` 跑 `/security-review` 回歸掃描；#4 的狀態依 canary 結果填寫，不得先宣告 17/17
