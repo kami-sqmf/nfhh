@@ -20,7 +20,6 @@
   // 這是 split-horizon 的同一套邏輯（見 DECISIONS.md）：本層裝置若填
   // 公網位址，封包會出去再繞回來，而 TP-Link 未必支援 NAT hairpin。
   const dnsIp = $derived(s?.lan_ip ?? s?.wan_ip ?? '未知')
-  const isLan = $derived(!!s?.lan_ip)
 
   // 檢查分頁的三步：授權 → 到裝置上查出口 → 對數字。
   // 第一步由 my_ip_allowed 決定；後兩步要人自己做，面板看不到結果。
@@ -94,12 +93,6 @@
         改成手動之後，IP／閘道／子網路遮罩通常也要一起填，照原本自動取得的值抄即可。
       </p>
 
-      {#if !isLan}
-        <p class="mt-3 text-body leading-relaxed text-watch-fg text-pretty">
-          ⚠️ 這是 IP 字面值，<b class="font-semibold">ISP 重撥換 IP 後要回來重設</b>。
-        </p>
-      {/if}
-
       <details class="mt-4 pt-3.5 border-t border-line">
         <summary class="text-body font-medium text-ok">為什麼不是私人 DNS？</summary>
         <p class="mt-2.5 text-body leading-relaxed text-fg-muted text-pretty">
@@ -149,12 +142,6 @@
       <p class="mt-4 text-body leading-relaxed text-fg-muted text-pretty">
         改成靜態之後，IP 位址／閘道通常也要一起填，照原本自動取得的值抄即可。DNS 2 留空，然後儲存。
       </p>
-
-      {#if !isLan}
-        <p class="mt-3 text-body leading-relaxed text-watch-fg text-pretty">
-          ⚠️ 這是 IP 字面值，<b class="font-semibold">ISP 重撥換 IP 後要回來重設</b>。
-        </p>
-      {/if}
     </div>
 
     <div class="bg-surface rounded-lg p-5">
@@ -199,12 +186,6 @@
       <p class="mt-4 text-body leading-relaxed text-fg-muted text-pretty">
         填完按右上角「儲存」。
       </p>
-
-      {#if !isLan}
-        <p class="mt-3 text-body leading-relaxed text-watch-fg text-pretty">
-          ⚠️ 這是 IP 字面值，<b class="font-semibold">ISP 重撥換 IP 後要回來重設</b>。
-        </p>
-      {/if}
     </div>
 
     <div class="bg-surface rounded-lg p-5">
