@@ -35,6 +35,7 @@ dev/shoot.sh 'https://dnf.example.com/' '[
   （映像作者文件如此）。少了 host network 與主機掛載之後，它能影響的只剩容器自己。
 - `trap … EXIT`：正常結束或中斷都會清掉容器，不留一個在聽的 9333；也只清自己起的那個
   （靠 `started` 旗標），不會誤殺另一個還在跑的 `shoot.sh` 的容器 —— 同名容器已存在時會直接中止。
+  容器不帶 `--rm`：CDP 10 秒內沒起來時腳本會印容器最後的輸出再非零退出，清理仍由 trap 做。
 - **`--security-opt no-new-privileges --cap-drop ALL`**：容器不能提權、不帶任何 capability。
 
 步驟支援 `dark`（模擬 `prefers-color-scheme`，Chrome 的 `--force-dark-mode`
