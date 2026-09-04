@@ -115,9 +115,9 @@ status() {
         row "$u" "$(systemctl is-enabled "$u" 2>/dev/null || echo 未安裝)/$(systemctl is-active "$u" 2>/dev/null || echo -)"
     done
     if [[ -e /etc/systemd/system/docker.service.d/10-nfhh-firewall.conf ]]; then
-        row "docker.service.d/10-nfhh-firewall.conf" "已安裝"
+        row "docker drop-in" "✅ 已安裝（Docker 依賴防火牆 unit）"
     else
-        row "docker.service.d/10-nfhh-firewall.conf" "未安裝"
+        row "docker drop-in" "⛔ 未安裝（防火牆失敗時 Docker 仍會起來；見 docs/SETUP.md 第 4 步）"
     fi
 }
 

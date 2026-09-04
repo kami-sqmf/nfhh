@@ -143,9 +143,11 @@ sudo cp /opt/nfhh/deploy/nfhh-*.{service,timer,path} /etc/systemd/system/ && sud
 >
 > 這條相依是雙向的：`stop`／`restart` `nfhh-firewall.service` 現在也會連帶
 > 停／重啟 Docker（nft 規則本身不會因此消失，理由見 docs/DECISIONS.md）。
-> 只是要讓改過的規則生效，用 `sudo nft -f /opt/nfhh/config/nft/nfhh.nft`
-> （白名單另外 `sudo nft -f /opt/nfhh/generated/nft/clients.nft`），不要
-> `restart` 這個 unit —— 那會連 Docker 一起重啟。
+> 只是要讓改過的規則生效，不要 `restart` 這個 unit（那會連 Docker 一起重啟），用：
+> `cat /opt/nfhh/config/nft/nfhh.nft /opt/nfhh/generated/nft/clients.nft | sudo nft -f -`
+> —— 一個交易把整張表換掉並補回白名單（`nfhh.nft` 檔頭的「先宣告再 delete」讓它可以
+> 重複套用；只套 `nfhh.nft` 會把動態白名單清空，家人會被擋在外面直到面板下次寫入）。
+> 先 `sudo nft -c -f /opt/nfhh/config/nft/nfhh.nft` 可以只檢查語法不套用。
 >
 > 緊急時要解除這條相依（例如要單獨除錯 Docker、暫時不想連動防火牆）：
 > `sudo rm /etc/systemd/system/docker.service.d/10-nfhh-firewall.conf && sudo systemctl daemon-reload`。
@@ -166,7 +168,7 @@ echo "requires/after: $(systemctl show docker.service -p Requires -p After | gre
 sudo systemctl stop docker.service
 sudo nft delete table inet nfhh
 sudo systemctl start docker.service; echo "docker: $(systemctl is-active docker.service)"          # 預期 start 報錯，is-active 印出 activating、failed 或 inactive（docker 會自己重試幾次）
-echo "public listeners: $(sudo ss -ltunp | grep -cE '[:.](53|443|853)\s')"                          # 預期 0
+echo "public listeners: $(sudo ss -ltunp | grep -vE '127\.0\.0\.|\[::1\]' | grep -cE '[:.](53|443|853)\s')"   # 預期 0（loopback 的 stub resolver 不算）
 sudo systemctl restart nfhh-firewall.service && sudo nft list table inet nfhh >/dev/null && sudo systemctl reset-failed docker.service && sudo systemctl start docker.service
 systemctl is-active docker.service nfhh-firewall.service                                            # 預期兩行 active
 systemctl is-active --quiet docker.service && systemctl is-active --quiet nfhh-firewall.service && trap - EXIT
