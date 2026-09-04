@@ -186,3 +186,115 @@ compose 預設用資料夾名當專案名，volume 實際名稱是「專案名_v
 CDN 或分析服務的網域，等於替它們背書。
 
 → 影片 CDN 之類的請照既有慣例放 `*-cdn.list.disabled`，不要混進主清單。
+
+## 登入與註冊的 session 狀態互斥，不能共用鍵
+
+`login_start` 存 `S_LOGIN_USER`、`register_start` 存 `S_REG_USER`，任一流程開始
+時 `clear_auth_flows` 清掉全部（`S_REG`、`S_REG_USER`、`S_AUTH`、`S_LOGIN_USER`、
+`S_DISC`；刻意不清登入身分與 `S_EMAIL_PROOF`）。以前共用 `S_REG_USER`：member 先
+啟動「新增 Passkey」、再對 admin 的 Email 啟動登入、最後提交註冊回應，新金鑰就寫進
+admin 列。`register_finish` 另外硬檢查「目標 = 目前登入者」（`check_registration_owner`）。
+
+→ 別為了少一個鍵把兩條流程合回去；別把 `check_registration_owner` 拿掉。
+
+## 信箱所有權證明綁在 session 上，不只是全域旗標
+
+`email_otp.verified_at` 是全域的（以 Email 為鍵）。`register_start` 另外要求
+`S_EMAIL_PROOF` 等於該信箱 —— 證明是**這個瀏覽器**做的（驗證碼與邀請連結兩條路
+都寫這把鍵）。否則攻擊者只要知道受邀 Email、等真正持有人驗證完，就能在自己的
+瀏覽器搶先建帳號。
+
+## v6 遷移路徑已移除：帳號一定有 email，登入只認 email
+
+補填 Email 的端點、`username` 登入退路與 `rename_owner` 都拿掉了。它們讓一個
+只有舊 Passkey 的帳號可以自填任意信箱、搶走家人的身分與轉發控制。
+`users.username` 欄位仍在（WebAuthn user handle 與歷史稽核的 actor），但不再
+是登入識別。啟動時若發現沒有 email 的帳號會記 error 並列出 username
+（`db::users_without_email`）：那種帳號仍可用可探索登入進來，但不能用 Email 登入、
+也對不上平台分權與轉發，只能刪掉重邀。
+
+→ 別把 `find_user(username)` 加回登入流程。
+
+## Worker 的 fail-open 只對「面板不可用」，不對「面板拒收」
+
+ingest 回 401／422 = 拒收（永久）；5xx（含端點未啟用的 503）、408／429、逾時、
+連不上 = 不可用（暫時）。只有後者退回 FORWARD_MAP；前者只轉 FALLBACK_TO
+（2xx 但 JSON 不是物件也算拒收，Worker 才不會在 `forward()` 之前拋例外）。
+以前所有失敗都是 400、都走 FORWARD_MAP，寄一封讓解析器出錯的信就能繞過寄件者驗證
+直達家人信箱。
+
+→ `mail_ingest` 不能改回 `AppError`（那是一律 400）。
+
+## `received_at` 是寄件者說的，`ingested_at` 才是面板的時鐘
+
+排序、分頁、保留期只看 `ingested_at`；`received_at` 夾在保留期之前
+（`NFHH_MAIL_KEEP_DAYS`，預設 14 天）到一小時之後之間，超出就改用現在，而且
+只做顯示（`clamp_received`）。以前用 `received_at`：一封未來日期的信永遠排第一、
+永遠不被清。遷移（v12）回填時取 `min(received_at, now)`，升級前就躺在表裡的
+偽造日期不會變成可信時間；`ingested_at` 為 NULL 的列一律當過期清掉。
+
+## 只採信第一個 Authentication-Results，而它的可靠性來自 Cloudflare，不來自我們
+
+`mail::parse` 只看最上面那個、authserv-id 等於 `NFHH_MAIL_AUTHSERV_ID` 的表頭
+（第一個表頭對不上就當沒有，不會滑到第二個）。這比以前「全部串起來看」嚴格，但仍
+假設收信端把自己的表頭放最前面。`authserv-id` 不是秘密。部署後要用任務 7 的 canary
+證實；結果與日期記在這裡：
+
+- （canary 日期）：（verified=false／true）
+
+解析器已對 token 錨定、註解與引號字串免疫（`strip_cfws`）。唯一無法在解析器端
+處理的情況：收信端把寄件者可控的欄位**不加引號**地回寫、而該欄位含原始 `;`
+（違反 RFC 8601 §2.2）—— 任何以 `;` 切段的解析器都會多出一段。canary 的第二封信
+測的就是這件事。
+
+→ canary 若失敗，程式端沒有更多可做的事；決策見任務 7 步驟 5。
+
+## Worker 沒有面板設定時照 FORWARD_MAP 轉發是刻意的
+
+`PANEL_ENDPOINT`／`PANEL_SECRET` 缺席是部署狀態，攻擊者改不了 Worker 的環境變數，
+所以它不是攻擊面；而「Worker 先於面板部署」時它是唯一的轉發路徑。分類上它是
+`unconfigured`，跟「面板拒收」（只轉 FALLBACK_TO）與「面板不可用」分開記錄。
+
+## 白名單條目只有新增者或 admin 能改寫；無主條目由 admin 認領
+
+`upsert_allow_owned` 把「檢查擁有者」與「寫入」放在同一句 SQL（`ON CONFLICT … DO UPDATE
+… WHERE allowlist.added_by = excluded.added_by OR ?is_admin`），沒有先查後寫的空隙；
+不成立時 `changes()` 是 0，handler 回「不是你新增的」。同一個 NAT 後面的第二個人
+不能再對同一個 IP 按「延長」——那個網路本來就通了（`my_ip_allowed` 看全部條目），
+面板會直接這樣告訴他。`nft::import_legacy` 匯入的無主列（`added_by IS NULL`）
+只有 admin 能改寫，改寫時 admin 成為擁有者（`coalesce`），有主的列永遠不會被搶。
+
+→ handler 一律用 `upsert_allow_owned`；`upsert_allow` 只給匯入與測試。
+
+## 推播訂閱：每人 8 筆，接手別人的 endpoint 算新裝置但仍被允許
+
+配額在同一把鎖內檢查與寫入（`MAX_PUSH_SUBS_PER_USER`）。接手他人 endpoint
+（`ON CONFLICT(endpoint)` 轉移 `user_id`）在有空位時仍然允許 —— endpoint 不會
+序列化給前端，要拿到得先有資料庫或那台裝置；v2 審查的決定是「計入配額」而不是
+「禁止」。`p256dh` 只收 65 bytes 未壓縮點（`push::valid_keys`）：壓縮點能通過
+曲線檢查、推送服務也回 201，但裝置永遠解不開。扇出同時最多 8 個 task
+（`PUSH_FANOUT_CONCURRENCY`）、整批 60 秒（`PUSH_FANOUT_DEADLINE_SECS`），
+連續失敗 10 次（`PUSH_MAX_FAILS`）的訂閱不再參與（含到期提醒）。
+
+## 稽核表有上限，公開端點有限流；兩者一起才守得住
+
+`audit` 表保留 90 天、最多 20 000 列（`NFHH_AUDIT_KEEP_DAYS` 夾在 1 到 3650、
+`NFHH_AUDIT_MAX_ROWS` 夾在 100 到 1 000 000，每 5 分鐘清一次），所有未登入就能
+寫稽核的端點（join/start、join/verify、join/invite、未登入的 register/start）共用
+一個固定視窗限流（每 IP 每 10 分鐘 30 次、全域 200 次）。只有其中一項的話：只設
+上限，洪水會把真正的稽核擠掉；只限流，表仍會無限長大。殘餘：全域 200／10 分鐘
+≈ 每天 28 800 列，持續的分散式洪水仍能把歷史壓到約 17 小時 —— 要真的防洪，可以讓
+`actor IS NOT NULL` 的列不受列數上限影響（公開端點寫的列 actor 一律 NULL）。
+洪水期間公開的加入流程會被擋 10 分鐘，登入與已登入的加金鑰不受影響（刻意豁免）。
+
+→ 新增任何不需登入就會寫稽核的端點，都要先過 `throttle_public`，而且要在任何
+DB 存取之前。
+
+## Docker 依賴 nfhh-firewall 成功：fail-closed 是刻意的
+
+`deploy/docker.service.d/10-nfhh-firewall.conf` 用 `Requires=` 讓 nft 載入失敗時
+Docker 不啟動，連管理面板一起不起來；`ExecStartPre=nft list table inet nfhh` 再驗
+一次規則真的在核心裡（unit 是 `RemainAfterExit` 的 oneshot，表被手動刪掉後它仍是
+active）。代價是「規則檔寫錯就全停」；不這樣做的代價是 open resolver 上 Internet。
+跟 `nfhh-firewall.service` 刻意沒有 `ExecStop` 是同一個判斷的兩面：
+**規則在的時候不要拿掉，規則不在的時候不要開埠。**

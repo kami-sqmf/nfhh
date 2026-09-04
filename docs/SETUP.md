@@ -242,7 +242,7 @@ systemctl is-active --quiet docker.service && systemctl is-active --quiet nfhh-f
 
 `FALLBACK_TO` 保留是刻意的：Worker 或面板萬一壞掉，管理員仍收得到驗證碼，不會整組人被鎖在外面卻拿不到碼。它**永遠會被加進轉發名單** —— 連面板判定「這封不用轉」時也一樣，篩選器設錯才看得見。
 
-Worker 是**先推送再轉發**：轉發名單由面板決定，只有它解析得到內文，關鍵字才比對得了。推送失敗時 Worker 退回自己的環境變數照送 —— 面板掛掉絕不能讓信轉不出去。詳見 [CONTROL.md](CONTROL.md) §2.5。
+Worker 是**先推送再轉發**：轉發名單由面板決定，只有它解析得到內文，關鍵字才比對得了。面板**不可用**（逾時、DNS、面板停機、5xx 含端點未啟用的 503、408／429）時 Worker 退回 `FORWARD_MAP` 照送 —— 面板掛掉絕不能讓信轉不出去；面板**拒收**（其餘 4xx：401 密鑰不符、422 解析失敗）則只轉 `FALLBACK_TO`，不走 `FORWARD_MAP`。詳見 [CONTROL.md](CONTROL.md) §2.5。
 
 > [!IMPORTANT]
 > `FORWARD_MAP` 是那條退路唯一的名單來源，請保持它與面板「轉發收件人」頁同步。

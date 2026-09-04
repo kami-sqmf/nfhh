@@ -58,7 +58,9 @@ struct Config {
     /// 可信的寄件品牌網域（比對 DKIM 簽章網域，不是信封寄件者）。
     /// 只是**種子值**，實際以 settings.sender_domains 為準（見 seed_settings／mail_ingest）。
     mail_allowed_senders: Vec<String>,
-    /// 未通過驗證時是否真的收掉扇出。預設 false = 觀察期，只記錄不阻擋。
+    /// 只是 `sender_verify_mode` 的**種子**（面板怎麼顯示未通過驗證的信：
+    /// `0` = observe、`1` = enforce）。轉發閘門 `forward_enforce_sender` 固定種子
+    /// 為 `1`、不看這個變數 —— 未通過驗證的信預設就不轉發，要放寬只能在面板改。
     mail_enforce_sender: bool,
     /// 收信端在 `Authentication-Results` 裡署名的 authserv-id。只有它寫的
     /// 驗證結果算數；Cloudflare Email Routing 是 `mx.cloudflare.net`。

@@ -285,6 +285,10 @@ cd /opt/nfhh && ./nfhh apply
 - 沒有它，`:53` 就是 open resolver → 會被拿去做 DNS 放大攻擊，你的 IP 會進黑名單
 - 沒有它，`:443` 就是免費的 Netflix 跳板（SNI 白名單只限制**去哪**，不限制**誰能用**）
 
+> [!WARNING]
+> `deploy/docker.service.d/10-nfhh-firewall.conf` 讓 Docker 在 nft 規則載入失敗時**不啟動**。
+> 這是刻意的：規則不在的時候，`:53` 開著就是 open resolver。
+
 ## 已知限制
 
 1. **電視類裝置只能填 IP**，重撥換 IP 後要手動重設。手機走 DoT hostname 不受影響。
