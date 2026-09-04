@@ -157,6 +157,13 @@
       </span>
     </div>
 
+    <!-- 授權只是第一步，裝置那端還要把 DNS 改過來。教學放在延長按鈕上方、
+         用實心綠色：多數人卡住的是「改了沒生效」，不是授權本身。 -->
+    <button
+      onclick={() => go('guide')}
+      class="mt-2.5 w-full py-3 rounded-sm bg-ok text-white text-item font-semibold"
+    >點這裡看教學</button>
+
     <button
       onclick={() => (authorize = true)}
       class="mt-2.5 w-full py-3 rounded-sm border-[1.5px] border-bad/40 text-item font-semibold text-bad-fg"

@@ -304,10 +304,10 @@ IPv4 因為 NAT，一筆就代表整戶。所以前端在**瀏覽器端**向只�
 
 | 分頁 | 內容 |
 |---|---|
-| Android | 設定 → 網路 → 私人 DNS → 指定主機名稱 → `dns.example.com` |
-| iPhone ／ iPad | 下載 `.mobileconfig` 描述檔 |
-| 檢查 | 引導開 `https://ifconfig.me` 確認出口 IP |
-| 電視 | DNS 手動填出口 IP（重撥後需重設） |
+| 電視 | DNS 手動填出口 IP（重撥後需重設）；路由器整台改列為不推薦 |
+| Android | 推薦：Wi‑Fi → 該網路 → IP 設定改「靜態」→ DNS 1 填出口 IP。私人 DNS（`dns.example.com`）列為不推薦 —— 全機設定，換到沒授權的網路整台會斷網 |
+| iPhone ／ iPad | 推薦：Wi‑Fi → ⓘ → 設定 DNS 改「手動」→ 填出口 IP。`.mobileconfig` 描述檔列為不推薦（同上理由） |
+| 檢查 | 三步：已授權（打勾，帶剩餘天數）→ 開 `https://ifconfig.me`（開啟／複製網址）→ 對照 `wan_ip`；下方附「還是不一樣」的排除步驟 |
 
 ### iOS 描述檔（`GET /api/dns-profile`）
 

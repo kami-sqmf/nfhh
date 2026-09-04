@@ -391,13 +391,15 @@ sudo cp /opt/nfhh/deploy/nfhh-cert.{path,service} /etc/systemd/system/ && sudo s
 
 **4. 手機設定**
 
-面板內建「連線教學」區塊，分 Android、iPhone ／ iPad、電視三頁，會自動帶入目前的網域名與出口 IP，並在該網路尚未授權時提示。家人註冊完直接照著做即可。
+面板內建「連線教學」區塊，分電視、Android、iOS、檢查四頁，會自動帶入目前的網域名與出口 IP，並在該網路尚未授權時提示。家人註冊完直接照著做即可。首頁「遇到同戶裝置問題？」區塊也有「點這裡看教學」直接跳過去。
 
-| 系統 | 做法 |
+| 系統 | 推薦做法 |
 |---|---|
-| Android | 設定 → 網路和網際網路 → 私人 DNS → 指定主機名稱 → `dns.example.com` |
-| iOS ／ iPadOS | 面板「連線教學 → iPhone ／ iPad」下載 `.mobileconfig` 描述檔後安裝 |
-| 電視與其他 | DNS 手動填出口 IP。⚠️ 重撥換 IP 後要重設 |
+| Android | 設定 → 網路和網際網路 → Wi‑Fi → 目前網路 → 編輯 → IP 設定改「靜態」→ DNS 1 填出口 IP |
+| iOS ／ iPadOS | 設定 → Wi‑Fi → ⓘ → 設定 DNS 改「手動」→ 填出口 IP |
+| 電視與其他 | DNS 手動填出口 IP |
+
+三種都是只改該 Wi‑Fi 的 IP 字面值。⚠️ 重撥換 IP 後要重設。私人 DNS（`dns.example.com`）與 iOS `.mobileconfig` 描述檔仍在教學頁，但標為不推薦：它們是全機設定，換到沒授權的網路整台會斷網。
 
 **iOS 描述檔的兩個實作重點：**
 
