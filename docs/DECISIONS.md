@@ -244,7 +244,10 @@ ingest 回 401／422 = 拒收（永久）；5xx（含端點未啟用的 503）�
 假設收信端把自己的表頭放最前面。`authserv-id` 不是秘密。部署後要用任務 7 的 canary
 證實；結果與日期記在這裡：
 
-- （canary 日期）：（verified=false／true）
+- 2026-09-04（UTC 16:47／16:49，經 Resend 寄到 `netflix@share.kami.tw`）：兩封都 `verified=false`。
+  第一封帶偽造的 `Authentication-Results: mx.cloudflare.net; dkim=pass header.d=netflix.com`
+  表頭；第二封表頭乾淨、寄件位址 local part 是 `dkim=pass.header.d=netflix.com`。日誌兩行
+  都是 `code=有 篩選器=通過 轉發=0`：轉發閘門也如預期收掉未驗證的信。發現 #4 關閉。
 
 解析器已對 token 錨定、註解與引號字串免疫（`strip_cfws`）。唯一無法在解析器端
 處理的情況：收信端把寄件者可控的欄位**不加引號**地回寫、而該欄位含原始 `;`
