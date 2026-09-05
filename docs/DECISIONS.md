@@ -322,8 +322,16 @@ login/otp/verify、未登入的 register/start）共用**同一個**固定視窗
 洪水換個門牌就能把真正的軌跡擠掉；session store 也是共用的。代價是有人猛敲登入時
 「用 Email 加入」會一起被擋 10 分鐘 —— 家人不會同時大量做這兩件事。
 
+session store 那一半光靠限流也封不住（#1）：限流只是讓灌得慢，每 10 分鐘 200 筆、
+預設壽命兩週，仍是無上限地長。所以是三件事一起：限流（灌得慢）＋匿名 session 只活
+15 分鐘（`mark_anonymous`，灌進來的自己消失）＋ `BoundedMemoryStore` 硬上限 10 000
+（真的滿了先清過期、再踢最早到期的，而那只會是匿名紀錄）。少任何一個都有洞：沒短壽命，
+上限一到就開始踢，兩週的登入 session 雖排在後面但整個 store 都是垃圾；沒上限，15 分鐘
+內仍能塞進 300 筆 × 每筆一份 WebAuthn 挑戰，長得有限但不是有界。
+
 → 新增任何不需登入就能打的認證端點（寄信、寫 session、寫稽核任一），都要先過
-`throttle_public`，而且要在任何 DB 存取之前。
+`throttle_public`，而且要在任何 DB 存取之前；會寫匿名 session 的話，第一次改動 session
+之前先 `mark_anonymous`（漏一條就是兩週）。
 
 ## Docker 依賴 nfhh-firewall 成功：fail-closed 是刻意的
 

@@ -324,17 +324,26 @@ const JOIN_LIMIT_GLOBAL: u32 = 200;
 /// 遠不到一萬；限流之下匿名起手每 10 分鐘最多 200 筆，要塞滿一萬得不間斷
 /// 灌 8 小時，而那時被踢的也只是 15 分鐘壽命的匿名紀錄。純粹是保險。
 const SESSION_STORE_MAX: usize = 10_000;
-/// 匿名 session（登入／加入起手到完成之間）的閒置壽命。要撐過整條流程裡
-/// 最長的一段：驗證碼本身 10 分鐘（`otp::TTL_SECS`），而 `join_verify` 寫下的
+/// 匿名 session（登入／加入起手到完成之間）從這次寫入起的壽命。要撐過
+/// 整條流程裡最長的一段：驗證碼本身 10 分鐘（`otp::TTL_SECS`），而 `join_verify` 寫下的
 /// 信箱證明要活到 `register_start`／`register_finish` 做完，`register_start`
 /// 認的時窗是 15 分鐘（`otp::VERIFIED_WINDOW_SECS`）。再長只是替灌 store
 /// 的人多留兩週而已。
 const ANON_SESSION_MINUTES: i64 = 15;
 
-/// 匿名的起手（挑戰、信箱證明）寫進 session 之前先呼叫：把這份 session 的
-/// 壽命縮到 `ANON_SESSION_MINUTES`，沒登入成功就自己消失，不必佔兩週。
+/// 匿名的起手（挑戰、信箱證明）寫進 session 之前先呼叫：讓這次寫入的紀錄
+/// 在 store 裡只活 `ANON_SESSION_MINUTES`，沒登入成功就自己消失，不必佔兩週。
 /// 已登入的人（例如登入著再去打 login/any/start）不動 —— 縮的是還沒證明
 /// 自己是誰的那些。
+///
+/// 不變量是「**每一條**會寫匿名 session 的路徑都要先走這裡」，漏一條就是
+/// 兩週：tower-sessions 的 expiry 掛在每個請求新建的 `Session` 物件上
+/// （`SessionManagerLayer` 沒 `with_expiry`，每個請求都從 `None` ＝兩週起跑），
+/// 不存在 store 的 `Record` 裡；`save` 時才用它算出 `expiry_date` 寫進去。
+/// 所以要在**第一次**改動 session 之前呼叫 —— 改了之後任何 `return Err`
+/// （回 400，middleware 照樣存）都會把這份 session 以當下的 expiry 存回去。
+/// 匿名者純讀不會 save、不會滑動延長，實際語意是「這次寫入起 15 分鐘」，
+/// 接近 `Expiry::AtDateTime`。
 async fn mark_anonymous(session: &Session) {
     if current_user(session).await.is_none() {
         session.set_expiry(Some(Expiry::OnInactivity(
@@ -343,8 +352,13 @@ async fn mark_anonymous(session: &Session) {
     }
 }
 
-/// 登入成功之後呼叫：解除 `mark_anonymous` 的短壽命，回到 tower-sessions
-/// 的預設（兩週）。CONTROL.md 沒有另外規定登入壽命，容器重啟本來就會
+/// 登入成功之後呼叫，表達意圖：這份 session 從現在起是兩週的。
+///
+/// 在生產它其實是 no-op —— expiry 掛在請求自己的 `Session` 物件上（見
+/// `mark_anonymous`），登入那個請求沒走 `mark_anonymous`，本來就是 `None`
+/// ＝兩週；「登入回到兩週」靠的是這件事，不是這個呼叫。留著是因為測試
+/// 會重用同一個 `Session` 物件跨好幾個 handler，沒有它前一段的 15 分鐘
+/// 會黏到登入之後。CONTROL.md 沒有另外規定登入壽命，容器重啟本來就會
 /// 讓所有人重新登入。
 fn mark_authenticated(session: &Session) {
     session.set_expiry(None);
@@ -622,6 +636,10 @@ async fn register_start(
     let ip = client_ip(&headers);
     clear_auth_flows(&session).await?;
     let logged_in = current_user(&session).await;
+    // 上一行已經改動了 session，從這裡起任何 `return Err` 都會把它存回去；
+    // 縮壽命要在那之前，不然帶著信箱證明的匿名 session 會以兩週存回。
+    // 已登入的人 helper 自己會放過。
+    mark_anonymous(&session).await;
     let email = req.email.as_deref().map(|e| e.trim().to_lowercase());
     let nickname = req.nickname.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     check_label_len(nickname.as_deref())?;
@@ -661,8 +679,6 @@ async fn register_start(
         // 流量搶同一份額度 —— 上面讀的 session 不碰 DB，這裡仍在任何
         // DB 存取之前。
         throttle_public(&st, ip.as_deref())?;
-        // 這條分支結尾寫進 session 的註冊狀態是匿名的，壽命跟著縮短。
-        mark_anonymous(&session).await;
         let email = email.context("需要 Email 位址")?;
         if !valid_email(&email) {
             return Err(AppError(anyhow::anyhow!("請輸入完整的 Email 位址")));
@@ -4504,7 +4520,15 @@ mod tests {
     /// `BoundedMemoryStore`，不是 tower-sessions 附的 `MemoryStore` ——
     /// handler 測試順便走過真正會上線的 store。
     fn test_session() -> Session {
-        Session::new(None, Arc::new(BoundedMemoryStore::new(SESSION_STORE_MAX)), None)
+        test_session_with_store().0
+    }
+
+    /// 同上，但把 store 也交出來 —— 要看 `save` 之後**store 裡那筆紀錄**
+    /// 的 `expiry_date` 時用這個；`Session::expiry_date()` 只是物件上的
+    /// 設定，跟真的存進去的可以不一樣。
+    fn test_session_with_store() -> (Session, BoundedMemoryStore) {
+        let store = BoundedMemoryStore::new(SESSION_STORE_MAX);
+        (Session::new(None, Arc::new(store.clone()), None), store)
     }
 
     /// 這把新 Passkey 要寫給誰，必須跟「誰在這個 session 上」一致。
@@ -4893,28 +4917,39 @@ mod tests {
 
     /// 匿名起手留下的 session 只活 15 分鐘；登入成功就回到預設的兩週。
     /// 報告 #1 的另一半：限流只是讓灌得慢，短壽命才讓灌進來的東西自己消失。
+    ///
+    /// 看的是 `save` 之後 store 裡那筆 `Record` 的 `expiry_date`，不是
+    /// `Session::expiry_date()` —— 前者才是 `BoundedMemoryStore` 掃過期、
+    /// 踢人時看的東西。
     #[tokio::test]
     async fn anonymous_starts_get_a_short_session_and_login_restores_the_default() {
         use tower_sessions::cookie::time::{Duration, OffsetDateTime};
+        use tower_sessions::session_store::SessionStore;
+
+        /// 存進 store，再從 store 讀回這筆紀錄離到期還有多久。
+        async fn stored_ttl(store: &BoundedMemoryStore, session: &Session) -> Duration {
+            session.save().await.unwrap();
+            let id = session.id().expect("save 之後一定有 id");
+            let rec = store.load(&id).await.unwrap().expect("store 裡要有這筆");
+            rec.expiry_date - OffsetDateTime::now_utc()
+        }
+        let about = |left: Duration, minutes: i64| (left - Duration::minutes(minutes)).abs() < Duration::minutes(1);
+        let long_lived = |left: Duration| left > Duration::days(1);
 
         let st = test_state();
         db::create_user_with_platforms(&st.db, "u1", "a@x.tw", "a@x.tw", "member", Some("a@x.tw"), &[]).unwrap();
-        let about = |session: &Session, minutes: i64| {
-            let left = session.expiry_date() - OffsetDateTime::now_utc();
-            (left - Duration::minutes(minutes)).abs() < Duration::minutes(1)
-        };
-        let long_lived = |session: &Session| session.expiry_date() - OffsetDateTime::now_utc() > Duration::days(1);
 
         // 全新的 session 預設是兩週
-        let session = test_session();
-        assert!(long_lived(&session));
+        let (session, store) = test_session_with_store();
+        assert!(long_lived(stored_ttl(&store, &session).await));
 
         // Passkey 登入起手 → 15 分鐘
         let _ = login_any_start(State(st.clone()), session.clone(), hdrs(&[])).await.map_err(|e| e.0).unwrap();
-        assert!(about(&session, ANON_SESSION_MINUTES), "剩 {}", session.expiry_date() - OffsetDateTime::now_utc());
+        let left = stored_ttl(&store, &session).await;
+        assert!(about(left, ANON_SESSION_MINUTES), "剩 {left}");
 
         // 加入流程的信箱證明也一樣
-        let joiner = test_session();
+        let (joiner, joiner_store) = test_session_with_store();
         db::invite_email(&st.db, "mei@x.tw", "member", &[]).unwrap();
         let hash = otp::hash(&st.db, "mei@x.tw", "482913").unwrap();
         db::put_otp(&st.db, "mei@x.tw", db::OTP_JOIN, &hash, otp::TTL_SECS).unwrap();
@@ -4927,7 +4962,29 @@ mod tests {
         .await
         .map_err(|e| e.0)
         .unwrap();
-        assert!(about(&joiner, ANON_SESSION_MINUTES));
+        let left = stored_ttl(&joiner_store, &joiner).await;
+        assert!(about(left, ANON_SESSION_MINUTES), "剩 {left}");
+
+        // 未登入的註冊起手在**最早**的檢查（名稱太長）就失敗，存回去的也要是
+        // 15 分鐘：`clear_auth_flows` 已經改動了 session，middleware 會照樣存，
+        // 縮壽命若排在這道檢查之後，這份匿名 session 就以兩週存回。
+        let (stranger, stranger_store) = test_session_with_store();
+        let err = register_start(
+            State(st.clone()),
+            stranger.clone(),
+            hdrs(&[]),
+            Json(RegisterStart {
+                email: Some("nobody@x.tw".into()),
+                bootstrap_token: None,
+                nickname: Some("x".repeat(MAX_LABEL_LEN + 1)),
+            }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap_err();
+        assert!(err.to_string().contains("最多"), "{err}");
+        let left = stored_ttl(&stranger_store, &stranger).await;
+        assert!(about(left, ANON_SESSION_MINUTES), "失敗的註冊起手存回去剩 {left}");
 
         // 驗證碼登入成功 → 回到預設
         let hash = otp::hash(&st.db, "a@x.tw", "482913").unwrap();
@@ -4941,11 +4998,11 @@ mod tests {
         .await
         .map_err(|e| e.0)
         .unwrap();
-        assert!(long_lived(&session), "登入後不該還是 15 分鐘");
+        assert!(long_lived(stored_ttl(&store, &session).await), "登入後不該還是 15 分鐘");
 
         // 登入著再去打登入起手，不能把自己的 session 縮回 15 分鐘
         let _ = login_any_start(State(st.clone()), session.clone(), hdrs(&[])).await.map_err(|e| e.0).unwrap();
-        assert!(long_lived(&session));
+        assert!(long_lived(stored_ttl(&store, &session).await));
     }
 
     /// 報告 #1 的情境：拿掉限流、用 500 個全新的瀏覽器打登入起手，

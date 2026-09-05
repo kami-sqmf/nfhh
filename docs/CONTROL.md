@@ -35,7 +35,9 @@
 
 來源 IP 只從 `CF-Connecting-IP` 取，刻意不讀 `X-Forwarded-For`。該值決定要把哪個 IP 寫進防火牆，兩件事合起來才讓它可信 —— 理由見 [DECISIONS.md](DECISIONS.md)。
 
-工作階段存在記憶體（`MemoryStore`），**容器重啟後所有人需要重新登入**。Cookie 為 `__Host-nfhh_session`，帶 `Secure` 與 `HttpOnly`。
+工作階段存在記憶體（自己寫的 `BoundedMemoryStore`，`session_store.rs`），**容器重啟後所有人需要重新登入**。Cookie 為 `__Host-nfhh_session`，帶 `Secure` 與 `HttpOnly`。
+
+store 有硬上限 10 000 筆：滿了先清所有已過期的，還是滿就踢 `expiry_date` 最早的那筆；`load` 碰到過期紀錄當場刪掉（tower-sessions 附的 `MemoryStore` 只過濾不刪），另外掛在 5 分鐘的背景 tick 上掃一次沒人再碰的過期紀錄。壽命分兩種：匿名的登入／加入起手（WebAuthn 挑戰、信箱證明）寫進 session 時只給 **15 分鐘** —— 要撐過流程裡最長的一段，也就是 `register_start` 認信箱證明的時窗（`otp::VERIFIED_WINDOW_SECS`＝900 秒）；登入成功之後是 tower-sessions 的預設**兩週**。在限流之下（見 §8）被踢的只可能是 15 分鐘的匿名紀錄，家人兩週的登入 session 永遠排在後面。
 
 `__Host-` 前綴是瀏覽器端的規則：只接受 `Secure`、`Path=/`、不帶 `Domain` 的設定，所以**同一個父網域底下的其他服務寫不進這個名字的 cookie**。面板跟 music、Wolfram、Frigate 共用一個父網域，少了這道前綴，任何一個 sibling 被攻下就能替訪客預先種好一個 session id（session fixation）。另一半的防護在後端：每一次認證升級（通過加入驗證碼、兌換邀請連結、登入完成、建立新帳號）寫入身分之前都先 `session.cycle_id()`，匿名階段的 session id 不會延用到登入之後 —— 就算有人事先種了 id，換掉之後他手上的只是一串失效的字。
 

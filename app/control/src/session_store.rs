@@ -14,10 +14,11 @@
 //! 沒有用 `#[async_trait]`：async-trait 不是這個 crate 的直接相依，
 //! tower-sessions 也沒有重新匯出它。四個方法都不需要在鎖裡等任何東西，
 //! 所以直接同步做完、回一個已完成的 future，跟巨集展開出來的簽名一致。
+//! 升級 tower-sessions 若 trait 簽名變動，這裡會在編譯期對不上，不會默默漂掉。
 //!
 //! 鎖用 `std::sync::Mutex` 而不是 tokio 的：臨界區只有幾次 HashMap 操作、
 //! 從不跨 `await`，用非同步鎖只會多一次排程。中毒（持鎖時 panic）就直接
-//! 接手內容 —— 每個操作都是單一步驟，不會留下半套狀態。
+//! 接手內容 —— HashMap 操作不會 unwind，接手的內容一定完整。
 
 use std::collections::HashMap;
 use std::future::{Future, ready};
@@ -29,7 +30,8 @@ use tower_sessions::session::{Id, Record};
 use tower_sessions::session_store::{self, SessionStore};
 
 /// 踢人的警告最多多久印一次。被灌的時候每一筆新紀錄都會踢掉一筆，
-/// 逐筆印只會把日誌淹掉；累計數量、一分鐘報一次就夠看出在發生什麼。
+/// 逐筆印只會把日誌淹掉；累計數量、最多一分鐘報一次就夠看出在發生什麼
+/// （累計到下一次踢人才印，所以印出來的是「自上次警告起」的總數）。
 const EVICT_WARN_EVERY: Duration = Duration::minutes(1);
 
 #[derive(Debug, Default)]
@@ -105,7 +107,7 @@ impl BoundedMemoryStore {
         let due = g.last_warn.is_none_or(|t| now - t >= EVICT_WARN_EVERY);
         if due {
             tracing::warn!(
-                "session store 已達上限 {}，這一分鐘踢掉 {} 筆最早到期的紀錄 —— 有人在灌匿名登入起手？",
+                "session store 已達上限 {}，自上次警告起踢掉 {} 筆最早到期的紀錄 —— 有人在灌匿名登入起手？",
                 self.max,
                 g.evicted_since_warn
             );
