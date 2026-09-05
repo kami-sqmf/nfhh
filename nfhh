@@ -48,9 +48,18 @@ ensure_generated() {
 # 若 nftables 的 inet nfhh 表還不在，這幾個埠會在沒有來源 IP 閘門的狀態下對外開放。
 # 這裡只判斷表存不存在：用 -t 只列結構、不印白名單 IP。
 # 回傳 0 = 表存在、1 = 表不存在、2 = 拿不到 sudo（無法判斷，要跟「沒表」分開處理）。
+#
+# 這台的 sudo 要密碼：up / restart 是人在終端機前敲的，讓 sudo 照常問密碼即可，
+# 只有沒有終端機（cron、systemd、CI）時才回 2 —— 不然密碼 sudo 的主機永遠起不來。
+# $1 = noprompt 時絕不問密碼（status 是唯讀的一頁，不該為了一列資訊卡住等密碼）。
 nft_table_state() {
-    sudo -n true 2>/dev/null || return 2
-    sudo -n nft -t list table inet nfhh >/dev/null 2>&1 || return 1
+    if sudo -n true 2>/dev/null; then
+        sudo -n nft -t list table inet nfhh >/dev/null 2>&1 || return 1
+    elif [[ "${1:-}" != noprompt && -t 0 ]]; then
+        sudo nft -t list table inet nfhh >/dev/null || return 1
+    else
+        return 2
+    fi
 }
 
 # up / restart 之前先確認防火牆表存在，不存在就中止並印出修復指令。
@@ -155,9 +164,9 @@ status() {
     else
         row "docker drop-in" "⛔ 未安裝（防火牆失敗時 Docker 仍會起來；見 docs/SETUP.md 第 4 步）"
     fi
-    # 與 require_firewall 同一個檢查，但 status 只顯示、不中止
+    # 與 require_firewall 同一個檢查，但 status 只顯示、不中止、不問密碼
     local rc=0
-    nft_table_state || rc=$?
+    nft_table_state noprompt || rc=$?
     case $rc in
         0) row "nft 表 inet nfhh" "✅ 存在" ;;
         2) row "nft 表 inet nfhh" "（需要 sudo 才能確認：sudo nft list table inet nfhh）" ;;
