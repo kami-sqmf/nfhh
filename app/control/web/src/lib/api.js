@@ -190,11 +190,6 @@ export async function loginDiscoverable({ conditional = false, signal } = {}) {
   })
 }
 
-/** 這個瀏覽器支援把 passkey 掛進自動填入嗎。 */
-export const supportsConditionalUi = () =>
-  typeof PublicKeyCredential !== 'undefined' &&
-  PublicKeyCredential.isConditionalMediationAvailable?.().catch(() => false)
-
 /**
  * 猜一個裝置名當預設值。使用者可以改，但多數人不會 —— 而「iPhone」比
  * 一片空白好認太多，尤其是三個月後回來看「哪一把是我弄丟的那台」。

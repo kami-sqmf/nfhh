@@ -258,19 +258,31 @@ async fn require_user(st: &Shared, session: &Session) -> ApiResult<(String, Stri
     Ok((id, name))
 }
 
-/// 每次從 DB 重讀角色，讓降權即時生效。
+/// 這個 session 現在有沒有 admin 特權：角色是 admin **而且**是用 Passkey 登入的。
 ///
-/// 角色之外還看**登入方式**：驗證碼登入的 session 是弱認證（拿到信箱就
-/// 拿到它），member 功能放行、admin 功能不放 —— 否則家人信箱一失守，
-/// 整個面板的設定、成員、邀請都跟著失守。
+/// 驗證碼登入的 session 是弱認證（拿到信箱就拿到它，見 otp.rs）。弱認證的
+/// admin 在**任何地方**都只是 member —— 不只 `require_admin` 守的那些端點，
+/// member 端點裡順手給 admin 的特權（改別人的 IP、讀所有人的信）也一樣。
+/// 否則家人信箱一失守，只要那位家人碰巧是 admin，整個面板就跟著失守。
+/// 所有拿角色來授權的地方都走這一個函式，不直接看 `is_admin()`；
+/// 讀不到 session 的登入方式時當成不是 Passkey（fail-closed）。
+async fn admin_powers(session: &Session, me: &db::User) -> bool {
+    if !me.is_admin() {
+        return false;
+    }
+    let via: Option<String> = session.get(S_AUTH_VIA).await.ok().flatten();
+    via.as_deref() == Some(AUTH_VIA_PASSKEY)
+}
+
+/// 每次從 DB 重讀角色，讓降權即時生效；授權本身交給 [`admin_powers`]。
+/// 兩句不同的錯誤訊息只是讓 admin 知道該換 Passkey 登入，而不是誤以為自己被降權。
 async fn require_admin(st: &Shared, session: &Session) -> ApiResult<db::User> {
     let (uid, _) = require_user(st, session).await?;
     let user = db::get_user(&st.db, &uid)?.context("帳號已不存在")?;
     if !user.is_admin() {
         return Err(AppError(anyhow::anyhow!("需要管理員權限")));
     }
-    let via: Option<String> = session.get(S_AUTH_VIA).await?;
-    if via.as_deref() != Some(AUTH_VIA_PASSKEY) {
+    if !admin_powers(session, &user).await {
         return Err(AppError(anyhow::anyhow!("管理功能需要用 Passkey 登入")));
     }
     Ok(user)
@@ -348,8 +360,66 @@ struct InviteOpened {
 
 #[derive(Debug, Serialize)]
 struct JoinRes {
-    /// 冷卻中剩餘秒數。1o 的「重新寄送（0:42）」倒數用這個值。
+    /// 重寄冷卻秒數。1o 的「重新寄送（0:42）」倒數用這個值。
+    /// 一律是常數 `RESEND_COOLDOWN_SECS`，不是剩餘秒數（理由見 `send_otp`）。
     cooldown: i64,
+}
+
+/// 沒設寄信金鑰時兩支寄碼端點都不能用。這一關要排在「這個位址該不該寄」
+/// **之前**：擺在後面的話，寄信服務關著時會變成「該寄的報錯、不該寄的回 Ok」，
+/// 又把位址有沒有登記洩漏出去。
+fn require_mailer(st: &Shared) -> ApiResult<()> {
+    if !st.mailer.enabled() {
+        return Err(AppError(anyhow::anyhow!("尚未設定寄信服務，請聯絡管理員")));
+    }
+    Ok(())
+}
+
+/// 兩支寄碼端點（`join_start`、`login_otp_start`）在決定「這個位址該寄」之後
+/// 共同的尾段：冷卻、產碼、寫 DB、背景寄信、稽核。
+///
+/// 冷卻中回的是**常數** `RESEND_COOLDOWN_SECS`，不是剩餘秒數：剩餘秒數會隨
+/// 「上一次是幾秒前寄的」變動，等於告訴外人這個信箱剛剛有沒有真的被寄過碼
+/// —— 也就是有沒有被邀請、有沒有帳號。前端在倒數歸零前不會叫重寄，根本
+/// 用不到剩餘值。
+///
+/// 寄信丟到背景：`send_code` 要連外、要等 Resend 回，會寄的位址跟不會寄的
+/// 位址回應時間差好幾百毫秒，量得出來就等於明講。所以寫完 DB 就立刻回覆；
+/// 寄失敗寫稽核（`failed_action`）與 log，使用者等不到信會按重寄。
+/// `sent_action` 在交給背景之前就寫 —— 它記的是「這個位址被發了一組碼」。
+async fn send_otp(
+    st: &Shared,
+    ip: Option<&str>,
+    email: &str,
+    purpose: &str,
+    sent_action: &str,
+    failed_action: &str,
+) -> ApiResult<Json<JoinRes>> {
+    let as_if_sent = JoinRes { cooldown: otp::RESEND_COOLDOWN_SECS };
+    // 冷卻擋的是「拿這支端點當寄信機去洗別人的信箱」。不報錯，因為前端
+    // 本來就會把按鈕鎖到倒數結束。
+    if db::otp_cooldown(&st.db, email, otp::RESEND_COOLDOWN_SECS)? > 0 {
+        return Ok(Json(as_if_sent));
+    }
+
+    let code = otp::generate();
+    // 先寫 DB 再寄信：反過來的話，寄成功但寫失敗會讓使用者拿著一組
+    // 系統不認得的碼，而且冷卻也沒生效，可以無限重按。
+    db::put_otp(&st.db, email, purpose, &otp::hash(&st.db, email, &code)?, otp::TTL_SECS)?;
+    db::audit(&st.db, None, sent_action, Some(email), ip);
+
+    let st = Arc::clone(st);
+    let email = email.to_string();
+    let ip = ip.map(str::to_string);
+    let failed_action = failed_action.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = st.mailer.send_code(&email, &code, otp::TTL_SECS / 60).await {
+            // 位址只進稽核（admin 看得到），不進容器日誌。
+            tracing::warn!("驗證碼寄送失敗（{failed_action}）: {e:#}");
+            db::audit(&st.db, None, &failed_action, Some(&email), ip.as_deref());
+        }
+    });
+    Ok(Json(as_if_sent))
 }
 
 /// 寄出一組加入用的驗證碼。
@@ -362,8 +432,8 @@ struct JoinRes {
 /// 「任何人都能列舉家人的信箱有沒有登記、有沒有帳號」—— 不值。
 /// 打錯字的人收不到信、只能回頭檢查拼字 —— 這是不讓外人列舉的代價。
 ///
-/// 仍會報錯的只有：信箱格式、限流、寄信服務未設定、寄信失敗。
-/// 這四種都跟「這個位址是誰的」無關。
+/// 仍會報錯的只有：信箱格式、限流、寄信服務未設定。這三種都跟「這個位址
+/// 是誰的」無關。寄信本身在背景做（見 `send_otp`），成敗不進回應。
 async fn join_start(
     State(st): State<Shared>,
     headers: HeaderMap,
@@ -375,10 +445,8 @@ async fn join_start(
         return Err(AppError(anyhow::anyhow!("請輸入完整的 Email 位址")));
     }
     throttle_public(&st, ip.as_deref())?;
-    if !st.mailer.enabled() {
-        return Err(AppError(anyhow::anyhow!("尚未設定寄信服務，請聯絡管理員")));
-    }
-    // 不寄的三種情況回的都是這個值 —— 跟剛寄出去時回的一樣。
+    require_mailer(&st)?;
+    // 不寄的兩種情況回的都是這個值 —— 跟 `send_otp` 寄出去（或冷卻中）時回的一樣。
     let as_if_sent = JoinRes { cooldown: otp::RESEND_COOLDOWN_SECS };
     if db::find_user_by_email(&st.db, &email)?.is_some() {
         db::audit(&st.db, None, "join_has_account", Some(&email), ip.as_deref());
@@ -388,22 +456,7 @@ async fn join_start(
         db::audit(&st.db, None, "join_not_invited", Some(&email), ip.as_deref());
         return Ok(Json(as_if_sent));
     }
-
-    // 冷卻擋的是「拿這支端點當寄信機去洗別人的信箱」。回剩餘秒數，
-    // 畫面的倒數才對得上；不報錯，因為前端本來就會把按鈕鎖到倒數結束。
-    let cooldown = db::otp_cooldown(&st.db, &email, otp::RESEND_COOLDOWN_SECS)?;
-    if cooldown > 0 {
-        return Ok(Json(JoinRes { cooldown }));
-    }
-
-    let code = otp::generate();
-    // 先寫 DB 再寄信：反過來的話，寄成功但寫失敗會讓使用者拿著一組
-    // 系統不認得的碼，而且冷卻也沒生效，可以無限重按。
-    db::put_otp(&st.db, &email, db::OTP_JOIN, &otp::hash(&st.db, &email, &code)?, otp::TTL_SECS)?;
-    st.mailer.send_code(&email, &code, otp::TTL_SECS / 60).await?;
-
-    db::audit(&st.db, None, "join_code_sent", Some(&email), ip.as_deref());
-    Ok(Json(as_if_sent))
+    send_otp(&st, ip.as_deref(), &email, db::OTP_JOIN, "join_code_sent", "join_code_send_failed").await
 }
 
 /// 核對驗證碼。通過後才允許進入 Passkey 註冊。
@@ -538,6 +591,14 @@ async fn register_start(
     //   3. 登記過的信箱 + 剛通過 OTP → 家人建立自己的帳號（member）
     let pending = if let Some((uid, _)) = &logged_in {
         let u = db::get_user(&st.db, uid)?.context("帳號已不存在")?;
+        // 驗證碼登入的 admin 不能在這裡加 Passkey：否則「驗證碼登入 → 加
+        // Passkey → 登出 → 用那把 Passkey 登入」四步就把 `require_admin` 的
+        // Passkey 要求整個繞掉。member 不擋 —— 拿得到信箱的人本來就等於那位 member。
+        if u.is_admin() && !admin_powers(&session, &u).await {
+            return Err(AppError(anyhow::anyhow!(
+                "管理員帳號要先用 Passkey 登入才能新增 Passkey"
+            )));
+        }
         PendingReg {
             user_id: u.id,
             username: u.username,
@@ -648,6 +709,18 @@ async fn register_finish(
 
     let logged_in = current_user(&session).await;
     check_registration_owner(logged_in.as_ref().map(|(id, _)| id.as_str()), &p)?;
+
+    // `register_start` 擋過一次，這裡再擋一次：finish 才是真正寫進憑證的那一步，
+    // 閘門要守在寫入之前；而且 start 到 finish 之間角色可能變了（途中被升成
+    // admin），所以看的是 DB 現在的角色，不是 `p.role` 那份快照。
+    if !p.is_new {
+        let u = db::get_user(&st.db, &p.user_id)?.context("帳號已不存在")?;
+        if u.is_admin() && !admin_powers(&session, &u).await {
+            return Err(AppError(anyhow::anyhow!(
+                "管理員帳號要先用 Passkey 登入才能新增 Passkey"
+            )));
+        }
+    }
 
     // 先驗 WebAuthn，通過了才消耗憑據
     let passkey = st.webauthn.finish_passkey_registration(&cred, &reg_state)?;
@@ -818,28 +891,13 @@ async fn login_otp_start(
         return Err(AppError(anyhow::anyhow!("請輸入完整的 Email 位址")));
     }
     throttle_public(&st, ip.as_deref())?;
-    if !st.mailer.enabled() {
-        return Err(AppError(anyhow::anyhow!("尚未設定寄信服務，請聯絡管理員")));
-    }
-    let as_if_sent = JoinRes { cooldown: otp::RESEND_COOLDOWN_SECS };
+    require_mailer(&st)?;
     if db::find_user_by_email(&st.db, &email)?.is_none() {
         db::audit(&st.db, None, "login_otp_no_account", Some(&email), ip.as_deref());
-        return Ok(Json(as_if_sent));
+        return Ok(Json(JoinRes { cooldown: otp::RESEND_COOLDOWN_SECS }));
     }
-
-    let cooldown = db::otp_cooldown(&st.db, &email, otp::RESEND_COOLDOWN_SECS)?;
-    if cooldown > 0 {
-        return Ok(Json(JoinRes { cooldown }));
-    }
-
-    let code = otp::generate();
-    // 先寫 DB 再寄信（理由同 `join_start`）。用途標 login：這組碼不能拿去
-    // 過 `register_start` 的信箱證明。
-    db::put_otp(&st.db, &email, db::OTP_LOGIN, &otp::hash(&st.db, &email, &code)?, otp::TTL_SECS)?;
-    st.mailer.send_code(&email, &code, otp::TTL_SECS / 60).await?;
-
-    db::audit(&st.db, None, "login_otp_sent", Some(&email), ip.as_deref());
-    Ok(Json(as_if_sent))
+    // 用途標 login：這組碼不能拿去過 `register_start` 的信箱證明。
+    send_otp(&st, ip.as_deref(), &email, db::OTP_LOGIN, "login_otp_sent", "login_otp_send_failed").await
 }
 
 /// 核對登入用的驗證碼，通過就登入。
@@ -935,7 +993,13 @@ struct Status {
     needs_bootstrap: bool,
     /// 只有一把 passkey 時前端提示註冊備援
     passkey_count: i64,
+    /// 這個 session 現在有沒有 admin 特權（角色 admin **且** Passkey 登入，
+    /// 見 `admin_powers`）。前端拿它決定管理分頁顯不顯示。
     is_admin: bool,
+    /// 帳號的角色本身（"admin"／"member"），未登入時 None。跟 `is_admin` 分開：
+    /// 驗證碼登入的 admin 是 role="admin"、is_admin=false，前端據此說明
+    /// 「你是管理員，但這次是用驗證碼登入」，而不是讓管理分頁無聲消失。
+    role: Option<String>,
     /// `"passkey"` 或 `"otp"`；未登入時 None。驗證碼登入的 session 進不了
     /// admin 功能，前端用它提示「請改用 Passkey 登入」。
     auth_via: Option<String>,
@@ -995,13 +1059,21 @@ async fn status(
     let my_ip_allowed = my_ip.as_ref().is_some_and(|ip| all.iter().any(|e| &e.ip == ip));
 
     // 只有登入後才揭露白名單內容
-    let (passkey_count, is_admin, my_platforms) = match &user {
-        Some((uid, _)) => (
-            db::credential_count(&st.db, uid).unwrap_or(0),
-            db::get_user(&st.db, uid)?.map(|u| u.is_admin()).unwrap_or(false),
-            db::platforms_for(&st.db, uid).unwrap_or_default(),
-        ),
-        None => (0, false, vec![]),
+    let (passkey_count, is_admin, role, my_platforms) = match &user {
+        Some((uid, _)) => {
+            let me = db::get_user(&st.db, uid)?;
+            let is_admin = match &me {
+                Some(u) => admin_powers(&session, u).await,
+                None => false,
+            };
+            (
+                db::credential_count(&st.db, uid).unwrap_or(0),
+                is_admin,
+                me.map(|u| u.role),
+                db::platforms_for(&st.db, uid).unwrap_or_default(),
+            )
+        }
+        None => (0, false, None, vec![]),
     };
 
     let now = db::now();
@@ -1042,6 +1114,7 @@ async fn status(
         needs_bootstrap: db::user_count(&st.db).unwrap_or(0) == 0,
         passkey_count,
         is_admin,
+        role,
         auth_via,
         dot_host: st.cfg.dot_host.clone(),
         dot_ready: dot_ready(&st.cfg.dot_conf),
@@ -1223,6 +1296,8 @@ async fn allow_add(
 
     let ttl_days = req.ttl_days.unwrap_or(st.cfg.default_ttl_days).clamp(1, 30);
     let expires_at = db::now() + ttl_days * 86400;
+    // 改別人的條目是 admin 特權，跟其他特權一樣只給強認證的 admin。
+    let admin = admin_powers(&session, &me).await;
     if !db::upsert_allow_owned(
         &st.db,
         &ip_str,
@@ -1230,7 +1305,7 @@ async fn allow_add(
         &username,
         expires_at,
         ttl_days,
-        me.is_admin(),
+        admin,
     )? {
         return Err(AppError(anyhow::anyhow!(
             "{ip_str} 不是你新增的，只有新增者或管理員能修改"
@@ -1257,8 +1332,8 @@ async fn allow_remove(
     let (uid, username) = require_user(&st, &session).await?;
     let me = db::get_user(&st.db, &uid)?.context("帳號已不存在")?;
 
-    // 一般成員只能移除自己加的
-    if !me.is_admin() {
+    // 一般成員只能移除自己加的（弱認證的 admin 也算一般成員，見 `admin_powers`）
+    if !admin_powers(&session, &me).await {
         let owner = db::list_allow(&st.db)?
             .into_iter()
             .find(|e| e.ip == ip)
@@ -1302,7 +1377,7 @@ async fn allow_rename(
         .find(|e| e.ip == ip)
         .context("查無此白名單條目")?
         .added_by;
-    if !me.is_admin() && owner.as_deref() != Some(username.as_str()) {
+    if !admin_powers(&session, &me).await && owner.as_deref() != Some(username.as_str()) {
         return Err(AppError(anyhow::anyhow!("只能重新命名自己新增的項目")));
     }
 
@@ -1827,7 +1902,7 @@ async fn mail_get(
     let (uid, _) = require_user(&st, &session).await?;
     let me = db::get_user(&st.db, &uid)?.context("帳號已不存在")?;
     let mut m = db::get_mail(&st.db, id)?.context("查無此信件")?;
-    if !me.is_admin() && !MailScope::load(&st, &uid)?.allows_mail(&m) {
+    if !admin_powers(&session, &me).await && !MailScope::load(&st, &uid)?.allows_mail(&m) {
         // 不分辨「不存在」與「不是你的」：不給枚舉 id 的人存在性 oracle
         return Err(AppError(anyhow::anyhow!("查無此信件")));
     }
@@ -1845,7 +1920,7 @@ async fn mail_delete(
 ) -> ApiResult<Json<serde_json::Value>> {
     let (uid, _) = require_user(&st, &session).await?;
     let me = db::get_user(&st.db, &uid)?.context("帳號已不存在")?;
-    let n = if me.is_admin() {
+    let n = if admin_powers(&session, &me).await {
         db::delete_mail_if(&st.db, id, |_| true)?
     } else {
         let scope = MailScope::load(&st, &uid)?;
@@ -4395,13 +4470,14 @@ mod tests {
         assert_eq!(audit_count(&st.db, "login_otp_no_account"), 1, "admin 要看得到有人在試");
 
         // 有帳號、剛寄過（冷卻中）：同樣是 Ok 而不是錯誤，也不重寄。
+        // 回的是常數而不是剩餘秒數 —— 剩餘秒數會透露這個信箱剛剛真的被寄過碼。
         // （真的寄出那一步要連外，這條測試停在冷卻前面。）
         db::put_otp(&st.db, "a@x.tw", db::OTP_LOGIN, "sent-a-moment-ago", otp::TTL_SECS).unwrap();
         let res = login_otp_start(State(st.clone()), hdrs(&[]), Json(EmailReq { email: "a@x.tw".into() }))
             .await
             .map_err(|e| e.0)
-            .expect("冷卻中要回 Ok 帶剩餘秒數，不是錯誤");
-        assert!(res.0.cooldown > 0 && res.0.cooldown <= otp::RESEND_COOLDOWN_SECS);
+            .expect("冷卻中要回 Ok，不是錯誤");
+        assert_eq!(res.0.cooldown, otp::RESEND_COOLDOWN_SECS, "冷卻中回的要跟沒帳號時一模一樣");
         let (hash, purpose): (String, String) = st
             .db
             .lock()
@@ -4437,10 +4513,40 @@ mod tests {
             .await
             .map_err(|e| e.0)
             .expect("登入碼要能登入");
-        assert!(
-            !db::otp_recently_verified(&st.db, "a@x.tw", db::OTP_JOIN, otp::VERIFIED_WINDOW_SECS).unwrap(),
-            "登入碼通過不等於信箱證明，`register_start` 那關不能因此打開"
-        );
+
+        // 反向：一組「已通過」的登入碼開不了 `register_start` 那道門。
+        // 走真的 handler，不是只查 DB —— 登入碼通過後那一列已被 verify 清掉，
+        // 光查 `otp_recently_verified` 只是空證明。這裡直接擺出最壞情況：
+        // 列還在、verified_at 已寫上、session 上也有這個信箱的證明，只差用途不對。
+        db::invite_email(&st.db, "mei@x.tw", "admin", &[]).unwrap();
+        let mei_hash = otp::hash(&st.db, "mei@x.tw", "482913").unwrap();
+        db::put_otp(&st.db, "mei@x.tw", db::OTP_LOGIN, &mei_hash, otp::TTL_SECS).unwrap();
+        assert!(matches!(
+            db::check_otp(&st.db, "mei@x.tw", db::OTP_LOGIN, &mei_hash, otp::MAX_ATTEMPTS).unwrap(),
+            db::OtpCheck::Ok
+        ));
+        let session = test_session();
+        session.insert(S_EMAIL_PROOF, &"mei@x.tw".to_string()).await.unwrap();
+        let register = |session: Session| {
+            let st = st.clone();
+            async move {
+                register_start(
+                    State(st),
+                    session,
+                    hdrs(&[]),
+                    Json(RegisterStart { email: Some("mei@x.tw".into()), bootstrap_token: None, nickname: None }),
+                )
+                .await
+                .map_err(|e| e.0)
+            }
+        };
+        let err = register(session.clone()).await.expect_err("登入碼通過不等於信箱證明");
+        assert!(err.to_string().contains("完成信箱驗證"), "拿到的是：{err}");
+
+        // 同一個 session、同一個位址，換成**加入**用途的證明就開得了 ——
+        // 證明剛才擋下的是用途，不是別的關卡。
+        db::mark_email_verified(&st.db, "mei@x.tw", db::OTP_JOIN).unwrap();
+        let _ = register(session).await.expect("加入用途的證明才開得了門");
     }
 
     /// 驗證碼登入成功：身分寫對、標成弱認證、session id 換過、碼被清掉。
@@ -4508,6 +4614,105 @@ mod tests {
             .await
             .map_err(|e| e.0)
             .expect("Passkey 登入的 admin 要進得去");
+    }
+
+    /// 驗證碼登入的 admin 不能新增 Passkey：否則「驗證碼登入 → 加 Passkey →
+    /// 登出 → 用那把 Passkey 登入」四步就把 `require_admin` 的 Passkey 要求繞掉。
+    /// member 照常 —— 拿得到信箱的人本來就等於那位 member。
+    #[tokio::test]
+    async fn an_otp_admin_cannot_add_a_passkey() {
+        let st = test_state();
+        db::create_user_with_platforms(&st.db, "a", "a@x", "a@x", "admin", Some("a@x"), &[]).unwrap();
+        db::create_user_with_platforms(&st.db, "m", "m@x", "m@x", "member", Some("m@x"), &[]).unwrap();
+
+        let start = |uid: &str, via: &'static str| {
+            let st = st.clone();
+            let uid = uid.to_string();
+            async move {
+                let session = test_session();
+                session.insert(S_USER, &uid).await.unwrap();
+                session.insert(S_NAME, &format!("{uid}@x")).await.unwrap();
+                session.insert(S_AUTH_VIA, via).await.unwrap();
+                register_start(
+                    State(st),
+                    session,
+                    hdrs(&[]),
+                    Json(RegisterStart { email: None, bootstrap_token: None, nickname: None }),
+                )
+                .await
+                .map_err(|e| e.0)
+            }
+        };
+
+        let err = start("a", AUTH_VIA_OTP).await.expect_err("驗證碼登入的 admin 不能加 Passkey");
+        assert!(err.to_string().contains("Passkey 登入才能新增"), "拿到的是：{err}");
+        let _ = start("m", AUTH_VIA_OTP).await.expect("驗證碼登入的 member 照常能加");
+        let _ = start("a", AUTH_VIA_PASSKEY).await.expect("Passkey 登入的 admin 能加");
+    }
+
+    /// 弱認證的 admin 在**任何地方**都只是 member —— 不只 `require_admin` 守的
+    /// 端點，member 端點裡順手給 admin 的特權（讀所有人的信、動別人的 IP、
+    /// 白名單全覽）也一律收回；`/api/status` 的 `is_admin` 跟著回 false，
+    /// `role` 仍說他是 admin，前端才有辦法解釋為什麼管理分頁不見了。
+    #[tokio::test]
+    async fn a_weakly_authenticated_admin_is_only_a_member_elsewhere() {
+        let st = test_state();
+        db::create_user_with_platforms(&st.db, "a", "a@x", "a@x", "admin", Some("a@x"), &[]).unwrap();
+        db::create_user_with_platforms(&st.db, "m", "m@x", "m@x", "member", Some("m@x"), &["disneyplus".into()]).unwrap();
+        // m 的白名單條目，跟一封只有 m 的平台才看得到的信。admin 一個平台都沒被授權。
+        assert!(db::upsert_allow_owned(&st.db, "203.0.113.5", Some("m 家"), "m@x", db::now() + 86400, 1, false).unwrap());
+        db::insert_mail(&st.db, Some("d1"), db::now(), None, None, Some("code"), None, None, None, &[], true, Some("disneyplus"), None).unwrap();
+        let mail_id: i64 = st
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT id FROM mails WHERE message_id = 'd1'", [], |r| r.get(0))
+            .unwrap();
+
+        let login = |via: &'static str| async move {
+            let session = test_session();
+            session.insert(S_USER, &"a".to_string()).await.unwrap();
+            session.insert(S_NAME, &"a@x".to_string()).await.unwrap();
+            session.insert(S_AUTH_VIA, via).await.unwrap();
+            session
+        };
+        let rename = |s: Session| {
+            let st = st.clone();
+            async move {
+                allow_rename(State(st), s, hdrs(&[]), Path("203.0.113.5".into()), Json(LabelReq { label: Some("改".into()) }))
+                    .await
+                    .map_err(|e| e.0)
+            }
+        };
+        let get_status = |s: Session| {
+            let st = st.clone();
+            async move { status(State(st), s, hdrs(&[]), Query(StatusQuery { ip: None })).await.map_err(|e| e.0).unwrap().0 }
+        };
+
+        let otp = login(AUTH_VIA_OTP).await;
+        let err = mail_get(State(st.clone()), otp.clone(), Path(mail_id)).await.map_err(|e| e.0).expect_err("讀別人的信要被當 member 拒絕");
+        assert!(err.to_string().contains("查無此信件"), "拿到的是：{err}");
+        let err = allow_remove(State(st.clone()), otp.clone(), hdrs(&[]), Path("203.0.113.5".into()))
+            .await
+            .map_err(|e| e.0)
+            .expect_err("刪別人的 IP 要被當 member 拒絕");
+        assert!(err.to_string().contains("只能移除自己新增的"), "拿到的是：{err}");
+        let err = rename(otp.clone()).await.expect_err("改別人的 IP 名稱要被當 member 拒絕");
+        assert!(err.to_string().contains("只能重新命名自己新增的"), "拿到的是：{err}");
+        let s = get_status(otp.clone()).await;
+        assert!(!s.is_admin, "status.is_admin 要跟後端實際給的特權一致");
+        assert_eq!(s.role.as_deref(), Some("admin"), "但角色照實說，前端才能解釋");
+        assert_eq!(s.auth_via.as_deref(), Some(AUTH_VIA_OTP));
+        assert!(s.entries.is_empty(), "白名單也只看得到自己的");
+
+        // 同一位 admin 用 Passkey 登入：特權都在。
+        let pk = login(AUTH_VIA_PASSKEY).await;
+        let _ = mail_get(State(st.clone()), pk.clone(), Path(mail_id)).await.map_err(|e| e.0).expect("Passkey 登入的 admin 讀得到所有信");
+        let _ = rename(pk.clone()).await.expect("Passkey 登入的 admin 能改別人的條目");
+        let s = get_status(pk).await;
+        assert!(s.is_admin);
+        assert_eq!(s.role.as_deref(), Some("admin"));
+        assert_eq!(s.entries.len(), 1, "admin 看得到全部白名單");
     }
 
     /// 三支匿名的登入端點跟 join 那幾支一樣被同一個限流器擋。
@@ -4579,6 +4784,14 @@ mod tests {
         assert_eq!(otp_rows(&st.db), 0, "兩種情況都不寫碼");
         assert_eq!(audit_count(&st.db, "join_has_account"), 1);
         assert_eq!(audit_count(&st.db, "join_not_invited"), 1);
+
+        // 被邀請、剛寄過（冷卻中）：回的也是同一個常數。回剩餘秒數的話，
+        // 「有個值在倒數」本身就洩漏了這個位址剛剛真的被寄過碼。
+        db::invite_email(&st.db, "mei@x.tw", "admin", &[]).unwrap();
+        db::put_otp(&st.db, "mei@x.tw", db::OTP_JOIN, "sent-a-moment-ago", otp::TTL_SECS).unwrap();
+        let invited_cooling = start("mei@x.tw").await;
+        assert_eq!(invited_cooling.cooldown, not_invited.cooldown, "冷卻中的回應要跟沒被邀請的一樣");
+        assert_eq!(otp_rows(&st.db), 1, "冷卻中不重寄、不覆寫");
     }
 
     /// 信箱證明是身分升級，寫進 session 之前要換 id —— 驗證碼與邀請連結

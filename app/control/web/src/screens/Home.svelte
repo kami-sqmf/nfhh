@@ -66,9 +66,14 @@
   const platformName = (code) => platform(code)?.name ?? code
 
   const allowed = $derived(!!app.status?.my_ip_allowed)
-  // 用驗證碼登入 = 這台裝置上沒有可用的 Passkey（有的話就不會走退路）。
-  // 提示只在這種 session 出現：建好一把重新登入後它自己會消失。
+  // 用驗證碼登入多半代表這台裝置上沒有可用的 Passkey（有的話通常不會走退路），
+  // 但也可能只是剛才沒選到 —— 文案不武斷。提示只在這種 session 出現：
+  // 建好一把重新登入後它自己會消失。
   const otpSession = $derived(app.status?.auth_via === 'otp')
+  // 驗證碼登入的 admin：後端把他當 member（status.is_admin=false，管理分頁不見），
+  // 也不讓他在這種 session 新增 Passkey —— 否則加一把、登出、用它登入就繞過了
+  // 「管理功能要 Passkey」。這裡要用 role 判斷，is_admin 對他已經是 false。
+  const otpAdmin = $derived(otpSession && app.status?.role === 'admin')
   const latest = $derived(mails[0] ?? null)
   const rest = $derived(Math.max(0, mails.length - 1))
 
@@ -124,11 +129,24 @@
     </div>
   {/if}
 
-  {#if otpSession}
-    <div class="rounded-md bg-surface p-4">
-      <div class="text-item font-semibold">這台裝置還沒有 Passkey</div>
+  {#if otpAdmin}
+    <div class="rounded-md bg-watch-bg p-4">
+      <div class="text-item font-semibold text-watch-fg">你是管理員，但這次是用驗證碼登入</div>
       <p class="mt-1 text-label leading-relaxed text-fg-muted text-pretty">
-        你是用驗證碼登入的，這台裝置還沒有 Passkey。建一把之後登入就不必再收驗證碼。
+        管理功能只開放給 Passkey 登入的 session，所以這次看不到管理分頁；
+        管理員帳號也要先用 Passkey 登入才能新增 Passkey。請登出後改用 Passkey 登入。
+      </p>
+      <button
+        onclick={async () => { await api.logout(); location.reload() }}
+        class="mt-2.5 w-full py-3 rounded-sm border-[1.5px] border-watch/40 text-item
+               font-semibold text-watch-fg"
+      >登出</button>
+    </div>
+  {:else if otpSession}
+    <div class="rounded-md bg-surface p-4">
+      <div class="text-item font-semibold">這台裝置可能還沒有 Passkey</div>
+      <p class="mt-1 text-label leading-relaxed text-fg-muted text-pretty">
+        你是用驗證碼登入的，這台裝置上大概還沒有可用的 Passkey。建一把之後登入就不必再收驗證碼。
       </p>
       <button
         onclick={() => { accountAdd = true; account = true }}

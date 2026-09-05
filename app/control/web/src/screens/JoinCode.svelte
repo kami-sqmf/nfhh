@@ -33,8 +33,7 @@
       if (login) {
         await api.loginOtpVerify(app.flowEmail, v)
         verified = true
-        // 跟 Passkey 登入成功走一樣的收尾；記下信箱是給下次的 Email 頁預填
-        localStorage.setItem('nfhh:last-email', app.flowEmail)
+        // 跟 Passkey 登入成功走一樣的收尾
         notify('登入成功', true)
         await refresh()
       } else {
@@ -118,7 +117,7 @@
 
     <div class="mt-4 p-4 rounded-md bg-surface text-body leading-relaxed text-fg-muted">
       {#if login}
-        用驗證碼登入的這台裝置還沒有 Passkey，登入後可以在帳號頁建一把，之後就不用再收驗證碼。
+        用驗證碼登入多半代表這台裝置還沒有可用的 Passkey，登入後可以在帳號頁建一把，之後就不用再收驗證碼。
       {:else}
         這組驗證碼只確認信箱是你的。通過後才會請你在這支手機建立 Passkey，
         之後登入都不再需要信箱。

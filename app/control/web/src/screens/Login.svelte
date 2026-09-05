@@ -12,8 +12,7 @@
   async function passkey() {
     busy = true
     try {
-      const r = await loginDiscoverable()
-      if (r.username) localStorage.setItem('nfhh:last-email', r.username)
+      await loginDiscoverable()
       notify('登入成功', true)
       await refresh()
     } catch (e) {

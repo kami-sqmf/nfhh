@@ -26,9 +26,13 @@
   let renaming = $state(null)
 
   const only = $derived(keys.length === 1)
-  // 驗證碼登入的 session：這台裝置上沒有 Passkey，提示要講的是「這台沒有」，
-  // 不是「帳號只剩一把」—— 兩件事的下一步不同。
+  // 驗證碼登入的 session：這台裝置上多半沒有可用的 Passkey，提示要講的是
+  // 「這台可能沒有」，不是「帳號只剩一把」—— 兩件事的下一步不同。
   const otpSession = $derived(app.status?.auth_via === 'otp')
+  // 驗證碼登入的 admin 不能在這種 session 新增 Passkey（後端 register_start 會擋）：
+  // 加一把、登出、用它登入就繞過了「管理功能要 Passkey」。這裡不給入口，
+  // 免得填完名字才看到錯誤。用 role 判斷 —— is_admin 對他已經是 false。
+  const otpAdmin = $derived(otpSession && app.status?.role === 'admin')
 
   // 兩層狀態：這台裝置有沒有訂閱（瀏覽器端），以及帳號層的兩顆開關
   // （跟著人跑）。分開是因為它們真的是兩件事。
@@ -105,7 +109,7 @@
     if (open) {
       load()
       loadExtras()
-      if (startAdding) { adding = true; draft = '' }
+      if (startAdding && !otpAdmin) { adding = true; draft = '' }
     }
   })
 
@@ -146,19 +150,31 @@
 <Sheet {open} {onclose} title="帳號">
   <div class="mt-4 p-4 rounded-md bg-canvas">
     <div class="font-mono text-body break-all">{app.status?.username}</div>
+    <!-- 角色看 role，不看 is_admin：後者是「這次有沒有管理特權」，
+         驗證碼登入的管理員會是 false，但他仍是管理員 -->
     <div class="mt-1 text-label text-fg-faint">
-      {app.status?.is_admin ? '管理員' : '一般成員'}
+      {app.status?.role === 'admin' ? '管理員' : '一般成員'}{#if otpAdmin} · 這次用驗證碼登入，管理功能停用{/if}
     </div>
   </div>
 
-  {#if otpSession}
+  {#if otpAdmin}
     <div class="mt-3 flex gap-3 p-4 rounded-md bg-watch-bg">
       <IconAlert width="18" height="18" class="text-watch-fg shrink-0 mt-0.5" />
       <div>
-        <div class="text-body font-semibold text-watch-fg">這台裝置還沒有 Passkey</div>
+        <div class="text-body font-semibold text-watch-fg">管理員帳號要先用 Passkey 登入才能新增 Passkey</div>
         <p class="mt-1 text-label leading-relaxed text-fg-strong text-pretty">
-          你是用驗證碼登入的，這台裝置還沒有 Passkey。建一把之後登入就不必再收驗證碼；
-          管理功能也只有 Passkey 登入的 session 能用。
+          你是用驗證碼登入的。管理功能只開放給 Passkey 登入的 session，
+          在這種 session 新增的 Passkey 也不算數 —— 請登出後改用 Passkey 登入再來。
+        </p>
+      </div>
+    </div>
+  {:else if otpSession}
+    <div class="mt-3 flex gap-3 p-4 rounded-md bg-watch-bg">
+      <IconAlert width="18" height="18" class="text-watch-fg shrink-0 mt-0.5" />
+      <div>
+        <div class="text-body font-semibold text-watch-fg">這台裝置可能還沒有 Passkey</div>
+        <p class="mt-1 text-label leading-relaxed text-fg-strong text-pretty">
+          你是用驗證碼登入的，這台裝置上大概還沒有可用的 Passkey。建一把之後登入就不必再收驗證碼。
         </p>
       </div>
     </div>
@@ -360,7 +376,12 @@
     {/each}
   </div>
 
-  {#if adding}
+  {#if otpAdmin}
+    <!-- 後端會拒絕，這裡直接不給入口（理由見上面 otpAdmin） -->
+    <p class="mt-2 px-1 text-meta leading-relaxed text-fg-faint text-pretty">
+      管理員帳號要先用 Passkey 登入才能新增 Passkey。
+    </p>
+  {:else if adding}
     <div class="mt-2 flex gap-2">
       <input
         bind:value={draft}
