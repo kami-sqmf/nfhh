@@ -1,68 +1,29 @@
 <script>
   import { app, notify, refresh } from '../lib/state.svelte.js'
-  import { loginPasskey, loginDiscoverable, supportsConditionalUi, passkeyError } from '../lib/api.js'
+  import { loginDiscoverable, passkeyError } from '../lib/api.js'
 
   // 設計 1j：沒有輸入欄位，一顆按鈕就登入。走可探索憑證 ——
   // 裝置自己知道有哪些帳號，不必先告訴伺服器我是誰。
   //
-  // 但 webauthn-rs 0.5 註冊時送的是 residentKey: "discouraged"，
-  // 所以不是每一把 passkey 都可探索（見 main.rs 的登入段註解）。
-  // Email 登入因此保留成退路，預設收起來不佔版面。
+  // 退路是 Email 驗證碼（不靠 Passkey），給換了手機、或憑證弄丟的人。
+  // 它跟「用 Email 加入」走同一個寄信服務，所以 join_enabled 關著時一起停用。
   let busy = $state(false)
-  let fallback = $state(false)
-  let email = $state(localStorage.getItem('nfhh:last-email') ?? '')
-
-  async function done(username) {
-    if (username) localStorage.setItem('nfhh:last-email', username)
-    notify('登入成功', true)
-    await refresh()
-  }
 
   async function passkey() {
     busy = true
     try {
       const r = await loginDiscoverable()
-      await done(r.username)
+      if (r.username) localStorage.setItem('nfhh:last-email', r.username)
+      notify('登入成功', true)
+      await refresh()
     } catch (e) {
-      // 不管哪種失敗都指路到退路 —— 使用者要的是「怎麼進去」，
+      // 訊息本身已指路到退路（見 passkeyError）—— 使用者要的是「怎麼進去」，
       // 不是知道 WebAuthn 規格的哪一條沒滿足。
       notify(passkeyError(e))
-      fallback = true
     } finally {
       busy = false
     }
   }
-
-  async function byEmail() {
-    if (!email.trim()) return notify('請輸入 Email')
-    busy = true
-    try {
-      await loginPasskey(email.trim())
-      await done(email.trim())
-    } catch (e) {
-      notify(passkeyError(e))
-    } finally {
-      busy = false
-    }
-  }
-
-  // Conditional UI：不跳窗，把 passkey 掛進輸入框的自動填入。
-  // 只在展開退路、而且瀏覽器支援時啟動；元件卸載要 abort，
-  // 否則這個等待中的請求會擋掉之後任何一次 credentials.get()。
-  $effect(() => {
-    if (!fallback) return
-    const ctrl = new AbortController()
-    ;(async () => {
-      if (!(await supportsConditionalUi())) return
-      try {
-        const r = await loginDiscoverable({ conditional: true, signal: ctrl.signal })
-        await done(r.username)
-      } catch {
-        // 使用者沒選、或按了主按鈕把它取消掉 —— 都不是錯誤
-      }
-    })()
-    return () => ctrl.abort()
-  })
 </script>
 
 <div class="flex flex-col min-h-[100dvh] px-6">
@@ -87,32 +48,11 @@
     使用 Passkey 登入
   </button>
 
-  {#if fallback}
-    <div class="mt-3">
-      <input
-        bind:value={email}
-        type="email"
-        inputmode="email"
-        autocomplete="username webauthn"
-        autocapitalize="off"
-        spellcheck="false"
-        placeholder="Email"
-        onkeydown={(e) => e.key === 'Enter' && byEmail()}
-        class="w-full px-4 py-3.5 rounded-md bg-surface border-[1.5px] border-line-firm
-               font-mono outline-none focus:border-fg"
-      />
-      <button
-        onclick={byEmail}
-        disabled={busy}
-        class="mt-2 w-full py-3.5 rounded-md border-[1.5px] border-line-firm text-item font-medium disabled:opacity-50"
-      >登入</button>
-    </div>
-  {:else}
-    <button
-      onclick={() => (fallback = true)}
-      class="mt-2.5 w-full py-2.5 min-h-0 text-body text-fg-faint"
-    >登不進去？改用 Email 登入</button>
-  {/if}
+  <button
+    onclick={() => (app.authStep = 'loginemail')}
+    disabled={!app.status?.join_enabled}
+    class="mt-2.5 w-full py-2.5 min-h-0 text-body text-fg-faint disabled:opacity-40"
+  >登不進去？改用 Email 驗證碼登入</button>
 
   <div class="flex-1 min-h-[60px]"></div>
 
@@ -131,6 +71,7 @@
     用 Email 加入
   </button>
   {#if !app.status?.join_enabled}
+    <!-- 驗證碼登入與加入都靠寄信；沒設寄信服務時兩條路一起關，說明放一次就好 -->
     <p class="mt-2 text-center text-label text-fg-faint">尚未設定寄信服務，請聯絡管理員</p>
   {/if}
 

@@ -20,12 +20,23 @@
 
   const tabs = { home: Home, allow: Allow, codes: Codes, guide: Guide, admin: Admin }
   const subs = { inbox: Inbox, members: Members, recipients: Recipients, sender: Sender }
-  const auth = { login: Login, join: Join, joincode: JoinCode, invited: JoinInvite }
+  // Email 驗證碼登入沿用加入流程的兩個畫面，只換 mode（文案與 API 不同，版型相同）
+  const auth = {
+    login: [Login],
+    join: [Join],
+    joincode: [JoinCode],
+    invited: [JoinInvite],
+    loginemail: [Join, 'login'],
+    logincode: [JoinCode, 'login'],
+  }
 
+  // 驗證碼登入的 session 是弱認證，後端的 admin 端點一律拒絕 ——
+  // 子頁進去只會一直載入失敗閃紅，所以直接停在管理首頁讓它解釋原因。
+  const weakAuth = $derived(app.status?.auth_via === 'otp')
   const Screen = $derived(
-    app.tab === 'admin' && app.sub ? subs[app.sub] : tabs[app.tab] ?? Home
+    app.tab === 'admin' && app.sub && !weakAuth ? subs[app.sub] : tabs[app.tab] ?? Home
   )
-  const Auth = $derived(auth[app.authStep] ?? Login)
+  const [Auth, authMode] = $derived(auth[app.authStep] ?? auth.login)
 
   $effect(() => { refresh() })
 </script>
@@ -36,7 +47,7 @@
   <Bootstrap />
 {:else if !app.status.logged_in}
   <Msg />
-  <Auth />
+  <Auth mode={authMode} />
 {:else}
   <Msg />
   <Screen />

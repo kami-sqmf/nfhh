@@ -18,6 +18,8 @@
   const list = mailList(api.mails)
   const mails = $derived(list.mails)
   let account = $state(false)
+  // 從「建一把 Passkey」那張卡開帳號頁時，直接把新增流程展開，不要再讓人找按鈕
+  let accountAdd = $state(false)
   let authorize = $state(false)
   let askPush = $state(false)
   let fwd = $state(null)
@@ -64,6 +66,9 @@
   const platformName = (code) => platform(code)?.name ?? code
 
   const allowed = $derived(!!app.status?.my_ip_allowed)
+  // 用驗證碼登入 = 這台裝置上沒有可用的 Passkey（有的話就不會走退路）。
+  // 提示只在這種 session 出現：建好一把重新登入後它自己會消失。
+  const otpSession = $derived(app.status?.auth_via === 'otp')
   const latest = $derived(mails[0] ?? null)
   const rest = $derived(Math.max(0, mails.length - 1))
 
@@ -116,6 +121,19 @@
         class="mt-2.5 w-full py-3 rounded-sm border-[1.5px] border-watch/40 text-item
                font-semibold text-watch-fg"
       >{fwd.cf_present === false ? '寄出驗證信' : '重新發送驗證信'}</button>
+    </div>
+  {/if}
+
+  {#if otpSession}
+    <div class="rounded-md bg-surface p-4">
+      <div class="text-item font-semibold">這台裝置還沒有 Passkey</div>
+      <p class="mt-1 text-label leading-relaxed text-fg-muted text-pretty">
+        你是用驗證碼登入的，這台裝置還沒有 Passkey。建一把之後登入就不必再收驗證碼。
+      </p>
+      <button
+        onclick={() => { accountAdd = true; account = true }}
+        class="mt-2.5 w-full py-3 rounded-sm border-[1.5px] border-line-firm text-item font-semibold"
+      >在這台裝置建一把 Passkey</button>
     </div>
   {/if}
 
@@ -175,7 +193,7 @@
   </div>
 </div>
 
-<AccountSheet open={account} onclose={() => (account = false)} />
+<AccountSheet open={account} startAdding={accountAdd} onclose={() => { account = false; accountAdd = false }} />
 <PushSheet open={askPush} onclose={() => (askPush = false)} />
 <MailView mail={list.viewing} onclose={() => (list.viewing = null)} />
 <AllowSheet open={authorize} onclose={() => (authorize = false)} ondone={refresh} />

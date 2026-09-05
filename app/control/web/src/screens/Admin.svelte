@@ -12,6 +12,11 @@
   let audit = $state([])
   let showAll = $state(false)
 
+  // 驗證碼登入的 session 是弱認證，後端所有 admin 端點都會拒絕。
+  // 這裡不去打稽核（一定失敗、一直閃紅），改成說明怎麼辦；
+  // 子頁的入口也一併停用，App.svelte 那邊還會擋住已經選到的 sub。
+  const weakAuth = $derived(app.status?.auth_via === 'otp')
+
   const tiles = [
     { id: 'inbox', label: '收件匣', icon: IconInbox },
     { id: 'members', label: '成員管理', icon: IconUsers },
@@ -32,6 +37,7 @@
   }
 
   $effect(() => {
+    if (weakAuth) return
     api.audit().then((r) => (audit = r)).catch(fail)
   })
 
@@ -43,11 +49,27 @@
 </header>
 
 <div class="px-5 pt-3 flex flex-col gap-2.5">
+  {#if weakAuth}
+    <div class="rounded-md bg-watch-bg p-4">
+      <div class="text-item font-semibold text-watch-fg">管理功能需要用 Passkey 登入</div>
+      <p class="mt-1 text-label leading-relaxed text-fg-muted text-pretty">
+        你這次是用 Email 驗證碼登入的，管理功能不開放給這種 session。
+        請登出後改用 Passkey；這台裝置若還沒有，可以先到帳號頁建一把。
+      </p>
+      <button
+        onclick={async () => { await api.logout(); location.reload() }}
+        class="mt-2.5 w-full py-3 rounded-sm border-[1.5px] border-watch/40 text-item
+               font-semibold text-watch-fg"
+      >登出</button>
+    </div>
+  {/if}
+
   <div class="grid grid-cols-2 gap-2">
     {#each tiles as t (t.id)}
       <button
         onclick={() => go('admin', t.id)}
-        class="py-4 px-3 bg-surface rounded-md flex flex-col items-center gap-2"
+        disabled={weakAuth}
+        class="py-4 px-3 bg-surface rounded-md flex flex-col items-center gap-2 disabled:opacity-40"
       >
         <t.icon width="22" height="22" stroke-width="1.75" class="text-fg" />
         <span class="text-label font-semibold">{t.label}</span>

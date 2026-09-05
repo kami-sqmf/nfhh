@@ -3,6 +3,13 @@
   import { api, registerPasskey, passkeyError } from '../lib/api.js'
   import OtpInput from '../components/OtpInput.svelte'
 
+  // 加入與驗證碼登入共用的驗證碼頁（見 Join.svelte 的說明）。
+  // 差別只在：驗證用哪支 API、通過後做什麼 —— join 要接著建 Passkey，
+  // login 填滿六格通過就直接進面板。
+  let { mode = 'join' } = $props()
+  const login = $derived(mode === 'login')
+  const start = $derived(login ? api.loginOtpStart : api.joinStart)
+
   let code = $state('')
   let busy = $state(false)
   let err = $state(null)
@@ -23,8 +30,17 @@
     busy = true
     err = null
     try {
-      await api.joinVerify(app.joinEmail, v)
-      verified = true
+      if (login) {
+        await api.loginOtpVerify(app.flowEmail, v)
+        verified = true
+        // 跟 Passkey 登入成功走一樣的收尾；記下信箱是給下次的 Email 頁預填
+        localStorage.setItem('nfhh:last-email', app.flowEmail)
+        notify('登入成功', true)
+        await refresh()
+      } else {
+        await api.joinVerify(app.flowEmail, v)
+        verified = true
+      }
     } catch (e) {
       err = e.message
       code = ''
@@ -37,7 +53,7 @@
     busy = true
     err = null
     try {
-      await registerPasskey({ email: app.joinEmail })
+      await registerPasskey({ email: app.flowEmail })
       notify('帳號已建立', true)
       await refresh()
     } catch (e) {
@@ -49,7 +65,7 @@
 
   async function resend() {
     try {
-      const r = await api.joinStart(app.joinEmail)
+      const r = await start(app.flowEmail)
       cooldown = r.cooldown ?? 60
       code = ''
       err = null
@@ -63,7 +79,7 @@
 <div class="flex flex-col min-h-[100dvh]">
   <div class="flex items-center gap-3 px-5 pt-5">
     <button
-      onclick={() => (app.authStep = 'join')}
+      onclick={() => (app.authStep = login ? 'loginemail' : 'join')}
       class="w-9 h-9 min-h-0 rounded-sm bg-surface grid place-items-center"
       aria-label="改信箱">←</button
     >
@@ -72,8 +88,15 @@
 
   <div class="flex-1 flex flex-col px-6 pt-6">
     <h1 class="text-head font-bold leading-tight tracking-tight">輸入信箱驗證碼</h1>
+    <!-- 兩句都是條件句、都不能改成肯定句：起手端點對「有沒有這個帳號／有沒有被邀請」
+         刻意回一樣的東西，這裡若寫「已寄出」就等於替後端把答案講出來了。 -->
     <p class="mt-2 text-body leading-relaxed text-fg-muted text-pretty">
-      已寄出 6 位數到 <span class="font-mono">{app.joinEmail}</span>，10 分鐘內有效。
+      {#if login}
+        若這個信箱有帳號，驗證碼已寄出到 <span class="font-mono">{app.flowEmail}</span>，10 分鐘內有效。
+      {:else}
+        若這個信箱有被邀請，驗證碼已寄出到 <span class="font-mono">{app.flowEmail}</span>，10 分鐘內有效。
+        沒收到？先確認拼字與管理員登記的完全一致。
+      {/if}
     </p>
 
     <div class="mt-6">
@@ -94,22 +117,32 @@
     {/if}
 
     <div class="mt-4 p-4 rounded-md bg-surface text-body leading-relaxed text-fg-muted">
-      這組驗證碼只確認信箱是你的。通過後才會請你在這支手機建立 Passkey，
-      之後登入都不再需要信箱。
+      {#if login}
+        用驗證碼登入的這台裝置還沒有 Passkey，登入後可以在帳號頁建一把，之後就不用再收驗證碼。
+      {:else}
+        這組驗證碼只確認信箱是你的。通過後才會請你在這支手機建立 Passkey，
+        之後登入都不再需要信箱。
+      {/if}
     </div>
 
     <div class="flex-1"></div>
 
-    <button
-      onclick={createPasskey}
-      disabled={!verified || busy}
-      class="w-full py-5 rounded-lg bg-fg text-canvas text-lead font-semibold
-             disabled:bg-line-firm disabled:text-fg-faint"
-    >
-      建立我的 Passkey
-    </button>
-    <p class="mt-2.5 mb-8 text-center text-label leading-relaxed text-fg-faint">
-      {verified ? '信箱已確認，可以建立 Passkey 了' : '填滿 6 位後才會亮起'}
-    </p>
+    {#if login}
+      <p class="mb-8 text-center text-label leading-relaxed text-fg-faint">
+        {busy ? '驗證中…' : '填滿 6 位後會自動登入'}
+      </p>
+    {:else}
+      <button
+        onclick={createPasskey}
+        disabled={!verified || busy}
+        class="w-full py-5 rounded-lg bg-fg text-canvas text-lead font-semibold
+               disabled:bg-line-firm disabled:text-fg-faint"
+      >
+        建立我的 Passkey
+      </button>
+      <p class="mt-2.5 mb-8 text-center text-label leading-relaxed text-fg-faint">
+        {verified ? '信箱已確認，可以建立 Passkey 了' : '填滿 6 位後才會亮起'}
+      </p>
+    {/if}
   </div>
 </div>

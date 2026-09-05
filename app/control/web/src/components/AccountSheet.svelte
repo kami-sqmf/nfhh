@@ -16,7 +16,8 @@
   // 設計稿的 16 個畫面裡沒有 passkey 管理與登出，但兩者都必須有地方去：
   // 只有一把 passkey 的人若弄丟裝置就再也登不進來，而登出是基本操作。
   // 收在首頁右上的信箱底下 —— member 看不到管理分頁，不能放那。
-  let { open = false, onclose } = $props()
+  // startAdding：首頁「建一把 Passkey」的卡片開這頁時，直接展開新增流程
+  let { open = false, startAdding = false, onclose } = $props()
 
   let keys = $state([])
   let busy = $state(false)
@@ -25,6 +26,9 @@
   let renaming = $state(null)
 
   const only = $derived(keys.length === 1)
+  // 驗證碼登入的 session：這台裝置上沒有 Passkey，提示要講的是「這台沒有」，
+  // 不是「帳號只剩一把」—— 兩件事的下一步不同。
+  const otpSession = $derived(app.status?.auth_via === 'otp')
 
   // 兩層狀態：這台裝置有沒有訂閱（瀏覽器端），以及帳號層的兩顆開關
   // （跟著人跑）。分開是因為它們真的是兩件事。
@@ -97,7 +101,13 @@
   }
 
   // 開啟時才載入。這些只有這裡在用，沒必要塞進 /api/status。
-  $effect(() => { if (open) { load(); loadExtras() } })
+  $effect(() => {
+    if (open) {
+      load()
+      loadExtras()
+      if (startAdding) { adding = true; draft = '' }
+    }
+  })
 
   async function add() {
     busy = true
@@ -141,7 +151,18 @@
     </div>
   </div>
 
-  {#if only}
+  {#if otpSession}
+    <div class="mt-3 flex gap-3 p-4 rounded-md bg-watch-bg">
+      <IconAlert width="18" height="18" class="text-watch-fg shrink-0 mt-0.5" />
+      <div>
+        <div class="text-body font-semibold text-watch-fg">這台裝置還沒有 Passkey</div>
+        <p class="mt-1 text-label leading-relaxed text-fg-strong text-pretty">
+          你是用驗證碼登入的，這台裝置還沒有 Passkey。建一把之後登入就不必再收驗證碼；
+          管理功能也只有 Passkey 登入的 session 能用。
+        </p>
+      </div>
+    </div>
+  {:else if only}
     <div class="mt-3 flex gap-3 p-4 rounded-md bg-watch-bg">
       <IconAlert width="18" height="18" class="text-watch-fg shrink-0 mt-0.5" />
       <div>
