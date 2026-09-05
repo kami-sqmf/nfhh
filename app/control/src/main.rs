@@ -775,8 +775,9 @@ async fn register_finish(
     }
 
     let cred_id = base64_url(passkey.cred_id().as_ref());
-    // 上限只會在「加備援」那條路撞到：新帳號永遠是第 1 把。這個檢查沒辦法
-    // 提早到消耗 bootstrap／邀請之前 —— 要先驗過 WebAuthn 才知道有沒有東西可存。
+    // 上限只會在「加備援」那條路撞到，而那條路前面沒有消耗任何東西；
+    // `is_new` 的 user_id 是全新的 uuid、憑證數必為 0，上面消耗掉的
+    // bootstrap／邀請不會因為這裡退回而白白燒掉。
     if !db::add_credential(
         &st.db,
         &cred_id,
@@ -2547,6 +2548,8 @@ struct SubscribeReq {
 fn valid_push_endpoint(s: &str) -> bool {
     let Ok(u) = Url::parse(s) else { return false };
     let Some(url::Host::Domain(host)) = u.host() else { return false };
+    // `localhost.`（尾端點）是合法的 FQDN 寫法，解到的還是自己
+    let host = host.trim_end_matches('.');
     u.scheme() == "https"
         && u.username().is_empty()
         && u.password().is_none()
@@ -4385,7 +4388,9 @@ mod tests {
             "https://host:8443/",
             "http://fcm.googleapis.com/fcm/send/abc",
             "https://localhost/",
+            "https://localhost./",
             "https://push.localhost/",
+            "https://push.localhost./",
             "not a url",
         ] {
             assert!(!valid_push_endpoint(bad), "{bad} 該被擋");
