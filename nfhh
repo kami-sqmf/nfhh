@@ -19,9 +19,9 @@ usage() {
     cat <<EOF
 用法: ./nfhh <命令>
 
-  up                啟動三個容器（generated/ 不存在時會先自動 bootstrap）
+  up                啟動三個容器（會先確認 nft 表 inet nfhh 存在；generated/ 不存在時會先自動 bootstrap）
   down              停止並移除容器（⚠️ 全家會斷 DNS）
-  restart           重啟三個容器
+  restart           重啟三個容器（同樣先確認 nft 表存在）
   logs [服務]       追蹤日誌。服務可填 smartdns / sni-proxy / control
   status            一頁看完：容器、埠、白名單、對外 IP、憑證、systemd
 
@@ -42,6 +42,42 @@ ensure_generated() {
         scripts/bootstrap.sh
         echo
     fi
+}
+
+# 安全審查 #4：smartdns 與 nginx 都是 host network，容器一起來就直接綁 53/443/853。
+# 若 nftables 的 inet nfhh 表還不在，這幾個埠會在沒有來源 IP 閘門的狀態下對外開放。
+# 這裡只判斷表存不存在：用 -t 只列結構、不印白名單 IP。
+# 回傳 0 = 表存在、1 = 表不存在、2 = 拿不到 sudo（無法判斷，要跟「沒表」分開處理）。
+nft_table_state() {
+    sudo -n true 2>/dev/null || return 2
+    sudo -n nft -t list table inet nfhh >/dev/null 2>&1 || return 1
+}
+
+# up / restart 之前先確認防火牆表存在，不存在就中止並印出修復指令。
+# 設 NFHH_SKIP_FIREWALL_CHECK=1 可跳過（給 CI／測試機），跳過時印一行警告到 stderr。
+require_firewall() {
+    if [[ "${NFHH_SKIP_FIREWALL_CHECK:-}" == 1 ]]; then
+        echo "⚠️  NFHH_SKIP_FIREWALL_CHECK=1：略過防火牆檢查，容器會在沒有來源 IP 閘門的狀態下綁 53/443/853" >&2
+        return 0
+    fi
+    local rc=0
+    nft_table_state || rc=$?
+    case $rc in
+        0) return 0 ;;
+        2)
+            echo "無法確認防火牆狀態（需要 sudo），請先手動確認 \`sudo nft list table inet nfhh\`" >&2
+            exit 1
+            ;;
+        *)
+            cat >&2 <<EOF
+nftables 的 inet nfhh 表不存在，拒絕啟動：容器是 host network，會直接對外開放 53/443/853。
+先建立防火牆表再重試：
+  sudo systemctl restart nfhh-firewall.service    # 已安裝 systemd unit
+  sudo nft -f config/nft/nfhh.nft                 # 尚未安裝時
+EOF
+            exit 1
+            ;;
+    esac
 }
 
 # $1 = 標題, $2 = 值（空字串顯示為破折號）
@@ -119,15 +155,23 @@ status() {
     else
         row "docker drop-in" "⛔ 未安裝（防火牆失敗時 Docker 仍會起來；見 docs/SETUP.md 第 4 步）"
     fi
+    # 與 require_firewall 同一個檢查，但 status 只顯示、不中止
+    local rc=0
+    nft_table_state || rc=$?
+    case $rc in
+        0) row "nft 表 inet nfhh" "✅ 存在" ;;
+        2) row "nft 表 inet nfhh" "（需要 sudo 才能確認：sudo nft list table inet nfhh）" ;;
+        *) row "nft 表 inet nfhh" "❌ 不存在（up/restart 會拒絕啟動；sudo nft -f config/nft/nfhh.nft）" ;;
+    esac
 }
 
 cmd="${1:-help}"
 [[ $# -gt 0 ]] && shift
 
 case "$cmd" in
-    up)        ensure_generated; docker compose up -d "$@" ;;
+    up)        require_firewall; ensure_generated; docker compose up -d "$@" ;;
     down)      docker compose down "$@" ;;
-    restart)   docker compose restart "$@" ;;
+    restart)   require_firewall; docker compose restart "$@" ;;
     logs)      docker compose logs -f --tail=100 "$@" ;;
     status)    status ;;
     apply)     exec scripts/apply-config.sh "$@" ;;

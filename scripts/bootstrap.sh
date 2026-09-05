@@ -44,13 +44,16 @@ seed "$ROOT/generated/nft/clients.nft" \
 cat <<'EOF'
 
 完成。接下來照 docs/SETUP.md 走，或直接：
-  1. ./nfhh up
-  2. ./nfhh apply                              # 填入對外 IP
-  3. sudo nft -f config/nft/nfhh.nft           # 建立防火牆表
+  1. sudo nft -f config/nft/nfhh.nft           # 建立防火牆表（一定要在 up 之前）
+  2. ./nfhh up
+  3. ./nfhh apply                              # 填入對外 IP
   4. sudo cp deploy/nfhh-*.{service,timer,path} /etc/systemd/system/
      sudo mkdir -p /etc/systemd/system/docker.service.d
      sudo cp deploy/docker.service.d/10-nfhh-firewall.conf /etc/systemd/system/docker.service.d/
      sudo systemctl daemon-reload
      sudo systemctl enable --now nfhh-firewall.service nfhh-sync-ip.timer nfhh-cert.path
   5. ./nfhh cert                               # 啟用 DoT（需先有 acme.sh 憑證）
+
+順序不能反：smartdns 與 nginx 是 host network，容器一起來就直接綁 53/443/853；
+防火牆表還沒建就先 up，這幾秒鐘會是對全網開放的解析器。./nfhh up 也會先確認表存在才啟動。
 EOF
