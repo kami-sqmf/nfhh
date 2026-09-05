@@ -1,6 +1,7 @@
 <script>
   import { app, go, fail, notify, refresh } from '../lib/state.svelte.js'
   import { api } from '../lib/api.js'
+  import { mailList } from '../lib/mail.svelte.js'
   import CodeCard from '../components/CodeCard.svelte'
   import AccountSheet from '../components/AccountSheet.svelte'
   import AllowSheet from '../components/AllowSheet.svelte'
@@ -11,10 +12,15 @@
 
   // 1a：首頁以最新驗證碼為主，授權入口收在「遇到同戶裝置問題？」區塊裡。
   // 家人多數時候只是要一組碼，不該先被防火牆概念擋住。
-  let mails = $state([])
+  //
+  // 清單、輪詢與「點開才取全文」跟驗證碼分頁、收件匣一字不差，
+  // 共用 lib/mail.svelte.js 那一份。
+  const list = mailList(api.mails)
+  const mails = $derived(list.mails)
   let account = $state(false)
+  // 從「建一把 Passkey」那張卡開帳號頁時，直接把新增流程展開，不要再讓人找按鈕
+  let accountAdd = $state(false)
   let authorize = $state(false)
-  let viewing = $state(null)
   let askPush = $state(false)
   let fwd = $state(null)
 
@@ -59,14 +65,19 @@
   const platform = (code) => app.status?.platforms?.find((p) => p.code === code)
   const platformName = (code) => platform(code)?.name ?? code
 
+  const allowed = $derived(!!app.status?.my_ip_allowed)
+  // 用驗證碼登入多半代表這台裝置上沒有可用的 Passkey（有的話通常不會走退路），
+  // 但也可能只是剛才沒選到 —— 文案不武斷。提示只在這種 session 出現：
+  // 建好一把重新登入後它自己會消失。
+  const otpSession = $derived(app.status?.auth_via === 'otp')
+  // 驗證碼登入的 admin：後端把他當 member（status.is_admin=false，管理分頁不見），
+  // 也不讓他在這種 session 新增 Passkey —— 否則加一把、登出、用它登入就繞過了
+  // 「管理功能要 Passkey」。這裡要用 role 判斷，is_admin 對他已經是 false。
+  const otpAdmin = $derived(otpSession && app.status?.role === 'admin')
   const latest = $derived(mails[0] ?? null)
   const rest = $derived(Math.max(0, mails.length - 1))
 
-  async function load() {
-    try { mails = await api.mails() } catch (e) { fail(e) }
-  }
-
-  $effect(() => { load() })
+  $effect(() => { list.load() })
   $effect(() => {
     maybeAskPush()
     api.myForwarding().then((r) => (fwd = r)).catch(() => {})
@@ -74,7 +85,7 @@
 
   // 驗證碼時效很短，自動輪詢；切到背景就停，不浪費家人的電池與流量。
   $effect(() => {
-    const t = setInterval(() => { if (!document.hidden) load() }, 20000)
+    const t = setInterval(() => { if (!document.hidden) list.load() }, 20000)
     return () => clearInterval(t)
   })
 </script>
@@ -118,9 +129,35 @@
     </div>
   {/if}
 
+  {#if otpAdmin}
+    <div class="rounded-md bg-watch-bg p-4">
+      <div class="text-item font-semibold text-watch-fg">你是管理員，但這次是用驗證碼登入</div>
+      <p class="mt-1 text-label leading-relaxed text-fg-muted text-pretty">
+        管理功能只開放給 Passkey 登入的 session，所以這次看不到管理分頁；
+        管理員帳號也要先用 Passkey 登入才能新增 Passkey。請登出後改用 Passkey 登入。
+      </p>
+      <button
+        onclick={async () => { await api.logout(); location.reload() }}
+        class="mt-2.5 w-full py-3 rounded-sm border-[1.5px] border-watch/40 text-item
+               font-semibold text-watch-fg"
+      >登出</button>
+    </div>
+  {:else if otpSession}
+    <div class="rounded-md bg-surface p-4">
+      <div class="text-item font-semibold">這台裝置可能還沒有 Passkey</div>
+      <p class="mt-1 text-label leading-relaxed text-fg-muted text-pretty">
+        你是用驗證碼登入的，這台裝置上大概還沒有可用的 Passkey。建一把之後登入就不必再收驗證碼。
+      </p>
+      <button
+        onclick={() => { accountAdd = true; account = true }}
+        class="mt-2.5 w-full py-3 rounded-sm border-[1.5px] border-line-firm text-item font-semibold"
+      >在這台裝置建一把 Passkey</button>
+    </div>
+  {/if}
+
   {#if latest}
     <CodeCard mail={latest} platformName={platformName(latest.platform)} platformColor={platform(latest.platform)?.color}
-              showMailbox onview={(m) => (viewing = m)} />
+              showMailbox onview={list.view} />
     <div class="flex items-baseline justify-between px-1">
       <span class="text-body text-fg-faint">
         {rest > 0 ? `14 天內還有 ${rest} 組` : '14 天內沒有其他驗證碼'}
@@ -139,34 +176,42 @@
 
   <div class="flex-1 min-h-4"></div>
 
-  <!-- 授權入口。紅底不是警告，是「這裡有個問題可以解」的入口。 -->
-  <div class="rounded-md bg-bad-bg p-4">
-    <div class="text-item font-semibold text-bad-fg">遇到同戶裝置問題？</div>
+  <!-- 授權入口。紅底不是警告，是「這裡有個問題可以解」的入口 ——
+       所以只在還沒授權時是紅的；已授權就退成一般卡片，別讓人以為還有事要做。 -->
+  <div class="rounded-md p-4 {allowed ? 'bg-surface' : 'bg-bad-bg'}">
+    <div class="text-item font-semibold {allowed ? '' : 'text-bad-fg'}">遇到同戶裝置問題？</div>
     <p class="mt-1 text-label leading-relaxed text-fg-muted text-pretty">
       目前只建議電視出現同戶裝置限制再套用。
     </p>
 
-    <div class="mt-2.5 flex items-center justify-between gap-3 px-3.5 py-2.5 rounded-sm bg-surface/75">
+    <div class="mt-2.5 flex items-center justify-between gap-3 px-3.5 py-2.5 rounded-sm {allowed ? 'bg-canvas' : 'bg-surface/75'}">
       <span class="flex items-baseline gap-2 min-w-0">
         <span class="font-mono text-micro font-medium tracking-widest uppercase text-fg-faint shrink-0">出口 IP</span>
         <span class="font-mono text-lead font-medium truncate">{app.status?.my_ip ?? '取不到'}</span>
       </span>
-      <span class="font-mono text-micro font-medium shrink-0
-                   {app.status?.my_ip_allowed ? 'text-ok-fg' : 'text-bad-fg'}">
-        {app.status?.my_ip_allowed ? '已授權' : '尚未授權'}
+      <span class="font-mono text-micro font-medium shrink-0 {allowed ? 'text-ok-fg' : 'text-bad-fg'}">
+        {allowed ? '已授權' : '尚未授權'}
       </span>
     </div>
 
+    <!-- 授權只是第一步，裝置那端還要把 DNS 改過來。教學放在延長按鈕上方、
+         用實心綠色：多數人卡住的是「改了沒生效」，不是授權本身。 -->
+    <button
+      onclick={() => go('guide')}
+      class="mt-2.5 w-full py-3 rounded-sm bg-ok text-white text-item font-semibold"
+    >點這裡看教學</button>
+
     <button
       onclick={() => (authorize = true)}
-      class="mt-2.5 w-full py-3 rounded-sm border-[1.5px] border-bad/40 text-item font-semibold text-bad-fg"
+      class="mt-2.5 w-full py-3 rounded-sm border-[1.5px] text-item font-semibold
+             {allowed ? 'border-line-firm' : 'border-bad/40 text-bad-fg'}"
     >
-      {app.status?.my_ip_allowed ? '延長授權期限' : '授權這個網路'}
+      {allowed ? '延長授權期限' : '授權這個網路'}
     </button>
   </div>
 </div>
 
-<AccountSheet open={account} onclose={() => (account = false)} />
+<AccountSheet open={account} startAdding={accountAdd} onclose={() => { account = false; accountAdd = false }} />
 <PushSheet open={askPush} onclose={() => (askPush = false)} />
-<MailView mail={viewing} onclose={() => (viewing = null)} />
+<MailView mail={list.viewing} onclose={() => (list.viewing = null)} />
 <AllowSheet open={authorize} onclose={() => (authorize = false)} ondone={refresh} />

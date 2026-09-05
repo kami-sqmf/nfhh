@@ -16,6 +16,8 @@ mod nft;
 mod otp;
 mod platforms;
 mod push;
+mod ratelimit;
+mod session_store;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -28,7 +30,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::sync::Arc;
-use tower_sessions::{MemoryStore, Session, SessionManagerLayer};
+use session_store::BoundedMemoryStore;
+use tower_sessions::{Expiry, Session, SessionManagerLayer};
 use webauthn_rs::prelude::*;
 
 // ── 設定 ──────────────────────────────────────────────
@@ -55,9 +58,15 @@ struct Config {
     mail_secret: String,
     mail_keep_days: i64,
     /// 可信的寄件品牌網域（比對 DKIM 簽章網域，不是信封寄件者）。
+    /// 只是**種子值**，實際以 settings.sender_domains 為準（見 seed_settings／mail_ingest）。
     mail_allowed_senders: Vec<String>,
-    /// 未通過驗證時是否真的收掉扇出。預設 false = 觀察期，只記錄不阻擋。
+    /// 只是 `sender_verify_mode` 的**種子**（面板怎麼顯示未通過驗證的信：
+    /// `0` = observe、`1` = enforce）。轉發閘門 `forward_enforce_sender` 固定種子
+    /// 為 `1`、不看這個變數 —— 未通過驗證的信預設就不轉發，要放寬只能在面板改。
     mail_enforce_sender: bool,
+    /// 收信端在 `Authentication-Results` 裡署名的 authserv-id。只有它寫的
+    /// 驗證結果算數；Cloudflare Email Routing 是 `mx.cloudflare.net`。
+    mail_authserv_id: String,
     /// smartdns 的查詢稽核檔。讀不到時查詢統計為空，其餘功能不受影響。
     dns_audit: String,
     /// Cloudflare 帳戶與 token，用來查轉發收件人的驗證狀態。
@@ -73,6 +82,9 @@ struct Config {
     mail_domain: String,
     /// 邀請函樣板在 Resend 上的 id 或別名。樣板要先發布，草稿寄不出去。
     invite_template: String,
+    /// 稽核的保留期與列數上限。公開端點的每次失敗都寫一列，沒有上限就是免費的磁碟。
+    audit_keep_days: i64,
+    audit_max_rows: i64,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -101,6 +113,10 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .collect(),
             mail_enforce_sender: env_or("NFHH_MAIL_ENFORCE_SENDER", "0") == "1",
+            // 前後空白會讓比對永遠不成立 —— 那等於默默扣住所有信件
+            mail_authserv_id: env_or("NFHH_MAIL_AUTHSERV_ID", "mx.cloudflare.net")
+                .trim()
+                .to_string(),
             dns_audit: env_or("NFHH_DNS_AUDIT", "/smartdns-data/audit.log"),
             cf_account: env_or("NFHH_CF_ACCOUNT", ""),
             cf_token: env_or("NFHH_CF_TOKEN", ""),
@@ -108,6 +124,16 @@ impl Config {
             mail_from: env_or("NFHH_MAIL_FROM", "share@example.com"),
             mail_domain: env_or("NFHH_MAIL_DOMAIN", "share.example.com"),
             invite_template: env_or("NFHH_INVITE_TEMPLATE", "ott-share-invitation"),
+            // 夾範圍：0 天等於每次清光，0 列的 LIMIT 也一樣，而 -1 在 SQLite
+            // 的 LIMIT 是「不限」—— 打錯一個字不該讓稽核整張消失或永不清理
+            audit_keep_days: env_or("NFHH_AUDIT_KEEP_DAYS", "90")
+                .parse()
+                .unwrap_or(90)
+                .clamp(1, 3650),
+            audit_max_rows: env_or("NFHH_AUDIT_MAX_ROWS", "20000")
+                .parse()
+                .unwrap_or(20000)
+                .clamp(100, 1_000_000),
         })
     }
 }
@@ -127,6 +153,11 @@ struct AppState {
     push: push::Push,
     /// smartdns 查詢的記憶體滾動視窗，由背景 tail 任務餵。
     dns: Arc<dnslog::Window>,
+    /// 不需要登入的那幾支端點共用的限流器。沒有帳號可擋，只剩來源 IP 可數。
+    join_limiter: ratelimit::Limiter,
+    /// session store。放在這裡而不是 `routes` 裡自己建，是為了讓 `main` 的
+    /// 背景工作拿得到同一份來 `sweep`，測試也能直接看它的大小。
+    sessions: BoundedMemoryStore,
 }
 
 type Shared = Arc<AppState>;
@@ -171,7 +202,44 @@ const S_USER: &str = "uid";
 const S_NAME: &str = "uname";
 const S_REG: &str = "reg_state";
 const S_REG_USER: &str = "reg_user";
-const S_AUTH: &str = "auth_state";
+
+/// 這個 session 是**怎麼**登入的：`"passkey"` 或 `"otp"`。
+///
+/// Email 驗證碼登入是備援、是弱認證（誰控制信箱誰就進得來，見 otp.rs），
+/// 所以 `require_admin` 只放行 `"passkey"`。跟 `S_USER` 一起寫、一起活；
+/// 登出走 `flush` 整份清掉，不必單獨處理。
+const S_AUTH_VIA: &str = "auth_via";
+const AUTH_VIA_PASSKEY: &str = "passkey";
+const AUTH_VIA_OTP: &str = "otp";
+
+/// 這個 session 剛證明過擁有哪個信箱。`register_start` 除了查全域的
+/// `email_otp.verified_at`，還要求證明是**同一個瀏覽器**做的。
+const S_EMAIL_PROOF: &str = "email_proof";
+
+/// 任一認證流程開始時，先把其他流程留下的狀態全部清掉。
+/// 登入與註冊各自是獨立的狀態機，殘留的鍵會讓 finish 讀到另一條流程的目標。
+/// 清不掉就整個請求失敗 —— 帶著殘留狀態繼續，正是這個弱點的成因。
+/// 刻意不清的是 `S_USER`／`S_NAME`／`S_AUTH_VIA`（登入身分，加備援金鑰
+/// 本來就要登入著）與 `S_EMAIL_PROOF`（信箱證明，`register_start` 在清除
+/// 之後才讀它）—— 別把它們加進這個迴圈。
+async fn clear_auth_flows(session: &Session) -> Result<()> {
+    for key in [S_REG, S_REG_USER, S_DISC] {
+        session.remove::<serde_json::Value>(key).await?;
+    }
+    Ok(())
+}
+
+/// 註冊完成前的最後一道不變量：已登入的人只能替**自己**加備援金鑰；
+/// 建立新帳號的流程則不該有人登入著。
+fn check_registration_owner(logged_in: Option<&str>, p: &PendingReg) -> Result<()> {
+    match (logged_in, p.is_new) {
+        (Some(uid), false) if uid == p.user_id => Ok(()),
+        (Some(_), false) => anyhow::bail!("註冊目標與目前登入的帳號不符，請重新開始"),
+        (Some(_), true) => anyhow::bail!("已登入的帳號不能建立新帳號，請先登出"),
+        (None, false) => anyhow::bail!("加註備援 Passkey 需要先登入"),
+        (None, true) => Ok(()),
+    }
+}
 
 async fn current_user(session: &Session) -> Option<(String, String)> {
     let id: Option<String> = session.get(S_USER).await.ok().flatten();
@@ -195,12 +263,32 @@ async fn require_user(st: &Shared, session: &Session) -> ApiResult<(String, Stri
     Ok((id, name))
 }
 
-/// 每次從 DB 重讀角色，讓降權即時生效。
+/// 這個 session 現在有沒有 admin 特權：角色是 admin **而且**是用 Passkey 登入的。
+///
+/// 驗證碼登入的 session 是弱認證（拿到信箱就拿到它，見 otp.rs）。弱認證的
+/// admin 在**任何地方**都只是 member —— 不只 `require_admin` 守的那些端點，
+/// member 端點裡順手給 admin 的特權（改別人的 IP、讀所有人的信）也一樣。
+/// 否則家人信箱一失守，只要那位家人碰巧是 admin，整個面板就跟著失守。
+/// 所有拿角色來授權的地方都走這一個函式，不直接看 `is_admin()`；
+/// 讀不到 session 的登入方式時當成不是 Passkey（fail-closed）。
+async fn admin_powers(session: &Session, me: &db::User) -> bool {
+    if !me.is_admin() {
+        return false;
+    }
+    let via: Option<String> = session.get(S_AUTH_VIA).await.ok().flatten();
+    via.as_deref() == Some(AUTH_VIA_PASSKEY)
+}
+
+/// 每次從 DB 重讀角色，讓降權即時生效；授權本身交給 [`admin_powers`]。
+/// 兩句不同的錯誤訊息只是讓 admin 知道該換 Passkey 登入，而不是誤以為自己被降權。
 async fn require_admin(st: &Shared, session: &Session) -> ApiResult<db::User> {
     let (uid, _) = require_user(st, session).await?;
     let user = db::get_user(&st.db, &uid)?.context("帳號已不存在")?;
     if !user.is_admin() {
         return Err(AppError(anyhow::anyhow!("需要管理員權限")));
+    }
+    if !admin_powers(session, &user).await {
+        return Err(AppError(anyhow::anyhow!("管理功能需要用 Passkey 登入")));
     }
     Ok(user)
 }
@@ -213,6 +301,91 @@ async fn require_admin(st: &Shared, session: &Session) -> ApiResult<db::User> {
 //
 // 這組碼只證明信箱是本人的，通過後仍要建 Passkey 才算有帳號。
 // 完整的威脅模型見 otp.rs。
+
+/// RFC 5321 的位址上限。再長的不是信箱，是想撐大資料庫的人。
+const MAX_EMAIL_LEN: usize = 254;
+/// 白名單標籤、裝置名稱等可顯示文字的上限。
+const MAX_LABEL_LEN: usize = 128;
+/// 每個帳號最多幾把 Passkey。一家人一人幾台裝置，10 綽綽有餘；
+/// 上限是為了防已登入的人無限灌 `credentials` 表（報告 #3），
+/// 不是產品上的限制。
+const MAX_PASSKEYS_PER_USER: i64 = 10;
+/// 不需要登入的端點（join/start、join/verify、join/invite，以及 register/start
+/// 的未登入分支）共用的限流：每個來源 IP 每 10 分鐘 30 次、全域 200 次。
+/// 名字沿用 join，計數是共用的。
+///
+/// 每 IP 30 次是給「整家人躲在同一個 NAT 後面同時開通」留的空間：寄碼、
+/// 打錯幾次、重寄，一個人就可能用掉五六次。
+const JOIN_LIMIT_WINDOW_SECS: i64 = 600;
+const JOIN_LIMIT_PER_IP: u32 = 30;
+const JOIN_LIMIT_GLOBAL: u32 = 200;
+
+/// session store 同時能放幾筆（報告 #1）。一家人 × 幾台裝置 × 兩週壽命
+/// 遠不到一萬；限流之下匿名起手每 10 分鐘最多 200 筆，要塞滿一萬得不間斷
+/// 灌 8 小時，而那時被踢的也只是 15 分鐘壽命的匿名紀錄。純粹是保險。
+const SESSION_STORE_MAX: usize = 10_000;
+/// 匿名 session（登入／加入起手到完成之間）從這次寫入起的壽命。要撐過
+/// 整條流程裡最長的一段：驗證碼本身 10 分鐘（`otp::TTL_SECS`），而 `join_verify` 寫下的
+/// 信箱證明要活到 `register_start`／`register_finish` 做完，`register_start`
+/// 認的時窗是 15 分鐘（`otp::VERIFIED_WINDOW_SECS`）。再長只是替灌 store
+/// 的人多留兩週而已。
+const ANON_SESSION_MINUTES: i64 = 15;
+
+/// 匿名的起手（挑戰、信箱證明）寫進 session 之前先呼叫：讓這次寫入的紀錄
+/// 在 store 裡只活 `ANON_SESSION_MINUTES`，沒登入成功就自己消失，不必佔兩週。
+/// 已登入的人（例如登入著再去打 login/any/start）不動 —— 縮的是還沒證明
+/// 自己是誰的那些。
+///
+/// 不變量是「**每一條**會寫匿名 session 的路徑都要先走這裡」，漏一條就是
+/// 兩週：tower-sessions 的 expiry 掛在每個請求新建的 `Session` 物件上
+/// （`SessionManagerLayer` 沒 `with_expiry`，每個請求都從 `None` ＝兩週起跑），
+/// 不存在 store 的 `Record` 裡；`save` 時才用它算出 `expiry_date` 寫進去。
+/// 所以要在**第一次**改動 session 之前呼叫 —— 改了之後任何 `return Err`
+/// （回 400，middleware 照樣存）都會把這份 session 以當下的 expiry 存回去。
+/// 匿名者純讀不會 save、不會滑動延長，實際語意是「這次寫入起 15 分鐘」，
+/// 接近 `Expiry::AtDateTime`。
+async fn mark_anonymous(session: &Session) {
+    if current_user(session).await.is_none() {
+        session.set_expiry(Some(Expiry::OnInactivity(
+            tower_sessions::cookie::time::Duration::minutes(ANON_SESSION_MINUTES),
+        )));
+    }
+}
+
+/// 登入成功之後呼叫，表達意圖：這份 session 從現在起是兩週的。
+///
+/// 在生產它其實是 no-op —— expiry 掛在請求自己的 `Session` 物件上（見
+/// `mark_anonymous`），登入那個請求沒走 `mark_anonymous`，本來就是 `None`
+/// ＝兩週；「登入回到兩週」靠的是這件事，不是這個呼叫。留著是因為測試
+/// 會重用同一個 `Session` 物件跨好幾個 handler，沒有它前一段的 15 分鐘
+/// 會黏到登入之後。CONTROL.md 沒有另外規定登入壽命，容器重啟本來就會
+/// 讓所有人重新登入。
+fn mark_authenticated(session: &Session) {
+    session.set_expiry(None);
+}
+
+fn valid_email(s: &str) -> bool {
+    s.len() <= MAX_EMAIL_LEN && s.contains('@') && !s.contains(char::is_whitespace)
+}
+
+/// 不需要登入的端點共用這道門。四支都會在失敗時寫一列稽核，而稽核有列數
+/// 上限 —— 只擋其中一支，洪水換個門牌就能把真正的稽核軌跡整批擠掉。
+///
+/// 要在任何 DB 存取之前呼叫，被擋掉的請求才是真的什麼都沒碰到。
+fn throttle_public(st: &Shared, ip: Option<&str>) -> ApiResult<()> {
+    if !st.join_limiter.allow(ip.unwrap_or("?"), db::now()) {
+        return Err(AppError(anyhow::anyhow!("請求太頻繁，請稍後再試")));
+    }
+    Ok(())
+}
+
+/// 可顯示文字的長度檢查。傳進來的要是**真的會存下去**的那個值。
+fn check_label_len(label: Option<&str>) -> ApiResult<()> {
+    if label.is_some_and(|l| l.chars().count() > MAX_LABEL_LEN) {
+        return Err(AppError(anyhow::anyhow!("名稱最多 {MAX_LABEL_LEN} 個字")));
+    }
+    Ok(())
+}
 
 #[derive(Deserialize)]
 struct EmailReq {
@@ -238,17 +411,82 @@ struct InviteOpened {
     platforms: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct JoinRes {
-    /// 冷卻中剩餘秒數。1o 的「重新寄送（0:42）」倒數用這個值。
+    /// 重寄冷卻秒數。1o 的「重新寄送（0:42）」倒數用這個值。
+    /// 一律是常數 `RESEND_COOLDOWN_SECS`，不是剩餘秒數（理由見 `send_otp`）。
     cooldown: i64,
 }
 
-/// 寄出一組驗證碼。
+/// 沒設寄信金鑰時兩支寄碼端點都不能用。這一關要排在「這個位址該不該寄」
+/// **之前**：擺在後面的話，寄信服務關著時會變成「該寄的報錯、不該寄的回 Ok」，
+/// 又把位址有沒有登記洩漏出去。
+fn require_mailer(st: &Shared) -> ApiResult<()> {
+    if !st.mailer.enabled() {
+        return Err(AppError(anyhow::anyhow!("尚未設定寄信服務，請聯絡管理員")));
+    }
+    Ok(())
+}
+
+/// 兩支寄碼端點（`join_start`、`login_otp_start`）在決定「這個位址該寄」之後
+/// 共同的尾段：冷卻、產碼、寫 DB、背景寄信、稽核。
 ///
-/// 位址沒被登記時直接說「沒有被邀請」（設計 1k 就是這樣寫的）。
-/// 這會洩漏「某個位址有沒有被登記」，但這是個封閉的家用系統 ——
-/// 拿含糊訊息換取一點點防列舉，代價是家人打錯字時完全不知道發生什麼事。
+/// 冷卻中回的是**常數** `RESEND_COOLDOWN_SECS`，不是剩餘秒數：剩餘秒數會隨
+/// 「上一次是幾秒前寄的」變動，等於告訴外人這個信箱剛剛有沒有真的被寄過碼
+/// —— 也就是有沒有被邀請、有沒有帳號。前端在倒數歸零前不會叫重寄，根本
+/// 用不到剩餘值。
+///
+/// 寄信丟到背景：`send_code` 要連外、要等 Resend 回，會寄的位址跟不會寄的
+/// 位址回應時間差好幾百毫秒，量得出來就等於明講。所以寫完 DB 就立刻回覆；
+/// 寄失敗寫稽核（`failed_action`）與 log，使用者等不到信會按重寄。
+/// `sent_action` 在交給背景之前就寫 —— 它記的是「這個位址被發了一組碼」。
+async fn send_otp(
+    st: &Shared,
+    ip: Option<&str>,
+    email: &str,
+    purpose: &str,
+    sent_action: &str,
+    failed_action: &str,
+) -> ApiResult<Json<JoinRes>> {
+    let as_if_sent = JoinRes { cooldown: otp::RESEND_COOLDOWN_SECS };
+    // 冷卻擋的是「拿這支端點當寄信機去洗別人的信箱」。不報錯，因為前端
+    // 本來就會把按鈕鎖到倒數結束。
+    if db::otp_cooldown(&st.db, email, otp::RESEND_COOLDOWN_SECS)? > 0 {
+        return Ok(Json(as_if_sent));
+    }
+
+    let code = otp::generate();
+    // 先寫 DB 再寄信：反過來的話，寄成功但寫失敗會讓使用者拿著一組
+    // 系統不認得的碼，而且冷卻也沒生效，可以無限重按。
+    db::put_otp(&st.db, email, purpose, &otp::hash(&st.db, email, &code)?, otp::TTL_SECS)?;
+    db::audit(&st.db, None, sent_action, Some(email), ip);
+
+    let st = Arc::clone(st);
+    let email = email.to_string();
+    let ip = ip.map(str::to_string);
+    let failed_action = failed_action.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = st.mailer.send_code(&email, &code, otp::TTL_SECS / 60).await {
+            // 位址只進稽核（admin 看得到），不進容器日誌。
+            tracing::warn!("驗證碼寄送失敗（{failed_action}）: {e:#}");
+            db::audit(&st.db, None, &failed_action, Some(&email), ip.as_deref());
+        }
+    });
+    Ok(Json(as_if_sent))
+}
+
+/// 寄出一組加入用的驗證碼。
+///
+/// 位址沒被登記、已經有帳號、還在冷卻 —— 回應跟真的寄出去**一模一樣**
+/// （`ok` + `cooldown`），畫面一律說「若這個信箱有被邀請，驗證碼已寄出」。
+/// 早先這裡直接講「沒有被邀請」，理由是封閉的家用系統、含糊訊息只會讓
+/// 打錯字的家人看不懂。現在登入也能寄碼（`login_otp_start`），兩支端點
+/// 都對外開放且都會寄信，明確訊息的代價從「家人打錯字看不懂」變成
+/// 「任何人都能列舉家人的信箱有沒有登記、有沒有帳號」—— 不值。
+/// 打錯字的人收不到信、只能回頭檢查拼字 —— 這是不讓外人列舉的代價。
+///
+/// 仍會報錯的只有：信箱格式、限流、寄信服務未設定。這三種都跟「這個位址
+/// 是誰的」無關。寄信本身在背景做（見 `send_otp`），成敗不進回應。
 async fn join_start(
     State(st): State<Shared>,
     headers: HeaderMap,
@@ -256,53 +494,48 @@ async fn join_start(
 ) -> ApiResult<Json<JoinRes>> {
     let ip = client_ip(&headers);
     let email = req.email.trim().to_lowercase();
-    if !email.contains('@') {
+    if !valid_email(&email) {
         return Err(AppError(anyhow::anyhow!("請輸入完整的 Email 位址")));
     }
-    if !st.mailer.enabled() {
-        return Err(AppError(anyhow::anyhow!("尚未設定寄信服務，請聯絡管理員")));
-    }
+    throttle_public(&st, ip.as_deref())?;
+    require_mailer(&st)?;
+    // 不寄的兩種情況回的都是這個值 —— 跟 `send_otp` 寄出去（或冷卻中）時回的一樣。
+    let as_if_sent = JoinRes { cooldown: otp::RESEND_COOLDOWN_SECS };
     if db::find_user_by_email(&st.db, &email)?.is_some() {
-        return Err(AppError(anyhow::anyhow!(
-            "這個位址已經有帳號了，請直接用 Passkey 登入"
-        )));
+        db::audit(&st.db, None, "join_has_account", Some(&email), ip.as_deref());
+        return Ok(Json(as_if_sent));
     }
     if !db::is_email_invited(&st.db, &email)? {
         db::audit(&st.db, None, "join_not_invited", Some(&email), ip.as_deref());
-        return Err(AppError(anyhow::anyhow!(
-            "這個位址沒有被邀請。請確認拼字與管理員登記的完全一致。"
-        )));
+        return Ok(Json(as_if_sent));
     }
-
-    // 冷卻擋的是「拿這支端點當寄信機去洗別人的信箱」
-    let cooldown = db::otp_cooldown(&st.db, &email, otp::RESEND_COOLDOWN_SECS)?;
-    if cooldown > 0 {
-        return Err(AppError(anyhow::anyhow!("請等 {cooldown} 秒後再重新寄送")));
-    }
-
-    let code = otp::generate();
-    // 先寫 DB 再寄信：反過來的話，寄成功但寫失敗會讓使用者拿著一組
-    // 系統不認得的碼，而且冷卻也沒生效，可以無限重按。
-    db::put_otp(&st.db, &email, &otp::hash(&st.db, &email, &code)?, otp::TTL_SECS)?;
-    st.mailer.send_code(&email, &code, otp::TTL_SECS / 60).await?;
-
-    db::audit(&st.db, None, "join_code_sent", Some(&email), ip.as_deref());
-    Ok(Json(JoinRes { cooldown: otp::RESEND_COOLDOWN_SECS }))
+    send_otp(&st, ip.as_deref(), &email, db::OTP_JOIN, "join_code_sent", "join_code_send_failed").await
 }
 
 /// 核對驗證碼。通過後才允許進入 Passkey 註冊。
 async fn join_verify(
     State(st): State<Shared>,
+    session: Session,
     headers: HeaderMap,
     Json(req): Json<VerifyReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let ip = client_ip(&headers);
+    throttle_public(&st, ip.as_deref())?;
     let email = req.email.trim().to_lowercase();
     let code = otp::normalize(&req.code);
 
     let hash = otp::hash(&st.db, &email, &code)?;
-    match db::check_otp(&st.db, &email, &hash, otp::MAX_ATTEMPTS)? {
+    match db::check_otp(&st.db, &email, db::OTP_JOIN, &hash, otp::MAX_ATTEMPTS)? {
         db::OtpCheck::Ok => {
+            // 證明綁在這個 session 上：全域的 verified_at 只說「有人驗過」，
+            // 說不出是誰的瀏覽器驗的。
+            //
+            // 寫證明之前先換 session id：這個 session 從「匿名」升級成
+            // 「持有某個信箱」，舊 id 若是被人事先塞進瀏覽器的（session
+            // fixation），換掉它之後那個人手上的就只是一串失效的字。
+            mark_anonymous(&session).await;
+            session.cycle_id().await?;
+            session.insert(S_EMAIL_PROOF, &email).await?;
             db::audit(&st.db, None, "join_code_ok", Some(&email), ip.as_deref());
             Ok(Json(serde_json::json!({ "ok": true })))
         }
@@ -328,10 +561,12 @@ async fn join_verify(
 /// 位址由連結決定，不由呼叫端給 —— 前端沒有機會拿別人的權杖去換自己的信箱。
 async fn join_invite(
     State(st): State<Shared>,
+    session: Session,
     headers: HeaderMap,
     Json(req): Json<InviteTokenReq>,
 ) -> ApiResult<Json<InviteOpened>> {
     let ip = client_ip(&headers);
+    throttle_public(&st, ip.as_deref())?;
     let hash = invite::hash(&st.db, &req.token)?;
 
     // 撤銷過、已註冊過、或根本不存在的權杖，在這裡都是同一種結果。
@@ -348,7 +583,12 @@ async fn join_invite(
         )));
     }
 
-    db::mark_email_verified(&st.db, &row.email)?;
+    db::mark_email_verified(&st.db, &row.email, db::OTP_JOIN)?;
+    // 跟驗證碼那條路一樣：兌換連結的是哪個瀏覽器，證明就記在哪個 session；
+    // 也一樣先換 id 再寫（見 `join_verify`）。
+    mark_anonymous(&session).await;
+    session.cycle_id().await?;
+    session.insert(S_EMAIL_PROOF, &row.email).await?;
     db::audit(&st.db, None, "invite_link_opened", Some(&row.email), ip.as_deref());
     Ok(Json(InviteOpened { email: row.email, platforms: row.platforms }))
 }
@@ -394,9 +634,15 @@ async fn register_start(
     Json(req): Json<RegisterStart>,
 ) -> ApiResult<Json<CreationChallengeResponse>> {
     let ip = client_ip(&headers);
+    clear_auth_flows(&session).await?;
     let logged_in = current_user(&session).await;
+    // 上一行已經改動了 session，從這裡起任何 `return Err` 都會把它存回去；
+    // 縮壽命要在那之前，不然帶著信箱證明的匿名 session 會以兩週存回。
+    // 已登入的人 helper 自己會放過。
+    mark_anonymous(&session).await;
     let email = req.email.as_deref().map(|e| e.trim().to_lowercase());
     let nickname = req.nickname.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    check_label_len(nickname.as_deref())?;
 
     // 三種合法情境，其餘一律拒絕（不開放自助註冊）：
     //   1. 已登入 → 在這台裝置加註備援 passkey
@@ -404,6 +650,21 @@ async fn register_start(
     //   3. 登記過的信箱 + 剛通過 OTP → 家人建立自己的帳號（member）
     let pending = if let Some((uid, _)) = &logged_in {
         let u = db::get_user(&st.db, uid)?.context("帳號已不存在")?;
+        // 驗證碼登入的 admin 不能在這裡加 Passkey：否則「驗證碼登入 → 加
+        // Passkey → 登出 → 用那把 Passkey 登入」四步就把 `require_admin` 的
+        // Passkey 要求整個繞掉。member 不擋 —— 拿得到信箱的人本來就等於那位 member。
+        if u.is_admin() && !admin_powers(&session, &u).await {
+            return Err(AppError(anyhow::anyhow!(
+                "管理員帳號要先用 Passkey 登入才能新增 Passkey"
+            )));
+        }
+        // 先在這裡擋一次，讓人在按下裝置的確認之前就看到原因；真正守住的
+        // 是 `register_finish` 那句原子的 INSERT。
+        if db::credential_count(&st.db, &u.id)? >= MAX_PASSKEYS_PER_USER {
+            return Err(AppError(anyhow::anyhow!(
+                "這個帳號的 Passkey 已達上限（{MAX_PASSKEYS_PER_USER} 把），請先移除不用的"
+            )));
+        }
         PendingReg {
             user_id: u.id,
             username: u.username,
@@ -414,7 +675,14 @@ async fn register_start(
             nickname: nickname.clone(),
         }
     } else {
+        // 只有這條分支不需要登入。已登入的人加註備援 passkey 不該跟公開
+        // 流量搶同一份額度 —— 上面讀的 session 不碰 DB，這裡仍在任何
+        // DB 存取之前。
+        throttle_public(&st, ip.as_deref())?;
         let email = email.context("需要 Email 位址")?;
+        if !valid_email(&email) {
+            return Err(AppError(anyhow::anyhow!("請輸入完整的 Email 位址")));
+        }
         if db::find_user_by_email(&st.db, &email)?.is_some() {
             return Err(AppError(anyhow::anyhow!("這個位址已經有帳號了")));
         }
@@ -446,9 +714,14 @@ async fn register_start(
                 db::audit(&st.db, None, "register_not_invited", Some(&email), ip.as_deref());
                 return Err(AppError(anyhow::anyhow!("這個位址沒有被邀請")));
             }
-            if !db::otp_recently_verified(&st.db, &email, otp::VERIFIED_WINDOW_SECS)? {
+            // 全域旗標只證明「這個位址被驗過」，誰都能拿著它來註冊；
+            // 再對一次 session 上的證明，才輪得到真正完成驗證的那個瀏覽器。
+            let proven: Option<String> = session.get(S_EMAIL_PROOF).await?;
+            if proven.as_deref() != Some(email.as_str())
+                || !db::otp_recently_verified(&st.db, &email, db::OTP_JOIN, otp::VERIFIED_WINDOW_SECS)?
+            {
                 return Err(AppError(anyhow::anyhow!(
-                    "請先完成信箱驗證，或重新寄送一組驗證碼"
+                    "請先在這個瀏覽器完成信箱驗證，或重新寄送一組驗證碼"
                 )));
             }
             PendingReg {
@@ -500,6 +773,21 @@ async fn register_finish(
         .await?
         .context("註冊工作階段已失效，請重新開始")?;
 
+    let logged_in = current_user(&session).await;
+    check_registration_owner(logged_in.as_ref().map(|(id, _)| id.as_str()), &p)?;
+
+    // `register_start` 擋過一次，這裡再擋一次：finish 才是真正寫進憑證的那一步，
+    // 閘門要守在寫入之前；而且 start 到 finish 之間角色可能變了（途中被升成
+    // admin），所以看的是 DB 現在的角色，不是 `p.role` 那份快照。
+    if !p.is_new {
+        let u = db::get_user(&st.db, &p.user_id)?.context("帳號已不存在")?;
+        if u.is_admin() && !admin_powers(&session, &u).await {
+            return Err(AppError(anyhow::anyhow!(
+                "管理員帳號要先用 Passkey 登入才能新增 Passkey"
+            )));
+        }
+    }
+
     // 先驗 WebAuthn，通過了才消耗憑據
     let passkey = st.webauthn.finish_passkey_registration(&cred, &reg_state)?;
 
@@ -542,15 +830,30 @@ async fn register_finish(
     }
 
     let cred_id = base64_url(passkey.cred_id().as_ref());
-    db::add_credential(
+    // 上限只會在「加備援」那條路撞到，而那條路前面沒有消耗任何東西；
+    // `is_new` 的 user_id 是全新的 uuid、憑證數必為 0，上面消耗掉的
+    // bootstrap／邀請不會因為這裡退回而白白燒掉。
+    if !db::add_credential(
         &st.db,
         &cred_id,
         &p.user_id,
         &serde_json::to_string(&passkey)?,
         p.nickname.as_deref(),
-    )?;
+        MAX_PASSKEYS_PER_USER,
+    )? {
+        return Err(AppError(anyhow::anyhow!(
+            "這個帳號的 Passkey 已達上限（{MAX_PASSKEYS_PER_USER} 把），請先移除不用的"
+        )));
+    }
 
-    let _ = session.remove::<PasskeyRegistration>(S_REG).await;
+    // 三把鍵都清，而且清不掉要報錯：殘留的目標是下一次攻擊的材料。
+    // 排在 `add_credential` **之後**：憑證寫失敗就整個請求失敗，這時清掉
+    // 信箱證明只會讓人連重試都不行 —— 帳號建了、邀請消耗了、passkey 卻沒進去。
+    // 信箱證明不分流程無條件清（沒有那把鍵不算錯），加備援金鑰那條路
+    // 順手把殘留的證明一起帶走。
+    session.remove::<PasskeyRegistration>(S_REG).await?;
+    session.remove::<PendingReg>(S_REG_USER).await?;
+    session.remove::<String>(S_EMAIL_PROOF).await?;
     db::audit(
         &st.db,
         Some(p.label()),
@@ -559,29 +862,34 @@ async fn register_finish(
         client_ip(&headers).as_deref(),
     );
 
-    // 第一次註冊完直接視為登入
+    // 第一次註冊完直接視為登入。身分升級前先換 session id（見 `join_verify`）；
+    // 這把是剛用 Passkey 建的，登入方式就是 passkey。
     if p.is_new {
+        session.cycle_id().await?;
         session.insert(S_USER, &p.user_id).await?;
         session.insert(S_NAME, p.label()).await?;
+        session.insert(S_AUTH_VIA, AUTH_VIA_PASSKEY).await?;
+        mark_authenticated(&session);
     }
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 // ── 登入 ──────────────────────────────────────────────
 //
-// 兩條路，因為它們涵蓋的憑證不一樣：
+// 兩條路：
 //
-//   1. **可探索登入**（不必輸入信箱）—— 裝置自己知道有哪些帳號。
-//      這是設計 1j 想要的樣子。
-//   2. **信箱 ＋ passkey** —— 退路。
+//   1. **可探索 Passkey**（不必輸入信箱）—— 裝置自己知道有哪些帳號，
+//      這是設計 1j 想要的樣子，也是主路徑。家裡的憑證確認都是可探索的
+//      （webauthn-rs 0.5 註冊時送 `residentKey: "discouraged"`，但 iOS／
+//      Android／Chrome 的密碼管理器實務上仍存成可探索），所以早先那條
+//      「信箱 ＋ passkey」退路已經拿掉。
+//   2. **Email 驗證碼** —— 備援，給「換了手機、金鑰不在身上」的人。
+//      弱認證：誰控制信箱誰就進得來（見 otp.rs），所以 session 標成
+//      `S_AUTH_VIA = "otp"`，`require_admin` 不放行。
 //
-// 為什麼退路不能拿掉：`start_passkey_registration` 送出的是
-// `residentKey: "discouraged"`（webauthn-rs 0.5 寫死，高階 API 沒有
-// 非 attested 的 resident key 入口）。iOS／Android／Chrome 的密碼管理器
-// 實務上仍會存成可探索的，所以路徑 1 對它們有效；但硬體金鑰或設定較
-// 嚴格的認證器可能不會，那些帳號只剩路徑 2 進得來。
-//
-// → 在能確定所有人的憑證都可探索之前，別把路徑 2 拿掉。
+// 兩條路的 start 都不需要登入，都過 `throttle_public`；finish／verify 成功
+// 寫身分之前都先 `cycle_id`（報告 #7：匿名階段的 session id 不該延用到
+// 登入之後）。
 
 const S_DISC: &str = "disc_state";
 
@@ -590,7 +898,13 @@ const S_DISC: &str = "disc_state";
 async fn login_any_start(
     State(st): State<Shared>,
     session: Session,
+    headers: HeaderMap,
 ) -> ApiResult<Json<RequestChallengeResponse>> {
+    // 不需要登入就能打，跟其他匿名 start 一樣先過限流 —— 每一次都會在
+    // session store 留一份挑戰，不擋等於讓人免費灌記憶體。
+    throttle_public(&st, client_ip(&headers).as_deref())?;
+    clear_auth_flows(&session).await?;
+    mark_anonymous(&session).await;
     let (rcr, disc) = st.webauthn.start_discoverable_authentication()?;
     session.insert(S_DISC, &disc).await?;
     Ok(Json(rcr))
@@ -613,91 +927,109 @@ async fn login_any_finish(
     let user = db::get_user(&st.db, &uuid.to_string())?
         .context("這把 Passkey 對應的帳號已不存在")?;
 
-    let keys: Vec<DiscoverableKey> = db::credentials_for(&st.db, &user.id)?
+    let mut passkeys: Vec<Passkey> = db::credentials_for(&st.db, &user.id)?
         .iter()
         .filter_map(|j| serde_json::from_str::<Passkey>(j).ok())
-        .map(|p| DiscoverableKey::from(&p))
         .collect();
+    let keys: Vec<DiscoverableKey> = passkeys.iter().map(DiscoverableKey::from).collect();
 
     let result = st
         .webauthn
         .finish_discoverable_authentication(&cred, disc, &keys)?;
 
+    // 把這次登入學到的狀態寫回去（報告 #10）：counter 前進了、備份旗標翻了，
+    // 都要進 DB，下次才有東西可比 —— 不然被複製出去的 passkey 拿舊 counter
+    // 來登入，webauthn-rs 看到的永遠是註冊當下的 0。`update_credential` 回
+    // `Some(true)` 才有新材料要存，否則只記 `last_used_at`。寫不回去就讓
+    // 登入失敗，不用 `let _ =` 假裝成功。
     let cred_id = base64_url(result.cred_id().as_ref());
-    let _ = db::touch_credential(&st.db, &cred_id);
-    let _ = session.remove::<DiscoverableAuthentication>(S_DISC).await;
+    let updated = passkeys
+        .iter_mut()
+        .find(|p| p.cred_id() == result.cred_id())
+        .and_then(|p| (p.update_credential(&result) == Some(true)).then(|| serde_json::to_string(p)))
+        .transpose()?;
+    db::update_credential(&st.db, &cred_id, &user.id, updated.as_deref())?;
+    session.remove::<DiscoverableAuthentication>(S_DISC).await?;
 
     let label = user.label().to_string();
+    session.cycle_id().await?;
     session.insert(S_USER, &user.id).await?;
     session.insert(S_NAME, &label).await?;
+    session.insert(S_AUTH_VIA, AUTH_VIA_PASSKEY).await?;
+    mark_authenticated(&session);
     db::audit(&st.db, Some(&label), "login", Some("passkey"), client_ip(&headers).as_deref());
     Ok(Json(serde_json::json!({ "ok": true, "username": label })))
 }
 
-async fn login_start(
+/// 寄出一組登入用的驗證碼。
+///
+/// 條件跟 `join_start` 相反：帳號必須**存在**。查無帳號時不寄、不寫
+/// `email_otp`，但回應跟有帳號時完全一樣 —— 這支端點對外開放，不能變成
+/// 「這個信箱在這裡有沒有帳號」的探測器。稽核照寫（`login_otp_no_account`），
+/// admin 看得到有人在試。
+async fn login_otp_start(
     State(st): State<Shared>,
-    session: Session,
+    headers: HeaderMap,
     Json(req): Json<EmailReq>,
-) -> ApiResult<Json<RequestChallengeResponse>> {
-    let ident = req.email.trim().to_lowercase();
-    // 先查 email；查不到再退回 username，讓 v6 之前註冊、還沒補信箱的
-    // 帳號仍然登得進來。
-    let user = match db::find_user_by_email(&st.db, &ident)? {
-        Some(u) => u,
-        None => db::find_user(&st.db, &ident)?.context("查無此帳號")?,
-    };
-
-    let passkeys: Vec<Passkey> = db::credentials_for(&st.db, &user.id)?
-        .iter()
-        .filter_map(|j| serde_json::from_str(j).ok())
-        .collect();
-    if passkeys.is_empty() {
-        return Err(AppError(anyhow::anyhow!("此帳號沒有已註冊的 passkey")));
+) -> ApiResult<Json<JoinRes>> {
+    let ip = client_ip(&headers);
+    let email = req.email.trim().to_lowercase();
+    if !valid_email(&email) {
+        return Err(AppError(anyhow::anyhow!("請輸入完整的 Email 位址")));
     }
-
-    let (rcr, auth_state) = st.webauthn.start_passkey_authentication(&passkeys)?;
-    session.insert(S_AUTH, &auth_state).await?;
-    session
-        .insert(
-            S_REG_USER,
-            &PendingReg {
-                user_id: user.id,
-                username: user.username,
-                email: user.email,
-                is_new: false,
-                role: user.role,
-                bootstrap_token: None,
-                nickname: None,
-            },
-        )
-        .await?;
-    Ok(Json(rcr))
+    throttle_public(&st, ip.as_deref())?;
+    require_mailer(&st)?;
+    if db::find_user_by_email(&st.db, &email)?.is_none() {
+        db::audit(&st.db, None, "login_otp_no_account", Some(&email), ip.as_deref());
+        return Ok(Json(JoinRes { cooldown: otp::RESEND_COOLDOWN_SECS }));
+    }
+    // 用途標 login：這組碼不能拿去過 `register_start` 的信箱證明。
+    send_otp(&st, ip.as_deref(), &email, db::OTP_LOGIN, "login_otp_sent", "login_otp_send_failed").await
 }
 
-async fn login_finish(
+/// 核對登入用的驗證碼，通過就登入。
+///
+/// 只認 `purpose = login` 的列：加入流程寄出的碼在這裡跟不存在一樣。
+async fn login_otp_verify(
     State(st): State<Shared>,
     session: Session,
     headers: HeaderMap,
-    Json(cred): Json<PublicKeyCredential>,
+    Json(req): Json<VerifyReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let auth_state: PasskeyAuthentication = session
-        .get(S_AUTH)
-        .await?
-        .context("登入工作階段已失效，請重新開始")?;
-    let p: PendingReg = session
-        .get(S_REG_USER)
-        .await?
-        .context("登入工作階段已失效，請重新開始")?;
+    let ip = client_ip(&headers);
+    throttle_public(&st, ip.as_deref())?;
+    let email = req.email.trim().to_lowercase();
+    let code = otp::normalize(&req.code);
 
-    let result = st.webauthn.finish_passkey_authentication(&cred, &auth_state)?;
-    let cred_id = base64_url(result.cred_id().as_ref());
-    let _ = db::touch_credential(&st.db, &cred_id);
-    let _ = session.remove::<PasskeyAuthentication>(S_AUTH).await;
-
-    session.insert(S_USER, &p.user_id).await?;
-    session.insert(S_NAME, p.label()).await?;
-    db::audit(&st.db, Some(p.label()), "login", None, client_ip(&headers).as_deref());
-    Ok(Json(serde_json::json!({ "ok": true })))
+    let hash = otp::hash(&st.db, &email, &code)?;
+    match db::check_otp(&st.db, &email, db::OTP_LOGIN, &hash, otp::MAX_ATTEMPTS)? {
+        db::OtpCheck::Ok => {
+            // 寄碼到通過之間帳號可能被刪；碼對了也不能憑空登入一個不存在的人。
+            let user = db::find_user_by_email(&st.db, &email)?.context("帳號已不存在")?;
+            // 碼一次性：通過就清掉，不留給第二個人試。
+            db::clear_otp(&st.db, &email)?;
+            // 這個 session 可能還掛著半途的 Passkey 流程；登入是新的起點。
+            clear_auth_flows(&session).await?;
+            let label = user.label().to_string();
+            session.cycle_id().await?;
+            session.insert(S_USER, &user.id).await?;
+            session.insert(S_NAME, &label).await?;
+            session.insert(S_AUTH_VIA, AUTH_VIA_OTP).await?;
+            mark_authenticated(&session);
+            db::audit(&st.db, Some(&label), "login", Some("otp"), ip.as_deref());
+            Ok(Json(serde_json::json!({ "ok": true, "username": label })))
+        }
+        db::OtpCheck::Wrong => Err(AppError(anyhow::anyhow!("驗證碼不正確"))),
+        db::OtpCheck::Expired => Err(AppError(anyhow::anyhow!(
+            "驗證碼已過期，請重新寄送一組"
+        ))),
+        db::OtpCheck::TooManyAttempts => {
+            db::audit(&st.db, None, "login_otp_locked", Some(&email), ip.as_deref());
+            Err(AppError(anyhow::anyhow!(
+                "錯誤次數過多，請重新寄送一組新的驗證碼"
+            )))
+        }
+    }
 }
 
 async fn logout(session: Session) -> ApiResult<Json<serde_json::Value>> {
@@ -749,7 +1081,16 @@ struct Status {
     needs_bootstrap: bool,
     /// 只有一把 passkey 時前端提示註冊備援
     passkey_count: i64,
+    /// 這個 session 現在有沒有 admin 特權（角色 admin **且** Passkey 登入，
+    /// 見 `admin_powers`）。前端拿它決定管理分頁顯不顯示。
     is_admin: bool,
+    /// 帳號的角色本身（"admin"／"member"），未登入時 None。跟 `is_admin` 分開：
+    /// 驗證碼登入的 admin 是 role="admin"、is_admin=false，前端據此說明
+    /// 「你是管理員，但這次是用驗證碼登入」，而不是讓管理分頁無聲消失。
+    role: Option<String>,
+    /// `"passkey"` 或 `"otp"`；未登入時 None。驗證碼登入的 session 進不了
+    /// admin 功能，前端用它提示「請改用 Passkey 登入」。
+    auth_via: Option<String>,
     dot_host: String,
     /// DoT 是否已啟用，未啟用則不提供 iOS 描述檔
     dot_ready: bool,
@@ -757,8 +1098,6 @@ struct Status {
     mail_enabled: bool,
     /// 「用 Email 加入」是否可用（要有寄信金鑰）
     join_enabled: bool,
-    /// v6 之前註冊的帳號還沒有信箱，要先補填才能用平台分權與轉發。
-    needs_email: bool,
     /// 轉發收件人的驗證狀態查得到嗎。false 時前端顯示「未查詢」，
     /// 不可顯示成「尚未驗證」—— 那是兩件不同的事。
     cf_enabled: bool,
@@ -782,6 +1121,11 @@ async fn status(
     Query(q): Query<StatusQuery>,
 ) -> ApiResult<Json<Status>> {
     let user = current_user(&session).await;
+    let auth_via: Option<String> = if user.is_some() {
+        session.get(S_AUTH_VIA).await?
+    } else {
+        None
+    };
 
     // ⚠️ 只在登入後採信 `?ip=` —— 否則這支端點會變成「某個 IP 在不在
     //    白名單裡」的探測器，而它是不需要登入就能打的。
@@ -803,13 +1147,21 @@ async fn status(
     let my_ip_allowed = my_ip.as_ref().is_some_and(|ip| all.iter().any(|e| &e.ip == ip));
 
     // 只有登入後才揭露白名單內容
-    let (passkey_count, is_admin, my_platforms) = match &user {
-        Some((uid, _)) => (
-            db::credential_count(&st.db, uid).unwrap_or(0),
-            db::get_user(&st.db, uid)?.map(|u| u.is_admin()).unwrap_or(false),
-            db::platforms_for(&st.db, uid).unwrap_or_default(),
-        ),
-        None => (0, false, vec![]),
+    let (passkey_count, is_admin, role, my_platforms) = match &user {
+        Some((uid, _)) => {
+            let me = db::get_user(&st.db, uid)?;
+            let is_admin = match &me {
+                Some(u) => admin_powers(&session, u).await,
+                None => false,
+            };
+            (
+                db::credential_count(&st.db, uid).unwrap_or(0),
+                is_admin,
+                me.map(|u| u.role),
+                db::platforms_for(&st.db, uid).unwrap_or_default(),
+            )
+        }
+        None => (0, false, None, vec![]),
     };
 
     let now = db::now();
@@ -834,11 +1186,6 @@ async fn status(
         _ => None,
     };
 
-    // v6 之前註冊的帳號還沒有信箱。要先補填，平台分權與轉發才對得上人。
-    let needs_email = user.as_ref().is_some_and(|(uid, _)| {
-        db::get_user(&st.db, uid).ok().flatten().is_some_and(|u| u.email.is_none())
-    });
-
     Ok(Json(Status {
         logged_in: user.is_some(),
         username: user.map(|(_, n)| n),
@@ -855,11 +1202,12 @@ async fn status(
         needs_bootstrap: db::user_count(&st.db).unwrap_or(0) == 0,
         passkey_count,
         is_admin,
+        role,
+        auth_via,
         dot_host: st.cfg.dot_host.clone(),
         dot_ready: dot_ready(&st.cfg.dot_conf),
         mail_enabled: !st.cfg.mail_secret.is_empty(),
         join_enabled: st.mailer.enabled(),
-        needs_email,
         cf_enabled: st.cf.enabled(),
     }))
 }
@@ -997,8 +1345,11 @@ async fn allow_add(
     headers: HeaderMap,
     Json(req): Json<AllowReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let (_, username) = require_user(&st, &session).await?;
+    let (uid, username) = require_user(&st, &session).await?;
     let caller_ip = client_ip(&headers);
+
+    // 存下去的就是 req.label 本身（沒有 trim），檢查的也是它
+    check_label_len(req.label.as_deref())?;
 
     let ip_str = req
         .ip
@@ -1016,33 +1367,39 @@ async fn allow_add(
 
     db::purge_expired(&st.db)?;
 
-    // 額度是 per-user 的。已經在自己名下的 IP 是「延長授權」，不佔新額度；
-    // 別人加過的同一個 IP 也不佔 —— 那會變成「改寫別人的條目」，
-    // 由下面的 upsert 決定語意，不在這裡擋。
-    let existing = db::list_allow(&st.db)?;
-    let already_mine = existing
-        .iter()
-        .any(|e| e.ip == ip_str && e.added_by.as_deref() == Some(username.as_str()));
-    if !already_mine {
-        let mine = db::allow_count_by(&st.db, &username)?;
-        if mine >= st.cfg.max_per_user {
-            return Err(AppError(anyhow::anyhow!(
-                "你的額度已滿（{mine} / {}），請先移除不用的網路",
-                st.cfg.max_per_user
-            )));
-        }
-    }
+    // 這裡讀角色只是為了決定 admin 特權；「帳號還在不在」會在下面那個
+    // transaction 裡再看一次，這一眼跟寫入之間被刪掉也不會漏寫進去。
+    let me = db::get_user(&st.db, &uid)?.context("帳號已不存在")?;
 
     let ttl_days = req.ttl_days.unwrap_or(st.cfg.default_ttl_days).clamp(1, 30);
     let expires_at = db::now() + ttl_days * 86400;
-    db::upsert_allow(
+    // 改別人的條目是 admin 特權，跟其他特權一樣只給強認證的 admin。
+    let admin = admin_powers(&session, &me).await;
+    // 存在、額度、寫入放在同一把鎖、同一個 transaction 裡（報告 #2、#5）。
+    match db::allow_add_atomic(
         &st.db,
+        &uid,
         &ip_str,
         req.label.as_deref(),
-        Some(&username),
+        &username,
         expires_at,
         ttl_days,
-    )?;
+        admin,
+        st.cfg.max_per_user,
+    )? {
+        db::AllowAdd::Added => {}
+        db::AllowAdd::QuotaFull { mine, max } => {
+            return Err(AppError(anyhow::anyhow!(
+                "你的額度已滿（{mine} / {max}），請先移除不用的網路"
+            )));
+        }
+        db::AllowAdd::NotOwner => {
+            return Err(AppError(anyhow::anyhow!(
+                "{ip_str} 不是你新增的，只有新增者或管理員能修改"
+            )));
+        }
+        db::AllowAdd::UserGone => return Err(AppError(anyhow::anyhow!("帳號已不存在"))),
+    }
 
     let n = nft::sync(&st.db, &st.cfg.clients_nft)?;
     db::audit(
@@ -1064,8 +1421,8 @@ async fn allow_remove(
     let (uid, username) = require_user(&st, &session).await?;
     let me = db::get_user(&st.db, &uid)?.context("帳號已不存在")?;
 
-    // 一般成員只能移除自己加的
-    if !me.is_admin() {
+    // 一般成員只能移除自己加的（弱認證的 admin 也算一般成員，見 `admin_powers`）
+    if !admin_powers(&session, &me).await {
         let owner = db::list_allow(&st.db)?
             .into_iter()
             .find(|e| e.ip == ip)
@@ -1109,11 +1466,12 @@ async fn allow_rename(
         .find(|e| e.ip == ip)
         .context("查無此白名單條目")?
         .added_by;
-    if !me.is_admin() && owner.as_deref() != Some(username.as_str()) {
+    if !admin_powers(&session, &me).await && owner.as_deref() != Some(username.as_str()) {
         return Err(AppError(anyhow::anyhow!("只能重新命名自己新增的項目")));
     }
 
     let label = req.label.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    check_label_len(label)?;
     db::rename_allow(&st.db, &ip, label)?;
     db::audit(
         &st.db,
@@ -1135,11 +1493,52 @@ async fn audit_list(
 
 // ── 驗證碼信件 ────────────────────────────────────────
 
+/// ingest 的錯誤要讓 Worker 分得出「拒收」與「面板掛了」：前者不該退回
+/// 未過濾的 FORWARD_MAP，後者才該。一般 `AppError` 一律回 400，分不出來。
+///
+/// 對應到 Worker 的三種處置：
+///   - 5xx（含未啟用）→ 面板不可用，Worker 走 FORWARD_MAP
+///   - 401／422 → 面板拒收，Worker 只轉 FALLBACK_TO
+#[derive(Debug)]
+enum IngestError {
+    /// 端點未啟用（`NFHH_MAIL_SECRET` 為空）—— 面板刻意不參與，
+    /// Worker 應照 FORWARD_MAP 轉發
+    Disabled,
+    /// 密鑰不符 —— 永久性，Worker 不得 fail-open
+    Unauthorized,
+    /// 這封信本身解析不了 —— 永久性，重送也不會變
+    Unprocessable(String),
+    /// 面板自己的問題（DB 等）—— 暫時性，Worker 可走退路
+    Internal(anyhow::Error),
+}
+
+impl IntoResponse for IngestError {
+    fn into_response(self) -> Response {
+        let (status, msg) = match self {
+            Self::Disabled => (StatusCode::SERVICE_UNAVAILABLE, "信件端點未啟用".to_string()),
+            Self::Unauthorized => (StatusCode::UNAUTHORIZED, "未授權".to_string()),
+            Self::Unprocessable(m) => (StatusCode::UNPROCESSABLE_ENTITY, m),
+            Self::Internal(e) => {
+                tracing::error!("ingest 失敗: {e:#}");
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            }
+        };
+        (status, Json(serde_json::json!({ "error": msg }))).into_response()
+    }
+}
+
+impl From<anyhow::Error> for IngestError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Internal(e)
+    }
+}
+
 /// Worker 用的共用密鑰認證（機器對機器，Worker 做不了 WebAuthn）。
 /// 密鑰未設定時相關端點一律停用。
-fn require_mail_secret(st: &Shared, headers: &HeaderMap) -> ApiResult<()> {
+fn require_mail_secret(st: &Shared, headers: &HeaderMap) -> std::result::Result<(), IngestError> {
     if st.cfg.mail_secret.is_empty() {
-        return Err(AppError(anyhow::anyhow!("信件端點未啟用")));
+        tracing::warn!("信件端點未啟用（NFHH_MAIL_SECRET 為空），已回 503 讓 Worker 照 FORWARD_MAP 轉發");
+        return Err(IngestError::Disabled);
     }
     let given = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -1158,9 +1557,21 @@ fn require_mail_secret(st: &Shared, headers: &HeaderMap) -> ApiResult<()> {
             == 0;
     if !ok {
         tracing::warn!("共用密鑰不符，已拒絕");
-        return Err(AppError(anyhow::anyhow!("未授權")));
+        return Err(IngestError::Unauthorized);
     }
     Ok(())
+}
+
+/// 寄件者宣告的日期只當顯示用，而且要夾在合理範圍：保留期之前、一小時之後
+/// 一律改用現在。排序與保留期另外看 `ingested_at`（見 db::migrate_v12）。
+///
+/// 下限跟著保留期走而不是寫死一年：面板只留 `keep_days` 天，卻讓一封剛收到的
+/// 信顯示「300 天前」，是拿自己的 UI 幫寄件者說謊。
+fn clamp_received(claimed: Option<i64>, now: i64, keep_days: i64) -> i64 {
+    match claimed {
+        Some(t) if t <= now + 3600 && t >= now - keep_days * 86400 => t,
+        _ => now,
+    }
 }
 
 /// 接收 Worker 推來的原始信件，並回覆這封要轉給誰。
@@ -1168,16 +1579,24 @@ fn require_mail_secret(st: &Shared, headers: &HeaderMap) -> ApiResult<()> {
 /// Worker 先推這裡、拿到 `forward_to` 才轉發 —— 篩選器的關鍵字要比對內文，
 /// 而只有這裡解析得到內文。
 ///
-/// ⚠️ 這支掛掉不能讓信轉不出去：Worker 逾時或收到非 2xx 會退回 FORWARD_MAP 照送。
+/// ⚠️ 這支掛掉不能讓信轉不出去：Worker 逾時或收到 5xx（含未啟用的 503）會退回
+///    FORWARD_MAP 照送。但 401／422 是拒收，Worker 只會轉給 FALLBACK_TO ——
+///    所以拒絕要拒得準。
 async fn mail_ingest(
     State(st): State<Shared>,
     headers: HeaderMap,
     body: axum::body::Bytes,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> std::result::Result<Json<serde_json::Value>, IngestError> {
     require_mail_secret(&st, &headers)?;
 
-    let p = mail::parse(&body);
-    let verified = p.auth.is_trusted(&st.cfg.mail_allowed_senders);
+    // 任務 6 已修掉已知的 panic；這層是防線：解析器再出問題也只影響這封信，
+    // 而且回的是 422，Worker 會當「拒收」而不是「面板掛了」。
+    let authserv = st.cfg.mail_authserv_id.clone();
+    let p = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mail::parse(&body, &authserv)))
+        .map_err(|_| IngestError::Unprocessable("信件解析失敗".into()))?;
+    // 以面板設定為準：環境變數只是首次啟動的種子（見 seed_settings）。
+    // 以前這裡讀 Config，UI 撤銷的網域會一直被信任到下次重啟。
+    let verified = p.auth.is_trusted(&db::get_setting_list(&st.db, db::keys::SENDER_DOMAINS));
 
     let mailbox = routing_mailbox(&headers, p.recipient.as_deref());
 
@@ -1189,7 +1608,7 @@ async fn mail_ingest(
     let platform = platforms::classify(p.sender.as_deref(), &mailbox, &senders, &mailboxes, &known);
     let skip_reason = p.code.is_none().then_some("未擷取到驗證碼");
 
-    let received = p.date.unwrap_or_else(db::now);
+    let received = clamp_received(p.date, db::now(), st.cfg.mail_keep_days);
     let is_new = db::insert_mail(
         &st.db,
         p.message_id.as_deref(),
@@ -1231,7 +1650,7 @@ async fn mail_ingest(
             "寄件者未通過驗證 mailbox={} {} → {}",
             mailbox,
             p.auth.summary(),
-            if withhold { "已收掉扇出" } else { "觀察期，照常轉發" }
+            if withhold { "未轉發給家人" } else { "觀察期，照常轉發" }
         );
         db::audit(
             &st.db,
@@ -1241,7 +1660,7 @@ async fn mail_ingest(
                 "{} / {} / {}",
                 p.sender.as_deref().unwrap_or("?"),
                 p.auth.summary(),
-                if withhold { "已收掉扇出" } else { "觀察期" }
+                if withhold { "未轉發給家人" } else { "觀察期，照常轉發" }
             )),
             None,
         );
@@ -1273,12 +1692,10 @@ async fn mail_ingest(
     // 通知裡放的是碼本身，所以跟的是**面板顯示**那條規則
     // （`sender_verify_mode`），不是轉發那條 —— 兩者會分岔，跟錯邊就是
     // 「通知有碼、點進面板什麼都沒有」。重送的信不推。
-    let visible = db::get_setting(&st.db, db::keys::SENDER_MODE)?
-        .unwrap_or_else(|| "observe".into())
-        != "enforce"
-        || verified;
+    let mode = db::get_setting(&st.db, db::keys::SENDER_MODE)?
+        .unwrap_or_else(|| "observe".into());
 
-    if is_new && actionable && visible {
+    if is_new && actionable && mode_allows(&mode, Some(verified)) {
         if let Some(pf) = platform.clone() {
             // 背景送，不擋回應。Worker 正在等 forward_to。
             tokio::spawn(push_new_code(st.clone(), pf, p.code.clone()));
@@ -1299,6 +1716,14 @@ async fn mail_ingest(
 }
 
 // ── 推送通知 ──────────────────────────────────────────
+
+/// 一個人實際上有幾台裝置。訂閱永久寫入 SQLite，沒有上限就是免費的磁碟。
+const MAX_PUSH_SUBS_PER_USER: i64 = 8;
+const MAX_ENDPOINT_LEN: usize = 2048;
+/// 同時存在的推送 task 數（也就是同時在飛的連線數）。
+const PUSH_FANOUT_CONCURRENCY: usize = 8;
+/// 整批扇出的總 deadline。每個請求各有 10 秒 timeout，但分輪送時會疊加。
+const PUSH_FANOUT_DEADLINE_SECS: u64 = 60;
 
 /// 把新驗證碼推給有這個平台授權的人。
 ///
@@ -1331,28 +1756,55 @@ async fn push_new_code(st: Shared, platform: String, code: Option<String>) {
 }
 
 /// 送給一組訂閱，順帶清掉已死的。並行送，免得最慢的那台拖住全部。
+///
+/// 並行度有上限，而且限的是**同時存在的 task 數**而不只是同時在飛的連線：
+/// 滿了就先等一個做完再開下一個，幾千筆訂閱不會先變成幾千個 task 排隊。
+/// 整批再套一個 deadline —— 假 endpoint 各自吃滿 10 秒的話，分輪會疊加。
+/// `JoinSet` 隨 `run` 一起被 drop 時會 abort 未完成的 task，逾時之後不會
+/// 留下殘留連線。代價是全都是死 endpoint 時（每輪吃滿 10 秒，60 秒只夠
+/// 6 輪）大約第 48 筆之後就送不到了 —— 由 `fail_count` 把那些訂閱逐出
+/// 扇出來收斂，不是靠把 deadline 調大。
+///
+/// task 的結果一定要收：`join_all` 會把 panic 原地重拋，而呼叫端之一是
+/// `renew_active` 那條長命的迴圈 —— 它被 unwind 掉就再也不會續期。
 async fn fan_out(st: &Shared, subs: Vec<db::PushSub>, n: &push::Notification) {
-    let mut set = tokio::task::JoinSet::new();
-    for sub in subs {
-        let (st, n) = (st.clone(), n.clone());
-        set.spawn(async move {
-            match st.push.send(&st.db, &sub, &n).await {
-                // 訂閱不存在了，當場清掉 —— 留著只會每次都失敗且無法自癒
-                Ok(false) => {
-                    let _ = db::delete_push_sub_by_endpoint(&st.db, &sub.endpoint);
-                    tracing::info!("訂閱已失效，已移除（user={}）", sub.user_id);
-                }
-                Ok(true) => {
-                    let _ = db::mark_push_ok(&st.db, sub.id);
-                }
-                Err(e) => {
-                    let _ = db::bump_push_fail(&st.db, sub.id);
-                    tracing::warn!("推送失敗（user={}）: {e:#}", sub.user_id);
+    let run = async {
+        let mut set = tokio::task::JoinSet::new();
+        for sub in subs {
+            if set.len() >= PUSH_FANOUT_CONCURRENCY {
+                // 滿了就收掉一個再開下一個
+                if let Some(Err(e)) = set.join_next().await {
+                    tracing::warn!("推送 task 異常結束: {e}");
                 }
             }
-        });
+            let (st, n) = (st.clone(), n.clone());
+            set.spawn(async move {
+                match st.push.send(&st.db, &sub, &n).await {
+                    // 訂閱不存在了，當場清掉 —— 留著只會每次都失敗且無法自癒
+                    Ok(false) => {
+                        let _ = db::delete_push_sub_by_endpoint(&st.db, &sub.endpoint);
+                        tracing::info!("訂閱已失效，已移除（user={}）", sub.user_id);
+                    }
+                    Ok(true) => {
+                        let _ = db::mark_push_ok(&st.db, sub.id);
+                    }
+                    Err(e) => {
+                        let _ = db::bump_push_fail(&st.db, sub.id);
+                        tracing::warn!("推送失敗（user={}）: {e:#}", sub.user_id);
+                    }
+                }
+            });
+        }
+        while let Some(r) = set.join_next().await {
+            if let Err(e) = r {
+                tracing::warn!("推送 task 異常結束: {e}");
+            }
+        }
+    };
+    let deadline = std::time::Duration::from_secs(PUSH_FANOUT_DEADLINE_SECS);
+    if tokio::time::timeout(deadline, run).await.is_err() {
+        tracing::warn!("推送扇出超過 {PUSH_FANOUT_DEADLINE_SECS} 秒，剩餘請求已放棄");
     }
-    set.join_all().await;
 }
 
 /// 這封信要扇出給誰。兩個否決條件，任一成立就不轉給家人。
@@ -1381,62 +1833,173 @@ fn routing_mailbox(headers: &HeaderMap, parsed_to: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
+/// `sender_verify_mode` 對一封信的裁決。
+///
+/// `verified` 為 None 是 v5 之前的舊信 —— 那是「無驗證資訊」而不是
+/// 「未通過」，observe 下一樣顯示，只是前端標成灰色而非琥珀色。
+fn mode_allows(mode: &str, verified: Option<bool>) -> bool {
+    match mode {
+        // 未通過的擋掉，只進管理收件匣
+        "enforce" => verified == Some(true),
+        // off：不驗證；observe（預設）：未通過也顯示，前端標琥珀色
+        _ => true,
+    }
+}
+
+/// member 對一封信的可見範圍。清單、單封讀取、刪除三處共用同一條規則 ——
+/// 分開寫過一次，結果是清單看不到的信可以用猜 id 的方式讀到與刪掉。
+struct MailScope {
+    granted: Vec<String>,
+    mode: String,
+    keywords: Vec<String>,
+    excludes: Vec<String>,
+}
+
+impl MailScope {
+    fn load(st: &Shared, uid: &str) -> Result<Self> {
+        Ok(Self {
+            granted: db::platforms_for(&st.db, uid)?,
+            mode: db::get_setting(&st.db, db::keys::SENDER_MODE)?.unwrap_or_else(|| "observe".into()),
+            keywords: db::get_setting_list(&st.db, db::keys::CODE_KEYWORDS),
+            excludes: db::get_setting_list(&st.db, db::keys::CODE_EXCLUDES),
+        })
+    }
+
+    fn allows(
+        &self,
+        platform: Option<&str>,
+        verified: Option<bool>,
+        subject: Option<&str>,
+        body: Option<&str>,
+        has_code: bool,
+    ) -> bool {
+        platform.is_some_and(|p| self.granted.iter().any(|g| g == p))
+            && mode_allows(&self.mode, verified)
+            // 有碼、或命中關鍵字。後者是為了 Netflix 的「暫時存取碼」——
+            // 碼不在信裡而在「取得存取碼」那顆按鈕後面，抽不到數字不代表
+            // 這封信對家人沒用。
+            && mail::is_actionable(subject, body, has_code, &self.keywords, &self.excludes)
+    }
+
+    fn allows_mail(&self, m: &db::Mail) -> bool {
+        self.allows(m.platform.as_deref(), m.verified, m.subject.as_deref(), m.body.as_deref(), m.code.is_some())
+    }
+}
+
+/// 只有「寄件者通過驗證」且「連結 host 落在該平台網域」才准畫品牌按鈕。
+/// 平台是由收件信箱分類的，跟寄件者是誰無關 —— 沒有這道檢查，任何人寄到
+/// netflix@ 信箱的釣魚連結都會穿上 Netflix 的外衣。
+///
+/// host 交給 `url` crate 判讀（跟瀏覽器同一套 WHATWG 規則：`\\` 當 `/`、
+/// host 小寫、IDN 轉 punycode）；帶帳密的 URL 一律拒絕。
+fn brand_link_allowed(verified: Option<bool>, link: &str, domains: &[String]) -> bool {
+    if verified != Some(true) {
+        return false;
+    }
+    let Ok(u) = url::Url::parse(link) else { return false };
+    if u.scheme() != "https" || !u.username().is_empty() || u.password().is_some() {
+        return false;
+    }
+    let Some(host) = u.host_str() else { return false };
+    // `.netflix.com` 會過 ends_with 檢查、卡片卻印出一個前導點；尾點是另一個 origin。
+    // 兩種都不是平台會寄的連結，直接拒絕。
+    if host.starts_with('.') || host.ends_with('.') {
+        return false;
+    }
+    domains.iter().any(|d| host == d || host.ends_with(&format!(".{d}")))
+}
+
+/// 不合格就把 `primary_link` 拿掉。清單與單封走的是兩條程式路徑，判斷式只寫這一份。
+fn withhold_unbranded(link: &mut Option<String>, verified: Option<bool>, domains: &[String]) {
+    if link.as_deref().is_some_and(|l| !brand_link_allowed(verified, l, domains)) {
+        *link = None;
+    }
+}
+
+/// 對一批摘要套用 `brand_link_allowed`，不合格的把 `primary_link` 拿掉。
+fn strip_unbranded_links(st: &Shared, mails: &mut [db::MailSummary]) {
+    let mut cache: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for m in mails.iter_mut() {
+        if m.primary_link.is_none() {
+            continue;
+        }
+        let code = m.platform.clone().unwrap_or_default();
+        let domains = cache
+            .entry(code.clone())
+            .or_insert_with(|| platforms::domains(&st.cfg.domain_set_dir, &code));
+        withhold_unbranded(&mut m.primary_link, m.verified, domains);
+    }
+}
+
 /// 驗證碼分頁的內容。
 ///
-/// 兩層過濾，順序不能顛倒：
-///   1. **平台分權** —— 沒有這個平台的人看不到它的驗證碼。認不出平台的信
-///      （`platform` 為 None）誰都看不到，只留在管理收件匣。
-///   2. **可用性** —— 有碼、或命中「驗證碼篩選器」的關鍵字。
-///   3. **顯示策略** —— 由 `sender_verify_mode` 決定未通過寄件者驗證的信
-///      要不要出現在這裡（見 db::keys::SENDER_MODE 的說明）。
+/// 能不能看到一封信由 [`MailScope`] 說了算 —— 平台分權、顯示策略、可用性
+/// 三個條件都寫在那裡，清單與刪除共用同一份。這支只負責取最近的信、
+/// 套上那條規則、截成一頁。
 ///
 /// admin 想看全部要去管理的收件匣，那支端點是另一條路徑。
-async fn mail_list(State(st): State<Shared>, session: Session) -> ApiResult<Json<Vec<db::Mail>>> {
+///
+/// 回的是摘要（[`db::MailSummary`]）而不是全文：這支每 20 秒被每個開著的
+/// 分頁輪詢一次，body / html / links 一起送等於讓寄件者決定要吃多少流量。
+/// 全文走 [`mail_get`]，點開原始信件時才拿一封。
+async fn mail_list(
+    State(st): State<Shared>,
+    session: Session,
+) -> ApiResult<Json<Vec<db::MailSummary>>> {
     let (uid, _) = require_user(&st, &session).await?;
     let _ = db::purge_old_mails(&st.db, st.cfg.mail_keep_days);
 
-    let granted = db::platforms_for(&st.db, &uid)?;
-    let mode = db::get_setting(&st.db, db::keys::SENDER_MODE)?
-        .unwrap_or_else(|| "observe".into());
-    let keywords = db::get_setting_list(&st.db, db::keys::CODE_KEYWORDS);
-    let excludes = db::get_setting_list(&st.db, db::keys::CODE_EXCLUDES);
-
-    let mails = db::recent_mails(&st.db, 60)?
+    let scope = MailScope::load(&st, &uid)?;
+    let mut mails: Vec<_> = db::recent_mail_summaries(&st.db, Some(&scope.granted), 60)?
         .into_iter()
-        .filter(|m| m.platform.as_deref().is_some_and(|p| granted.iter().any(|g| g == p)))
-        // 有碼、或命中關鍵字。後者是為了 Netflix 的「暫時存取碼」——
-        // 碼不在信裡而在「取得存取碼」那顆按鈕後面，抽不到數字不代表
-        // 這封信對家人沒用。
         .filter(|m| {
-            mail::is_actionable(
+            scope.allows(
+                m.platform.as_deref(),
+                m.verified,
                 m.subject.as_deref(),
                 m.body.as_deref(),
                 m.code.is_some(),
-                &keywords,
-                &excludes,
             )
-        })
-        .filter(|m| match mode.as_str() {
-            // 不驗證，全部當通過
-            "off" => true,
-            // 未通過的擋掉，只進管理收件匣
-            "enforce" => m.verified == Some(true),
-            // 觀察期（預設）：未通過的照樣顯示，由前端標成琥珀色。
-            // verified 為 None 是 v5 之前的舊信，那是「無驗證資訊」不是
-            // 「未通過」—— 一樣顯示，灰色。
-            _ => true,
         })
         .take(30)
         .collect();
+    strip_unbranded_links(&st, &mut mails);
 
     Ok(Json(mails))
 }
 
 /// 管理收件匣：不做平台過濾也不做驗證過濾，什麼都看得到。
 /// 這是 admin 診斷「為什麼某封信沒出現在驗證碼分頁」的地方（設計 1n）。
-async fn mail_inbox(State(st): State<Shared>, session: Session) -> ApiResult<Json<Vec<db::Mail>>> {
+async fn mail_inbox(
+    State(st): State<Shared>,
+    session: Session,
+) -> ApiResult<Json<Vec<db::MailSummary>>> {
     require_admin(&st, &session).await?;
-    Ok(Json(db::recent_mails(&st.db, 60)?))
+    let mut mails = db::recent_mail_summaries(&st.db, None, 60)?;
+    // admin 也不該看到假品牌按鈕 —— 這支是診斷用的，越是要照實呈現
+    strip_unbranded_links(&st, &mut mails);
+    Ok(Json(mails))
+}
+
+/// 全文的唯一出口。授權跟清單、刪除同一個 [`MailScope`] ——
+/// 分開寫的話，清單看不到的信可以用猜 id 的方式讀到。
+async fn mail_get(
+    State(st): State<Shared>,
+    session: Session,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<db::Mail>> {
+    let (uid, _) = require_user(&st, &session).await?;
+    let me = db::get_user(&st.db, &uid)?.context("帳號已不存在")?;
+    let mut m = db::get_mail(&st.db, id)?.context("查無此信件")?;
+    if !admin_powers(&session, &me).await && !MailScope::load(&st, &uid)?.allows_mail(&m) {
+        // 不分辨「不存在」與「不是你的」：不給枚舉 id 的人存在性 oracle
+        return Err(AppError(anyhow::anyhow!("查無此信件")));
+    }
+    if m.primary_link.is_some() {
+        let domains = platforms::domains(&st.cfg.domain_set_dir, m.platform.as_deref().unwrap_or(""));
+        withhold_unbranded(&mut m.primary_link, m.verified, &domains);
+    }
+    Ok(Json(m))
 }
 
 async fn mail_delete(
@@ -1444,8 +2007,15 @@ async fn mail_delete(
     session: Session,
     Path(id): Path<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    require_user(&st, &session).await?;
-    Ok(Json(serde_json::json!({ "ok": db::delete_mail(&st.db, id)? > 0 })))
+    let (uid, _) = require_user(&st, &session).await?;
+    let me = db::get_user(&st.db, &uid)?.context("帳號已不存在")?;
+    let n = if admin_powers(&session, &me).await {
+        db::delete_mail_if(&st.db, id, |_| true)?
+    } else {
+        let scope = MailScope::load(&st, &uid)?;
+        db::delete_mail_if(&st.db, id, |m| scope.allows_mail(m))?
+    };
+    Ok(Json(serde_json::json!({ "ok": n > 0 })))
 }
 
 /// 「全部刪除」。限管理員 —— 這會清掉所有人的驗證碼，
@@ -2029,6 +2599,24 @@ struct SubscribeReq {
     label: Option<String>,
 }
 
+/// 推送 endpoint 的形狀（報告 #6）。真的推送服務（FCM／Apple／Mozilla）
+/// 都是「https 網域、443、沒有 userinfo」，這裡把不長那樣的都擋掉：
+/// IP 字面值跟非 443 埠是拿面板去戳內網服務的形狀，`user@host` 是拿來
+/// 騙眼睛的形狀（`https://fcm.googleapis.com@10.0.0.1/`）。`localhost`
+/// 是 `Host::Domain` 但解到自己，也不收。
+fn valid_push_endpoint(s: &str) -> bool {
+    let Ok(u) = Url::parse(s) else { return false };
+    let Some(url::Host::Domain(host)) = u.host() else { return false };
+    // `localhost.`（尾端點）是合法的 FQDN 寫法，解到的還是自己
+    let host = host.trim_end_matches('.');
+    u.scheme() == "https"
+        && u.username().is_empty()
+        && u.password().is_none()
+        && u.port_or_known_default() == Some(443)
+        && host != "localhost"
+        && !host.ends_with(".localhost")
+}
+
 async fn push_subscribe(
     State(st): State<Shared>,
     session: Session,
@@ -2036,22 +2624,33 @@ async fn push_subscribe(
 ) -> ApiResult<Json<serde_json::Value>> {
     let (uid, _) = require_user(&st, &session).await?;
 
-    // endpoint 決定面板往哪裡送 POST。推送服務一律是 https。
-    if !req.endpoint.starts_with("https://") {
-        return Err(AppError(anyhow::anyhow!("推送 endpoint 必須是 https")));
+    // endpoint 決定面板往哪裡送 POST。推送服務一律是 https，而且這個字串
+    // 會永久留在資料庫裡 —— 沒有長度上限就是讓人免費寫磁碟。
+    let endpoint = req.endpoint.trim();
+    if !endpoint.starts_with("https://") || endpoint.len() > MAX_ENDPOINT_LEN {
+        return Err(AppError(anyhow::anyhow!(
+            "推送 endpoint 必須是 https 且不超過 {MAX_ENDPOINT_LEN} 字元"
+        )));
     }
-    if req.p256dh.trim().is_empty() || req.auth.trim().is_empty() {
-        return Err(AppError(anyhow::anyhow!("缺少加密金鑰材料")));
+    if !valid_push_endpoint(endpoint) {
+        return Err(AppError(anyhow::anyhow!(
+            "推送 endpoint 只能是 https 網域、標準 443 埠、不帶帳號密碼"
+        )));
     }
+    // 非空不等於能用：金鑰材料要真的解得開、p256dh 要在曲線上，
+    // 否則存進去的是一筆每次扇出都在送出前就失敗的垃圾。
+    let (p256dh, auth) = (req.p256dh.trim(), req.auth.trim());
+    if !push::valid_keys(p256dh, auth) {
+        return Err(AppError(anyhow::anyhow!("加密金鑰材料格式不正確")));
+    }
+    let label = req.label.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    check_label_len(label)?;
 
-    db::add_push_sub(
-        &st.db,
-        &uid,
-        &req.endpoint,
-        req.p256dh.trim(),
-        req.auth.trim(),
-        req.label.as_deref().map(str::trim).filter(|s| !s.is_empty()),
-    )?;
+    if !db::add_push_sub(&st.db, &uid, endpoint, p256dh, auth, label, MAX_PUSH_SUBS_PER_USER)? {
+        return Err(AppError(anyhow::anyhow!(
+            "這個帳號的裝置訂閱已達上限（{MAX_PUSH_SUBS_PER_USER} 台），請先移除不用的"
+        )));
+    }
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -2186,56 +2785,9 @@ async fn passkey_rename(
 ) -> ApiResult<Json<serde_json::Value>> {
     let (uid, _) = require_user(&st, &session).await?;
     let label = req.label.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    check_label_len(label)?;
     let n = db::rename_credential(&st.db, &uid, &id, label)?;
     Ok(Json(serde_json::json!({ "ok": n > 0 })))
-}
-
-// ── 補填 Email（v6 遷移用）────────────────────────────
-
-/// 讓 v6 之前註冊的帳號補上自己的信箱。
-///
-/// 那些帳號的 `email` 是 NULL，而面板現在一律以信箱稱呼使用者、
-/// 平台授權與轉發也都靠它。沒有這條路徑的話舊帳號會卡在半途 ——
-/// 登得進來，但畫面上顯示的是舊的 username。
-///
-/// 只能設定**自己的**，而且只能設定一次（已經有信箱的要換得走別的流程，
-/// 目前沒有 —— 換信箱牽涉到重新驗證，不是這支端點該做的事）。
-async fn set_my_email(
-    State(st): State<Shared>,
-    session: Session,
-    headers: HeaderMap,
-    Json(req): Json<EmailReq>,
-) -> ApiResult<Json<serde_json::Value>> {
-    let (uid, _) = require_user(&st, &session).await?;
-    let me = db::get_user(&st.db, &uid)?.context("帳號已不存在")?;
-    if me.email.is_some() {
-        return Err(AppError(anyhow::anyhow!("這個帳號已經有信箱了")));
-    }
-
-    let email = req.email.trim().to_lowercase();
-    if !email.contains('@') {
-        return Err(AppError(anyhow::anyhow!("請輸入完整的 Email 位址")));
-    }
-    if db::find_user_by_email(&st.db, &email)?.is_some() {
-        return Err(AppError(anyhow::anyhow!("這個位址已經被別的帳號用了")));
-    }
-
-    db::set_user_email(&st.db, &uid, &email)?;
-    // 白名單的擁有者標記存的是稱呼不是 id，稱呼變了要一起搬 ——
-    // 否則這個人既有的條目會變成「不是我的」，額度也會跟著歸零。
-    let moved = db::rename_owner(&st.db, &me.username, &email)?;
-    session.insert(S_NAME, &email).await?;
-    if moved > 0 {
-        tracing::info!("補填 email 後，{moved} 筆白名單條目的擁有者標記已一併更新");
-    }
-    db::audit(
-        &st.db,
-        Some(&email),
-        "email_backfilled",
-        Some(&me.username),
-        client_ip(&headers).as_deref(),
-    );
-    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 // ── 面板設定（僅管理員）───────────────────────────────
@@ -2750,6 +3302,19 @@ fn seed_platform_mailboxes(db: &db::Db, cfg: &Config) {
     let _ = db::set_setting_str_map(db, db::keys::PLATFORM_MAILBOXES, &boxes, None);
 }
 
+/// 環境變數只是**種子**：面板改過的設定不該被下一次重啟蓋回去，所以一律
+/// 只在鍵不存在時寫入。測試的 state 也要走這裡，否則 ingest 讀到空清單。
+fn seed_settings(db: &db::Db, cfg: &Config) {
+    let _ = db::seed_setting(db, db::keys::SENDER_MODE, if cfg.mail_enforce_sender { "enforce" } else { "observe" });
+    let _ = db::set_setting_list_if_absent(db, db::keys::SENDER_DOMAINS, &cfg.mail_allowed_senders);
+    let _ = db::set_setting_list_if_absent(db, db::keys::CODE_KEYWORDS, &[]);
+    let _ = db::set_setting_list_if_absent(db, db::keys::CODE_EXCLUDES, &[]);
+    // 預設只轉發通過寄件者驗證的信
+    let _ = db::seed_setting(db, db::keys::FORWARD_ENFORCE, "1");
+    let _ = db::seed_setting(db, db::keys::MAIL_DOMAIN, &cfg.mail_domain);
+    seed_platform_mailboxes(db, cfg);
+}
+
 /// 排除私有／保留位址。
 fn is_public(ip: &IpAddr) -> bool {
     match ip {
@@ -2851,8 +3416,8 @@ fn routes(state: Shared) -> Router {
         .route("/api/register/finish", post(register_finish))
         .route("/api/login/any/start", post(login_any_start))
         .route("/api/login/any/finish", post(login_any_finish))
-        .route("/api/login/start", post(login_start))
-        .route("/api/login/finish", post(login_finish))
+        .route("/api/login/otp/start", post(login_otp_start))
+        .route("/api/login/otp/verify", post(login_otp_verify))
         .route("/api/logout", post(logout))
         .route("/api/allow", post(allow_add))
         .route("/api/allow/{ip}", delete(allow_remove).post(allow_rename))
@@ -2860,7 +3425,6 @@ fn routes(state: Shared) -> Router {
         .route("/api/allow/{ip}/queries", get(allow_queries))
         .route("/api/audit", get(audit_list))
         .route("/api/settings", get(settings_get).put(settings_put))
-        .route("/api/me/email", post(set_my_email))
         .route("/api/passkeys", get(passkey_list))
         .route("/api/push/key", get(push_key))
         .route("/api/push/subs", get(push_list).post(push_subscribe))
@@ -2884,7 +3448,7 @@ fn routes(state: Shared) -> Router {
         )
         .route("/api/mail", get(mail_list).delete(mail_delete_all))
         .route("/api/mail/inbox", get(mail_inbox))
-        .route("/api/mail/{id}", delete(mail_delete))
+        .route("/api/mail/{id}", get(mail_get).delete(mail_delete))
         .route("/api/recipients", get(recipient_list).post(recipient_add))
         .route("/api/recipients/{id}", delete(recipient_remove))
         .route("/api/recipients/{id}/enabled", post(recipient_toggle))
@@ -2894,8 +3458,10 @@ fn routes(state: Shared) -> Router {
         .route("/api/invite", post(invite_create).get(invite_list))
         .route("/api/invite/{email}", delete(invite_revoke))
         .layer(
-            SessionManagerLayer::new(MemoryStore::default())
-                .with_name("nfhh_session")
+            // `__Host-` 前綴：瀏覽器只接受 Secure、Path=/、不帶 Domain 的
+            // 設定，子網域（或同機其他服務）寫不進這個名字的 cookie。
+            SessionManagerLayer::new(state.sessions.clone())
+                .with_name("__Host-nfhh_session")
                 .with_secure(true)
                 .with_http_only(true),
         )
@@ -2933,6 +3499,18 @@ async fn main() -> Result<()> {
 
     nft::preflight()?;
     let db = db::open(&cfg.db_path)?;
+
+    // v6 遷移路徑（補填 Email、username 登入）已移除。這種帳號仍然可以用
+    // 可探索登入進來，只是不能用 Email 登入、也對不上平台分權與轉發。
+    match db::users_without_email(&db) {
+        Ok(list) if !list.is_empty() => tracing::error!(
+            "{} 個帳號沒有 email（{}）：無法用 Email 登入，面板會以舊 username 稱呼；請刪除後重新邀請",
+            list.len(),
+            list.join(", ")
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("檢查缺 email 的帳號失敗: {e:#}"),
+    }
 
     // 還沒有任何使用者時，發一組一次性註冊碼並印在日誌
     if db::user_count(&db)? == 0 && !db::has_unused_bootstrap(&db)? {
@@ -2999,14 +3577,32 @@ async fn main() -> Result<()> {
         Err(e) => tracing::error!("白名單同步失敗: {e:#}"),
     }
 
+    // session store 在這裡建、不在 `routes` 裡建：下面的背景工作要拿同一份去掃。
+    let sessions = BoundedMemoryStore::new(SESSION_STORE_MAX);
+
     // 背景工作：定期清除過期條目並重新同步
     {
         let db = db.clone();
         let path = cfg.clients_nft.clone();
+        let sessions = sessions.clone();
+        // cfg 稍後會被搬進 AppState，先把要用的兩個數字抄走
+        let (keep, max) = (cfg.audit_keep_days, cfg.audit_max_rows);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
             loop {
                 tick.tick().await;
+                match db::purge_old_audit(&db, keep, max) {
+                    Ok(n) if n > 0 => tracing::debug!("清掉 {n} 列逾期或超量的稽核"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("清理稽核失敗: {e:#}"),
+                }
+                // 過期 session 掛在既有的 5 分鐘 tick 上，不另開 60 秒的工作：
+                // 上限本身已經守住記憶體，`load` 也會順手刪過期的，這裡只是
+                // 把沒人再碰的匿名紀錄收走，五分鐘跟一分鐘沒有差別。
+                let swept = sessions.sweep();
+                if swept > 0 {
+                    tracing::debug!("清掉 {swept} 筆過期 session，剩 {}", sessions.len());
+                }
                 if let Err(e) = nft::sync(&db, &path) {
                     tracing::error!("定期同步失敗: {e:#}");
                 }
@@ -3014,20 +3610,10 @@ async fn main() -> Result<()> {
         });
     }
 
-    // 環境變數只是**種子**：面板改過的設定不該被下一次重啟蓋回去。
-    // 所以這裡一律用 seed_setting（僅在鍵不存在時寫入）。
-    let _ = db::seed_setting(
-        &db,
-        db::keys::SENDER_MODE,
-        if cfg.mail_enforce_sender { "enforce" } else { "observe" },
-    );
-    let _ = db::set_setting_list_if_absent(&db, db::keys::SENDER_DOMAINS, &cfg.mail_allowed_senders);
-    let _ = db::set_setting_list_if_absent(&db, db::keys::CODE_KEYWORDS, &[]);
-    let _ = db::set_setting_list_if_absent(&db, db::keys::CODE_EXCLUDES, &[]);
-    // 預設只轉發通過寄件者驗證的信
-    let _ = db::seed_setting(&db, db::keys::FORWARD_ENFORCE, "1");
-    let _ = db::seed_setting(&db, db::keys::MAIL_DOMAIN, &cfg.mail_domain);
-    seed_platform_mailboxes(&db, &cfg);
+    seed_settings(&db, &cfg);
+
+    // 寄件者驗證的信任根。印出來，部署後的 canary 才有東西可以對照。
+    tracing::info!("寄件者驗證只採信 authserv-id = {}", cfg.mail_authserv_id);
 
     let mailer = mailer::Mailer::new(
         cfg.resend_key.clone(),
@@ -3047,7 +3633,21 @@ async fn main() -> Result<()> {
     }
 
     let push = push::Push::new(&cfg.mail_from);
-    let state = Arc::new(AppState { db, webauthn, cfg, mailer, cf, push, dns: dns.clone() });
+    let state = Arc::new(AppState {
+        db,
+        webauthn,
+        cfg,
+        mailer,
+        cf,
+        push,
+        dns: dns.clone(),
+        join_limiter: ratelimit::Limiter::new(
+            JOIN_LIMIT_WINDOW_SECS,
+            JOIN_LIMIT_PER_IP,
+            JOIN_LIMIT_GLOBAL,
+        ),
+        sessions,
+    });
 
     // 背景工作：tail smartdns 稽核檔，餵查詢視窗
     tokio::spawn(dnslog::tail(dns, audit_path));
@@ -3067,6 +3667,9 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // push::B64 的 encode 要有 Engine 這個 trait 在作用域裡
+    use base64::Engine as _;
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
 
     /// 描述檔識別碼是 reverse-DNS，且不含任何寫死的網域。
     #[test]
@@ -3202,10 +3805,8 @@ mod tests {
                 ("authorization", "Bearer s3cret"),
                 ("x-nfhh-mailbox", "netflix@share.example.com"),
             ]);
-            // AppError 沒有 Debug，剝一層再 unwrap
             let out = mail_ingest(State(st.clone()), h, eml(subject, body, id))
                 .await
-                .map_err(|e| e.0)
                 .unwrap()
                 .0;
 
@@ -3238,12 +3839,179 @@ mod tests {
         ]);
         let out = mail_ingest(State(st.clone()), h, eml("關於同戶裝置", "說明。", "x1"))
             .await
-            .map_err(|e| e.0)
             .unwrap()
             .0;
 
         assert_eq!(out["actionable"], false);
         assert_eq!(db::recent_mails(&st.db, 60).unwrap().len(), 1, "信要留在管理收件匣");
+    }
+
+    /// Worker 要分得出「拒收」與「面板掛了」。以前兩者都是 400，Worker 只能
+    /// 一律走 fail-open 的 FORWARD_MAP，拒收的信反而被無過濾轉發。
+    #[tokio::test]
+    async fn ingest_errors_carry_a_status_the_worker_can_classify() {
+        let mut cfg = Config::from_env().unwrap();
+        cfg.mail_secret = "s3cret".into();
+        let st = state_with(cfg);
+
+        let err = mail_ingest(State(st), hdrs(&[("authorization", "Bearer nope")]), eml("x", "y", "e1"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.into_response().status(), StatusCode::UNAUTHORIZED);
+
+        // 密鑰留空是「面板刻意不收信」，不是拒收 —— 回 5xx，Worker 才會照
+        // FORWARD_MAP 轉發，而不是把家人的碼收掉。
+        let mut off = Config::from_env().unwrap();
+        off.mail_secret = String::new();
+        let err = mail_ingest(
+            State(state_with(off)),
+            hdrs(&[("authorization", "Bearer anything")]),
+            eml("x", "y", "e2"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.into_response().status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        assert_eq!(
+            IngestError::Unprocessable("壞信".into()).into_response().status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            IngestError::Internal(anyhow::anyhow!("db")).into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    /// 管理介面存的是 DB，ingest 以前讀的是啟動時的環境變數 —— 兩個權威來源。
+    /// UI 移除的網域必須立刻失效，新增的必須立刻生效，不需要重啟。
+    #[tokio::test]
+    async fn sender_domains_edited_in_the_panel_take_effect_immediately() {
+        let mut cfg = Config::from_env().unwrap();
+        cfg.mail_secret = "s3cret".into();
+        let st = state_with(cfg);
+        let h = || hdrs(&[("authorization", "Bearer s3cret"), ("x-nfhh-mailbox", "netflix@share.example.com")]);
+        let ingest = |id: &'static str| {
+            let st = st.clone();
+            async move {
+                mail_ingest(State(st), h(), eml("code", "code 123456", id)).await.unwrap().0
+            }
+        };
+
+        db::set_setting_list(&st.db, db::keys::SENDER_DOMAINS, &["example.org".into()], None).unwrap();
+        assert_eq!(ingest("d1").await["verified"], false, "UI 移除 netflix.com 後要立刻不信任");
+
+        db::set_setting_list(&st.db, db::keys::SENDER_DOMAINS, &["netflix.com".into()], None).unwrap();
+        assert_eq!(ingest("d2").await["verified"], true);
+    }
+
+    /// 刪除是全域硬刪，規則必須跟清單一模一樣：同平台但清單看不到的信
+    /// （非驗證碼信、enforce 下未通過的信）也不能靠猜 id 刪掉。
+    #[tokio::test]
+    async fn members_can_only_delete_mail_they_could_see() {
+        let st = test_state();
+        db::create_user_with_platforms(&st.db, "m", "m@x", "m@x", "member", Some("m@x"), &["netflix".into()]).unwrap();
+        let ins = |id: &str, pf: Option<&str>, subject: &str, code: Option<&str>| {
+            db::insert_mail(&st.db, Some(id), db::now(), None, None, Some(subject), code, None, None, &[], true, pf, None).unwrap()
+        };
+        ins("n", Some("netflix"), "code", Some("123456")); // 看得到
+        ins("ad", Some("netflix"), "新片上架", None); // 同平台但不是驗證碼信：清單看不到
+        ins("d", Some("disneyplus"), "code", Some("111111")); // 別的平台
+        ins("x", None, "diag", None); // 管理診斷
+        let ids: Vec<i64> = db::recent_mails(&st.db, 10).unwrap().into_iter().map(|m| m.id).collect();
+
+        let session = test_session();
+        session.insert(S_USER, &"m".to_string()).await.unwrap();
+        session.insert(S_NAME, &"m@x".to_string()).await.unwrap();
+        let mut deleted = 0;
+        for id in &ids {
+            let out = mail_delete(State(st.clone()), session.clone(), Path(*id)).await.map_err(|e| e.0).unwrap().0;
+            if out["ok"] == true {
+                deleted += 1;
+            }
+        }
+        assert_eq!(deleted, 1, "只有清單看得到的那封能刪");
+
+        // 只數數量的話，規則整個反過來也會通過 —— 得指認活下來的是哪三封。
+        let left = db::recent_mails(&st.db, 10).unwrap();
+        assert_eq!(left.len(), 3);
+        assert!(
+            left.iter().all(|m| m.code.as_deref() != Some("123456")),
+            "被刪的必須是 netflix 那封驗證碼信"
+        );
+        let mut subjects: Vec<&str> = left.iter().filter_map(|m| m.subject.as_deref()).collect();
+        subjects.sort_unstable();
+        assert_eq!(subjects, ["code", "diag", "新片上架"], "留下的是清單看不到的那三封");
+    }
+
+    /// 單封端點是全文的唯一出口，授權要跟清單一模一樣（同一個 MailScope）。
+    #[tokio::test]
+    async fn mail_detail_reapplies_the_list_scope() {
+        let st = test_state();
+        db::create_user_with_platforms(&st.db, "m", "m@x", "m@x", "member", Some("m@x"), &["netflix".into()]).unwrap();
+        let ins = |id: &str, pf: &str, subject: &str, code: Option<&str>, verified: bool| {
+            db::insert_mail(&st.db, Some(id), db::now(), None, None, Some(subject), code, None, None, &[], verified, Some(pf), None).unwrap()
+        };
+        ins("n", "netflix", "code", Some("123456"), false);
+        ins("ad", "netflix", "新片上架", None, true);
+        ins("d", "disneyplus", "code", Some("111111"), true);
+        // 兩封的主旨都是 code —— key 要連平台一起，否則查到的是別人平台那封
+        let ids: std::collections::BTreeMap<(String, String), i64> = db::recent_mails(&st.db, 10)
+            .unwrap()
+            .into_iter()
+            .map(|m| ((m.platform.unwrap(), m.subject.unwrap()), m.id))
+            .collect();
+        let id = |pf: &str, subject: &str| ids[&(pf.to_string(), subject.to_string())];
+
+        let session = test_session();
+        session.insert(S_USER, &"m".to_string()).await.unwrap();
+        session.insert(S_NAME, &"m@x".to_string()).await.unwrap();
+        let get = |id: i64| {
+            let (st, s) = (st.clone(), session.clone());
+            async move { mail_get(State(st), s, Path(id)).await.map_err(|e| e.0) }
+        };
+
+        let full = get(id("netflix", "code")).await.expect("自己平台、observe 模式：看得到");
+        assert_eq!(full.0.code.as_deref(), Some("123456"), "單封回的是全文那顆 Mail");
+        assert!(
+            get(id("netflix", "新片上架")).await.is_err(),
+            "同平台但清單看不到的信，單封也看不到"
+        );
+        assert!(get(id("disneyplus", "code")).await.is_err(), "別的平台");
+
+        db::set_setting(&st.db, db::keys::SENDER_MODE, "enforce", None).unwrap();
+        assert!(get(id("netflix", "code")).await.is_err(), "enforce 下未通過驗證的信不給看");
+    }
+
+    /// admin 走的是繞過 [`MailScope`] 的那條分支：收件匣列得出來的信
+    /// —— 認不出平台的、別人平台的 —— 點「原始信件」也必須拿得到全文，
+    /// 否則診斷頁上有列表卻讀不到內容。
+    #[tokio::test]
+    async fn admins_read_every_mail_the_inbox_lists() {
+        let st = test_state();
+        db::create_user_with_platforms(&st.db, "a", "a@x", "a@x", "admin", Some("a@x"), &[]).unwrap();
+        let ins = |id: &str, pf: Option<&str>, subject: &str| {
+            db::insert_mail(&st.db, Some(id), db::now(), None, None, Some(subject), None, None, None, &[], true, pf, None).unwrap()
+        };
+        ins("u", None, "認不出平台"); // 只在管理收件匣出現
+        ins("d", Some("disneyplus"), "別人的平台");
+
+        let session = test_session();
+        session.insert(S_USER, &"a".to_string()).await.unwrap();
+        session.insert(S_NAME, &"a@x".to_string()).await.unwrap();
+        session.insert(S_AUTH_VIA, AUTH_VIA_PASSKEY).await.unwrap();
+
+        // 這位 admin 一個平台都沒被授權 —— 讀得到就證明走的是 admin 分支，
+        // 不是碰巧通過了 MailScope
+        assert!(db::platforms_for(&st.db, "a").unwrap().is_empty());
+        let listed = mail_inbox(State(st.clone()), session.clone()).await.map_err(|e| e.0).unwrap().0;
+        assert_eq!(listed.len(), 2, "收件匣兩封都列得出來");
+        for m in listed {
+            let got = mail_get(State(st.clone()), session.clone(), Path(m.id))
+                .await
+                .map_err(|e| e.0)
+                .unwrap_or_else(|e| panic!("admin 讀不到「{:?}」：{e}", m.subject));
+            assert_eq!(got.0.id, m.id);
+        }
     }
 
     /// 邀請連結兌換之後，接上的是跟驗證碼**完全一樣**的那道關卡 ——
@@ -3259,7 +4027,7 @@ mod tests {
         let redeem = |t: String| {
             let st = st.clone();
             async move {
-                join_invite(State(st), hdrs(&[]), Json(InviteTokenReq { token: t }))
+                join_invite(State(st), test_session(), hdrs(&[]), Json(InviteTokenReq { token: t }))
                     .await
                     .map_err(|e| e.0)
             }
@@ -3269,7 +4037,7 @@ mod tests {
         assert_eq!(out.email, "mei@example.com");
         assert_eq!(out.platforms, vec!["netflix"], "畫面要講明註冊完會拿到什麼");
         assert!(
-            db::otp_recently_verified(&st.db, "mei@example.com", otp::VERIFIED_WINDOW_SECS).unwrap(),
+            db::otp_recently_verified(&st.db, "mei@example.com", db::OTP_JOIN, otp::VERIFIED_WINDOW_SECS).unwrap(),
             "註冊那關讀的是這個旗標"
         );
 
@@ -3280,6 +4048,106 @@ mod tests {
         // 註冊完成之後，同一條連結不能再換第二個帳號
         db::consume_invited_email(&st.db, "mei@example.com", "u1").unwrap();
         assert!(redeem(token).await.is_err());
+    }
+
+    /// 驗證碼／邀請連結證明的是「這個瀏覽器的人擁有信箱」，證明不能被
+    /// 另一個瀏覽器拿去用 —— 否則攻擊者只要等真正持有人驗證完就能搶先建帳號。
+    #[tokio::test]
+    async fn email_proof_is_bound_to_the_session_that_earned_it() {
+        let st = test_state();
+        // 面板上得先有人（是 admin 發的邀請），否則 `register_start` 會走
+        // 「建立第一個帳號」那條路，根本碰不到信箱驗證這道關卡。
+        db::create_user_with_platforms(&st.db, "admin", "admin@x", "admin@x", "admin", Some("admin@x"), &[]).unwrap();
+        db::invite_email(&st.db, "mei@example.com", "admin", &[]).unwrap();
+        let token = invite::generate();
+        db::set_invite_token(&st.db, "mei@example.com", &invite::hash(&st.db, &token).unwrap()).unwrap();
+        // 另一位也被邀請的人 —— 他手上會有一份**別的信箱**的證明
+        db::invite_email(&st.db, "yu@example.com", "admin", &[]).unwrap();
+        let other = invite::generate();
+        db::set_invite_token(&st.db, "yu@example.com", &invite::hash(&st.db, &other).unwrap()).unwrap();
+
+        let redeem = |s: Session, t: String| {
+            let st = st.clone();
+            async move {
+                let _ = join_invite(State(st), s, hdrs(&[]), Json(InviteTokenReq { token: t }))
+                    .await
+                    .map_err(|e| e.0)
+                    .unwrap();
+            }
+        };
+        let victim = test_session();
+        let neighbour = test_session();
+        redeem(victim.clone(), token).await;
+        redeem(neighbour.clone(), other).await;
+
+        let start = |s: Session| {
+            let st = st.clone();
+            async move {
+                register_start(
+                    State(st), s, hdrs(&[]),
+                    Json(RegisterStart { email: Some("mei@example.com".into()), bootstrap_token: None, nickname: None }),
+                )
+                .await
+                .map_err(|e| e.0)
+            }
+        };
+
+        let err = start(test_session()).await.unwrap_err();
+        assert!(err.to_string().contains("在這個瀏覽器"), "拿到的訊息是：{err}");
+
+        // 證明不是「有沒有」而是「是哪個信箱」：換過另一個位址的 session
+        // 一樣進不來，否則把檢查放寬成「有證明就好」也能矇混過去。
+        let err = start(neighbour).await.unwrap_err();
+        assert!(err.to_string().contains("在這個瀏覽器"), "拿到的訊息是：{err}");
+
+        let _ = start(victim).await.expect("驗證過的那個 session 要能拿到 challenge");
+    }
+
+    /// 邀請連結那條路綁定了，驗證碼這條路也要 —— 兩支端點是同一道關卡的
+    /// 兩個入口，只補其中一個等於沒補。
+    #[tokio::test]
+    async fn email_proof_from_a_code_is_bound_to_the_session_too() {
+        let st = test_state();
+        // 同上：面板上先有人，`register_start` 才會走到信箱驗證那一關。
+        db::create_user_with_platforms(&st.db, "admin", "admin@x", "admin@x", "admin", Some("admin@x"), &[]).unwrap();
+        db::invite_email(&st.db, "mei@example.com", "admin", &[]).unwrap();
+        db::put_otp(
+            &st.db,
+            "mei@example.com",
+            db::OTP_JOIN,
+            &otp::hash(&st.db, "mei@example.com", "482913").unwrap(),
+            otp::TTL_SECS,
+        )
+        .unwrap();
+
+        // 收到碼的人在自己的瀏覽器輸入它
+        let victim = test_session();
+        let out = join_verify(
+            State(st.clone()), victim.clone(), hdrs(&[]),
+            Json(VerifyReq { email: "mei@example.com".into(), code: "482913".into() }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap()
+        .0;
+        assert_eq!(out["ok"], true);
+
+        let start = |s: Session| {
+            let st = st.clone();
+            async move {
+                register_start(
+                    State(st), s, hdrs(&[]),
+                    Json(RegisterStart { email: Some("mei@example.com".into()), bootstrap_token: None, nickname: None }),
+                )
+                .await
+                .map_err(|e| e.0)
+            }
+        };
+
+        // 旁觀者知道信箱、也知道有人剛驗過，但證明不在他的 session 上
+        let err = start(test_session()).await.unwrap_err();
+        assert!(err.to_string().contains("在這個瀏覽器"), "拿到的訊息是：{err}");
+        let _ = start(victim).await.expect("輸入驗證碼的那個 session 要能拿到 challenge");
     }
 
     /// 設定頁的欄位就是前後端的契約。少一個欄位不會有人報錯 ——
@@ -3316,10 +4184,9 @@ mod tests {
     #[test]
     fn registering_an_invite_creates_the_forwarding_rows() {
         let st = test_state();
-        // 跟 invite_create 同一條路：設定沒種進去時退回 Config 的種子值
-        let domain = db::get_setting(&st.db, db::keys::MAIL_DOMAIN)
-            .unwrap()
-            .unwrap_or_else(|| st.cfg.mail_domain.clone());
+        // seed_settings 在建 state 時就把 MAIL_DOMAIN 種進 DB 了，這裡讀到的
+        // 一定是 Some —— 不必再像「預設網域」欄位那樣退回 Config 的種子值。
+        let domain = db::get_setting(&st.db, db::keys::MAIL_DOMAIN).unwrap().unwrap();
 
         for code in ["netflix", "disneyplus"] {
             db::add_recipient(&st.db, &format!("{code}@{domain}"), "mei@x.tw", None, "admin")
@@ -3385,20 +4252,42 @@ mod tests {
         state_with(Config::from_env().unwrap())
     }
 
-    /// `set_var` 在 edition 2024 是 unsafe 且會干擾並行測試，改設定就直接組 Config。
+    /// 寄信服務**停用**的 state。`cfg.resend_key` 一律忽略 —— 開發機的
+    /// shell 匯出了 NFHH_RESEND_KEY 時，其他測試不該因此換一條路走。
     fn state_with(cfg: Config) -> Shared {
+        state_with_key(cfg, "")
+    }
+
+    /// 寄信服務啟用的 state。未受邀的位址在 `join_not_invited` 就結束，
+    /// 走不到真的要連外的 `send_code` —— 稽核那一列卻已經寫進去了。
+    fn state_with_mailer() -> Shared {
+        state_with_key(Config::from_env().unwrap(), "dummy")
+    }
+
+    /// `set_var` 在 edition 2024 是 unsafe 且會干擾並行測試，改設定就直接組 Config。
+    fn state_with_key(cfg: Config, resend_key: &str) -> Shared {
+        state_with_limits(cfg, resend_key, JOIN_LIMIT_PER_IP, JOIN_LIMIT_GLOBAL)
+    }
+
+    /// 限流門檻可調的 state。給「限流不在時 store 撐不撐得住」這類測試用，
+    /// 其他測試一律走上面的預設值。
+    fn state_with_limits(cfg: Config, resend_key: &str, per_ip: u32, global: u32) -> Shared {
         let webauthn = WebauthnBuilder::new("localhost", &Url::parse("http://localhost").unwrap())
             .unwrap()
             .build()
             .unwrap();
+        let db = db::test_db();
+        seed_settings(&db, &cfg);
         Arc::new(AppState {
-            db: db::test_db(),
+            db,
             webauthn,
             cfg,
-            mailer: mailer::Mailer::new(String::new(), "a@b.c".into(), "tpl".into()),
+            mailer: mailer::Mailer::new(resend_key.into(), "a@b.c".into(), "tpl".into()),
             push: push::Push::new("a@b.c"),
             cf: cloudflare::Cloudflare::new(String::new(), String::new()),
             dns: Arc::new(dnslog::Window::new(DNS_WINDOW_SECS)),
+            join_limiter: ratelimit::Limiter::new(JOIN_LIMIT_WINDOW_SECS, per_ip, global),
+            sessions: BoundedMemoryStore::new(SESSION_STORE_MAX),
         })
     }
 
@@ -3440,9 +4329,162 @@ mod tests {
             ("enforce", true, true),
         ];
         for (mode, verified, want) in cases {
-            let visible = *mode != "enforce" || *verified;
-            assert_eq!(visible, *want, "mode={mode} verified={verified}");
+            // 打的是 mail_ingest 真正用的那支判斷式。在測試裡重寫一遍規則，
+            // 盯的就只是那份重寫，生產程式碼改壞了也照樣綠。
+            assert_eq!(mode_allows(mode, Some(*verified)), *want, "mode={mode} verified={verified}");
         }
+    }
+
+    /// 卡片替連結畫平台品牌，等於替它背書。host 不在該平台網域清單內、
+    /// 或寄件者根本沒通過驗證，就不能有那顆按鈕。host 的判讀交給 `url` crate ——
+    /// 手寫的 parser 已經被 `\\@` 繞過一次（瀏覽器把 `\\` 當 `/`）。
+    #[test]
+    fn only_verified_links_on_platform_domains_get_the_branded_button() {
+        let nf = vec!["netflix.com".to_string(), "nflxext.com".to_string()];
+        assert!(brand_link_allowed(Some(true), "https://www.netflix.com/account/access", &nf));
+        assert!(brand_link_allowed(Some(true), "https://NETFLIX.com:443/x", &nf));
+        assert!(!brand_link_allowed(Some(false), "https://www.netflix.com/account/access", &nf), "未驗證");
+        assert!(!brand_link_allowed(None, "https://www.netflix.com/x", &nf), "舊信無驗證資訊也不背書");
+        assert!(!brand_link_allowed(Some(true), "https://netflix.com.evil.example/x", &nf));
+        assert!(!brand_link_allowed(Some(true), "https://netflix.com@evil.example/x", &nf), "userinfo");
+        assert!(!brand_link_allowed(Some(true), "https://evil.example\\@netflix.com/x", &nf), "反斜線：瀏覽器的 host 是 evil.example");
+        assert!(!brand_link_allowed(Some(true), "https://evil.example/?u=netflix.com", &nf));
+        assert!(!brand_link_allowed(Some(true), "https://nétflix.com/x", &nf), "IDN 同形字：host 會變 punycode，對不上");
+        assert!(!brand_link_allowed(Some(true), "http://www.netflix.com/x", &nf), "只接受 https");
+        assert!(!brand_link_allowed(Some(true), "https://.netflix.com/x", &nf), "前導點會過 ends_with，卡片卻印出 .netflix.com");
+        assert!(!brand_link_allowed(Some(true), "https://www.netflix.com./x", &nf), "尾點是另一個 origin");
+    }
+
+    /// 純函式測試只證明判斷式，不證明「handler 真的把連結拿掉了」。
+    /// 這條走 handler：清單與單封都不得把不合格的連結交到前端手上。
+    #[tokio::test]
+    async fn the_handlers_withhold_links_that_have_not_earned_the_brand() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("netflix.list"), "# platform-name: Netflix\nnetflix.com\n").unwrap();
+        let st = state_with(Config {
+            domain_set_dir: dir.path().to_str().unwrap().to_string(),
+            ..Config::from_env().unwrap()
+        });
+        db::create_user_with_platforms(&st.db, "m", "m@x", "m@x", "member", Some("m@x"), &["netflix".into()]).unwrap();
+        // 沒有碼的信才走到那顆按鈕，所以靠關鍵字讓它進得了清單
+        db::set_setting_list(&st.db, db::keys::CODE_KEYWORDS, &["存取碼".into()], None).unwrap();
+
+        let ins = |subject: &str, link: &str, verified: bool| {
+            db::insert_mail(&st.db, Some(subject), db::now(), None, None, Some(subject), None, None,
+                None, &[link.to_string()], verified, Some("netflix"), None).unwrap()
+        };
+        ins("存取碼 A", "https://www.netflix.com/account/access", true);
+        ins("存取碼 B", "https://netflix.com.evil.example/x", true);
+        ins("存取碼 C", "https://www.netflix.com/account/access", false);
+
+        let session = test_session();
+        session.insert(S_USER, &"m".to_string()).await.unwrap();
+        session.insert(S_NAME, &"m@x".to_string()).await.unwrap();
+
+        let listed = mail_list(State(st.clone()), session.clone()).await.map_err(|e| e.0).unwrap().0;
+        let link = |subject: &str| {
+            listed.iter().find(|m| m.subject.as_deref() == Some(subject))
+                .unwrap_or_else(|| panic!("清單少了「{subject}」")).primary_link.clone()
+        };
+        assert_eq!(link("存取碼 A").as_deref(), Some("https://www.netflix.com/account/access"));
+        assert_eq!(link("存取碼 B"), None, "host 不在平台網域，清單不得帶連結");
+        assert_eq!(link("存取碼 C"), None, "未通過寄件者驗證，清單不得帶連結");
+
+        // 單封是另一條程式路徑（沒有 cache），得各自證明
+        for (subject, want) in [("存取碼 A", true), ("存取碼 B", false), ("存取碼 C", false)] {
+            let id = listed.iter().find(|m| m.subject.as_deref() == Some(subject)).unwrap().id;
+            let got = mail_get(State(st.clone()), session.clone(), Path(id)).await.map_err(|e| e.0).unwrap().0;
+            assert_eq!(got.primary_link.is_some(), want, "單封端點對「{subject}」的裁決要跟清單一致");
+        }
+    }
+
+    /// 扇出對每個訂閱開一個 task 且沒有上限：一個 member 先堆幾千筆訂閱，
+    /// 再寄一封信給自己，就能同時打開幾千條連線。這裡用本機假推送服務量
+    /// 「同時在飛的請求數」。
+    ///
+    /// 假服務只接 TCP、不講 TLS：`push::audience` 只認 https，所以 endpoint
+    /// 必須是 https（http 的會在 `vapid_header` 就失敗，一條連線都不會開，
+    /// 量到的峰值永遠是 0）。要量的是「同時被接受的連線數」，握手則在
+    /// 200ms 後隨 socket 一起斷 —— 那正好就是「慢或惡意的 endpoint」。
+    #[tokio::test]
+    async fn fan_out_never_exceeds_the_concurrency_cap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (i2, p2) = (inflight.clone(), peak.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let (i, p) = (i2.clone(), p2.clone());
+                tokio::spawn(async move {
+                    let n = i.fetch_add(1, Ordering::SeqCst) + 1;
+                    p.fetch_max(n, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    i.fetch_sub(1, Ordering::SeqCst);
+                    drop(sock);
+                });
+            }
+        });
+
+        // 真實可用的金鑰材料：encrypt 要對 p256dh 做 ECDH，隨便塞會在送出前就失敗
+        let ua = p256::SecretKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let p256dh = push::B64.encode(ua.public_key().to_encoded_point(false).as_bytes());
+        let auth = push::B64.encode([7u8; 16]);
+
+        let st = test_state();
+        let subs: Vec<db::PushSub> = (0..20)
+            .map(|i| db::PushSub {
+                id: i, user_id: "u".into(), endpoint: format!("https://{addr}/push"),
+                p256dh: p256dh.clone(), auth: auth.clone(), label: None,
+                created_at: 0, last_ok_at: None, fail_count: 0,
+            })
+            .collect();
+        let n = push::Notification { title: "t".into(), body: "b".into(), tag: "netflix".into(), url: "/".into(), code: None };
+
+        let started = std::time::Instant::now();
+        fan_out(&st, subs, &n).await;
+
+        // 剛好等於上限：前 8 筆在碰到閘門之前就都 spawn 出去了，而每條連線
+        // 都被握住 200ms —— 少於 8 表示扇出根本沒真的送，多於 8 表示閘門沒關住
+        assert_eq!(peak.load(Ordering::SeqCst), PUSH_FANOUT_CONCURRENCY, "峰值");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(500), "20 筆分 3 輪，扣掉排程誤差也該有 500ms");
+    }
+
+    /// 金鑰材料要是真的：長度先擋、base64 要解得開、p256dh 要是曲線上的點。
+    #[test]
+    fn push_endpoints_must_look_like_a_push_service() {
+        for bad in [
+            "https://user@host/",
+            "https://user:pw@host/",
+            "https://1.2.3.4/",
+            "https://[::1]/",
+            "https://host:8443/",
+            "http://fcm.googleapis.com/fcm/send/abc",
+            "https://localhost/",
+            "https://localhost./",
+            "https://push.localhost/",
+            "https://push.localhost./",
+            "not a url",
+        ] {
+            assert!(!valid_push_endpoint(bad), "{bad} 該被擋");
+        }
+        assert!(valid_push_endpoint("https://fcm.googleapis.com/fcm/send/abc"));
+        assert!(valid_push_endpoint("https://web.push.apple.com:443/QAbc"), "明寫 443 也算標準埠");
+    }
+
+    #[test]
+    fn push_key_material_must_be_real() {
+        let ua = p256::SecretKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let good = push::B64.encode(ua.public_key().to_encoded_point(false).as_bytes());
+        let auth = push::B64.encode([1u8; 16]);
+        assert!(push::valid_keys(&good, &auth));
+        assert!(!push::valid_keys("not-base64!", "AAAA"));
+        assert!(!push::valid_keys(&push::B64.encode([4u8; 10]), &auth), "長度不對");
+        assert!(!push::valid_keys(&push::B64.encode([4u8; 65]), &auth), "65 bytes 但不在曲線上");
+        assert!(!push::valid_keys(&push::B64.encode(ua.public_key().to_encoded_point(true).as_bytes()), &auth), "壓縮點不收");
+        assert!(!push::valid_keys(&good, &push::B64.encode([1u8; 8])));
+        assert!(!push::valid_keys(&"A".repeat(4096), &auth), "先擋字串長度，不先解碼");
     }
 
     /// ⚠️ 被移除的成員必須**當場**失去存取，不能等到容器重啟。
@@ -3453,12 +4495,10 @@ mod tests {
     /// 「移除成員」要阻止的事。
     #[tokio::test]
     async fn a_deleted_member_loses_access_immediately() {
-        use tower_sessions::{MemoryStore, Session};
-
         let st = test_state();
         db::create_user_with_platforms(&st.db, "u1", "mei@x.tw", "mei", "member", Some("mei@x.tw"), &[]).unwrap();
 
-        let session = Session::new(None, std::sync::Arc::new(MemoryStore::default()), None);
+        let session = test_session();
         session.insert(S_USER, "u1".to_string()).await.unwrap();
         session.insert(S_NAME, "mei@x.tw".to_string()).await.unwrap();
 
@@ -3475,6 +4515,900 @@ mod tests {
         );
     }
 
+    /// 不經 HTTP 層直接餵給 handler 的 session。每個測試自己開一個，
+    /// 跨 session 的攻擊情境就用兩個。背後接的是正式環境用的
+    /// `BoundedMemoryStore`，不是 tower-sessions 附的 `MemoryStore` ——
+    /// handler 測試順便走過真正會上線的 store。
+    fn test_session() -> Session {
+        test_session_with_store().0
+    }
+
+    /// 同上，但把 store 也交出來 —— 要看 `save` 之後**store 裡那筆紀錄**
+    /// 的 `expiry_date` 時用這個；`Session::expiry_date()` 只是物件上的
+    /// 設定，跟真的存進去的可以不一樣。
+    fn test_session_with_store() -> (Session, BoundedMemoryStore) {
+        let store = BoundedMemoryStore::new(SESSION_STORE_MAX);
+        (Session::new(None, Arc::new(store.clone()), None), store)
+    }
+
+    /// 這把新 Passkey 要寫給誰，必須跟「誰在這個 session 上」一致。
+    /// 任何一邊對不上，都代表 session 裡的目標被另一條流程改寫過。
+    #[test]
+    fn a_registration_may_only_land_on_the_session_owner() {
+        let mine = PendingReg {
+            user_id: "u1".into(), username: "a@x".into(), email: None, is_new: false,
+            role: "member".into(), bootstrap_token: None, nickname: None,
+        };
+        assert!(check_registration_owner(Some("u1"), &mine).is_ok());
+        assert!(check_registration_owner(Some("u2"), &mine).is_err(), "別人的目標");
+        assert!(check_registration_owner(None, &mine).is_err(), "沒登入卻在加備援金鑰");
+
+        let fresh = PendingReg { is_new: true, ..mine };
+        assert!(check_registration_owner(None, &fresh).is_ok());
+        assert!(check_registration_owner(Some("u1"), &fresh).is_err(), "登入中不能建新帳號");
+    }
+
+    /// 完整重播報告裡的攻擊鏈：member 先開「新增 Passkey」、再啟動登入、
+    /// 最後提交第一步拿到的註冊回應。早先的版本是對 admin 的 Email 啟動
+    /// 「信箱＋passkey」登入，那條路已經拿掉；可探索登入雖然指不了目標，
+    /// 「另一條流程開始後，舊的註冊回應不能再被接受」這個不變量沒變。
+    #[tokio::test]
+    async fn a_member_cannot_finish_a_registration_after_starting_a_login() {
+        use webauthn_authenticator_rs::{softpasskey::SoftPasskey, WebauthnAuthenticator};
+        let st = test_state();
+        let origin = Url::parse("http://localhost").unwrap();
+        db::create_user_with_platforms(&st.db, "admin", "admin@x", "admin@x", "admin", Some("admin@x"), &[]).unwrap();
+        db::create_user_with_platforms(&st.db, "mem", "mem@x", "mem@x", "member", Some("mem@x"), &[]).unwrap();
+
+        // 攻擊者：已登入的 member
+        let session = test_session();
+        session.insert(S_USER, &"mem".to_string()).await.unwrap();
+        session.insert(S_NAME, &"mem@x".to_string()).await.unwrap();
+        let mut attacker_key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+
+        // 1. 新增 Passkey：拿到自己的註冊 challenge
+        let ccr = register_start(
+            State(st.clone()), session.clone(), hdrs(&[]),
+            Json(RegisterStart { email: None, bootstrap_token: None, nickname: None }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap()
+        .0;
+        // 2. 啟動登入
+        let _ = login_any_start(State(st.clone()), session.clone(), hdrs(&[]))
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        // 3. 提交第 1 步的註冊回應
+        let cred = attacker_key.do_registration(origin, ccr).unwrap();
+        let res = register_finish(State(st.clone()), session.clone(), hdrs(&[]), Json(cred)).await;
+
+        let err = res.expect_err("跨流程的 finish 必須失敗");
+        // 釘住失敗的**原因**：註冊狀態被 login_any_start 清掉了。
+        // 只驗 is_err() 的話，任何不相干的壞掉都能讓這個測試假裝通過。
+        assert!(err.0.to_string().contains("已失效"), "拿到的是：{}", err.0);
+        assert!(db::credentials_for(&st.db, "admin").unwrap().is_empty(), "admin 不得多出憑證");
+        assert!(db::credentials_for(&st.db, "mem").unwrap().is_empty(), "也不該偷偷寫給 member 自己");
+    }
+
+    fn otp_rows(db: &db::Db) -> i64 {
+        db.lock().unwrap().query_row("SELECT count(*) FROM email_otp", [], |r| r.get(0)).unwrap()
+    }
+
+    fn audit_count(db: &db::Db, action: &str) -> i64 {
+        db.lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM audit WHERE action = ?1", [action], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// 測試的 session 沒經過 HTTP 層，`id()` 要 `save` 過才有值。
+    async fn saved_id(session: &Session) -> tower_sessions::session::Id {
+        session.save().await.unwrap();
+        session.id().expect("save 之後一定有 id")
+    }
+
+    /// 登入用的驗證碼端點對外開放：查無帳號時不寄、不寫碼，但回應要跟有帳號
+    /// 時一模一樣 —— 否則它就是「這個信箱在這裡有沒有帳號」的探測器。
+    #[tokio::test]
+    async fn login_otp_start_answers_the_same_whether_or_not_the_account_exists() {
+        let st = state_with_mailer();
+        db::create_user_with_platforms(&st.db, "u1", "a@x.tw", "a@x.tw", "member", Some("a@x.tw"), &[]).unwrap();
+
+        // 查無帳號：Ok、cooldown 跟剛寄出時一樣、沒有任何碼被寫進去
+        let res = login_otp_start(State(st.clone()), hdrs(&[]), Json(EmailReq { email: "nobody@x.tw".into() }))
+            .await
+            .map_err(|e| e.0)
+            .expect("沒帳號也要回 Ok");
+        assert_eq!(res.0.cooldown, otp::RESEND_COOLDOWN_SECS);
+        assert_eq!(otp_rows(&st.db), 0, "沒帳號不寫 email_otp");
+        assert_eq!(audit_count(&st.db, "login_otp_no_account"), 1, "admin 要看得到有人在試");
+
+        // 有帳號、剛寄過（冷卻中）：同樣是 Ok 而不是錯誤，也不重寄。
+        // 回的是常數而不是剩餘秒數 —— 剩餘秒數會透露這個信箱剛剛真的被寄過碼。
+        // （真的寄出那一步要連外，這條測試停在冷卻前面。）
+        db::put_otp(&st.db, "a@x.tw", db::OTP_LOGIN, "sent-a-moment-ago", otp::TTL_SECS).unwrap();
+        let res = login_otp_start(State(st.clone()), hdrs(&[]), Json(EmailReq { email: "a@x.tw".into() }))
+            .await
+            .map_err(|e| e.0)
+            .expect("冷卻中要回 Ok，不是錯誤");
+        assert_eq!(res.0.cooldown, otp::RESEND_COOLDOWN_SECS, "冷卻中回的要跟沒帳號時一模一樣");
+        let (hash, purpose): (String, String) = st
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT code_hash, purpose FROM email_otp WHERE email = 'a@x.tw'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(hash, "sent-a-moment-ago", "冷卻中不得覆寫成新碼");
+        assert_eq!(purpose, db::OTP_LOGIN);
+    }
+
+    /// 加入碼跟登入碼長得一樣、寄到同一個信箱，但換到的東西不同：
+    /// 加入碼拿去登入要跟「沒有這組碼」一樣；登入碼通過後也開不了註冊那道門。
+    #[tokio::test]
+    async fn a_join_code_cannot_log_in_and_a_login_code_cannot_register() {
+        let st = test_state();
+        db::create_user_with_platforms(&st.db, "u1", "a@x.tw", "a@x.tw", "member", Some("a@x.tw"), &[]).unwrap();
+        let hash = otp::hash(&st.db, "a@x.tw", "482913").unwrap();
+        let body = || VerifyReq { email: "a@x.tw".into(), code: "482913".into() };
+
+        db::put_otp(&st.db, "a@x.tw", db::OTP_JOIN, &hash, otp::TTL_SECS).unwrap();
+        let session = test_session();
+        let err = login_otp_verify(State(st.clone()), session.clone(), hdrs(&[]), Json(body()))
+            .await
+            .map_err(|e| e.0)
+            .expect_err("加入碼不能登入");
+        assert!(err.to_string().contains("已過期"), "要跟沒有這組碼一樣，拿到的是：{err}");
+        assert!(current_user(&session).await.is_none());
+
+        db::put_otp(&st.db, "a@x.tw", db::OTP_LOGIN, &hash, otp::TTL_SECS).unwrap();
+        let _ = login_otp_verify(State(st.clone()), session.clone(), hdrs(&[]), Json(body()))
+            .await
+            .map_err(|e| e.0)
+            .expect("登入碼要能登入");
+
+        // 反向：一組「已通過」的登入碼開不了 `register_start` 那道門。
+        // 走真的 handler，不是只查 DB —— 登入碼通過後那一列已被 verify 清掉，
+        // 光查 `otp_recently_verified` 只是空證明。這裡直接擺出最壞情況：
+        // 列還在、verified_at 已寫上、session 上也有這個信箱的證明，只差用途不對。
+        db::invite_email(&st.db, "mei@x.tw", "admin", &[]).unwrap();
+        let mei_hash = otp::hash(&st.db, "mei@x.tw", "482913").unwrap();
+        db::put_otp(&st.db, "mei@x.tw", db::OTP_LOGIN, &mei_hash, otp::TTL_SECS).unwrap();
+        assert!(matches!(
+            db::check_otp(&st.db, "mei@x.tw", db::OTP_LOGIN, &mei_hash, otp::MAX_ATTEMPTS).unwrap(),
+            db::OtpCheck::Ok
+        ));
+        let session = test_session();
+        session.insert(S_EMAIL_PROOF, &"mei@x.tw".to_string()).await.unwrap();
+        let register = |session: Session| {
+            let st = st.clone();
+            async move {
+                register_start(
+                    State(st),
+                    session,
+                    hdrs(&[]),
+                    Json(RegisterStart { email: Some("mei@x.tw".into()), bootstrap_token: None, nickname: None }),
+                )
+                .await
+                .map_err(|e| e.0)
+            }
+        };
+        let err = register(session.clone()).await.expect_err("登入碼通過不等於信箱證明");
+        assert!(err.to_string().contains("完成信箱驗證"), "拿到的是：{err}");
+
+        // 同一個 session、同一個位址，換成**加入**用途的證明就開得了 ——
+        // 證明剛才擋下的是用途，不是別的關卡。
+        db::mark_email_verified(&st.db, "mei@x.tw", db::OTP_JOIN).unwrap();
+        let _ = register(session).await.expect("加入用途的證明才開得了門");
+    }
+
+    /// 驗證碼登入成功：身分寫對、標成弱認證、session id 換過、碼被清掉。
+    #[tokio::test]
+    async fn an_otp_login_marks_the_session_weak_and_rotates_its_id() {
+        let st = test_state();
+        db::create_user_with_platforms(&st.db, "u1", "a@x.tw", "a@x.tw", "member", Some("a@x.tw"), &[]).unwrap();
+        db::put_otp(&st.db, "a@x.tw", db::OTP_LOGIN, &otp::hash(&st.db, "a@x.tw", "482913").unwrap(), otp::TTL_SECS).unwrap();
+
+        let session = test_session();
+        let before = saved_id(&session).await;
+        let out = login_otp_verify(
+            State(st.clone()), session.clone(), hdrs(&[]),
+            Json(VerifyReq { email: "a@x.tw".into(), code: "482-913".into() }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap()
+        .0;
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["username"], "a@x.tw");
+
+        assert_eq!(current_user(&session).await.map(|(id, _)| id).as_deref(), Some("u1"));
+        assert_eq!(session.get::<String>(S_AUTH_VIA).await.unwrap().as_deref(), Some(AUTH_VIA_OTP));
+        assert_ne!(saved_id(&session).await, before, "身分升級後 session id 要換");
+        assert_eq!(otp_rows(&st.db), 0, "碼是一次性的");
+        assert_eq!(audit_count(&st.db, "login"), 1);
+    }
+
+    /// 驗證碼登入的 session 是弱認證：member 功能放行，admin 功能不放 ——
+    /// 拿到家人信箱的人做不了管理操作。沒標登入方式的 session 也不放。
+    #[tokio::test]
+    async fn admin_endpoints_only_accept_passkey_sessions() {
+        let st = test_state();
+        db::create_user_with_platforms(&st.db, "a", "a@x", "a@x", "admin", Some("a@x"), &[]).unwrap();
+
+        let login = |via: Option<&'static str>| async move {
+            let session = test_session();
+            session.insert(S_USER, &"a".to_string()).await.unwrap();
+            session.insert(S_NAME, &"a@x".to_string()).await.unwrap();
+            if let Some(v) = via {
+                session.insert(S_AUTH_VIA, v).await.unwrap();
+            }
+            session
+        };
+
+        let otp = login(Some(AUTH_VIA_OTP)).await;
+        let err = member_list(State(st.clone()), otp.clone())
+            .await
+            .map_err(|e| e.0)
+            .err()
+            .expect("OTP session 不能進 admin 端點");
+        assert!(err.to_string().contains("Passkey"), "拿到的是：{err}");
+        // member 功能照常
+        require_user(&st, &otp).await.map_err(|e| e.0).expect("弱認證仍是登入");
+
+        let err = member_list(State(st.clone()), login(None).await)
+            .await
+            .map_err(|e| e.0)
+            .err()
+            .expect("沒標登入方式的 session 也不能進");
+        assert!(err.to_string().contains("Passkey"), "沒標方式的也擋，拿到的是：{err}");
+
+        let _ = member_list(State(st.clone()), login(Some(AUTH_VIA_PASSKEY)).await)
+            .await
+            .map_err(|e| e.0)
+            .expect("Passkey 登入的 admin 要進得去");
+    }
+
+    /// 驗證碼登入的 admin 不能新增 Passkey：否則「驗證碼登入 → 加 Passkey →
+    /// 登出 → 用那把 Passkey 登入」四步就把 `require_admin` 的 Passkey 要求繞掉。
+    /// member 照常 —— 拿得到信箱的人本來就等於那位 member。
+    #[tokio::test]
+    async fn an_otp_admin_cannot_add_a_passkey() {
+        let st = test_state();
+        db::create_user_with_platforms(&st.db, "a", "a@x", "a@x", "admin", Some("a@x"), &[]).unwrap();
+        db::create_user_with_platforms(&st.db, "m", "m@x", "m@x", "member", Some("m@x"), &[]).unwrap();
+
+        let start = |uid: &str, via: &'static str| {
+            let st = st.clone();
+            let uid = uid.to_string();
+            async move {
+                let session = test_session();
+                session.insert(S_USER, &uid).await.unwrap();
+                session.insert(S_NAME, &format!("{uid}@x")).await.unwrap();
+                session.insert(S_AUTH_VIA, via).await.unwrap();
+                register_start(
+                    State(st),
+                    session,
+                    hdrs(&[]),
+                    Json(RegisterStart { email: None, bootstrap_token: None, nickname: None }),
+                )
+                .await
+                .map_err(|e| e.0)
+            }
+        };
+
+        let err = start("a", AUTH_VIA_OTP).await.expect_err("驗證碼登入的 admin 不能加 Passkey");
+        assert!(err.to_string().contains("Passkey 登入才能新增"), "拿到的是：{err}");
+        let _ = start("m", AUTH_VIA_OTP).await.expect("驗證碼登入的 member 照常能加");
+        let _ = start("a", AUTH_VIA_PASSKEY).await.expect("Passkey 登入的 admin 能加");
+    }
+
+    /// 弱認證的 admin 在**任何地方**都只是 member —— 不只 `require_admin` 守的
+    /// 端點，member 端點裡順手給 admin 的特權（讀所有人的信、動別人的 IP、
+    /// 白名單全覽）也一律收回；`/api/status` 的 `is_admin` 跟著回 false，
+    /// `role` 仍說他是 admin，前端才有辦法解釋為什麼管理分頁不見了。
+    #[tokio::test]
+    async fn a_weakly_authenticated_admin_is_only_a_member_elsewhere() {
+        let st = test_state();
+        db::create_user_with_platforms(&st.db, "a", "a@x", "a@x", "admin", Some("a@x"), &[]).unwrap();
+        db::create_user_with_platforms(&st.db, "m", "m@x", "m@x", "member", Some("m@x"), &["disneyplus".into()]).unwrap();
+        // m 的白名單條目，跟一封只有 m 的平台才看得到的信。admin 一個平台都沒被授權。
+        assert!(db::upsert_allow_owned(&st.db, "203.0.113.5", Some("m 家"), "m@x", db::now() + 86400, 1, false).unwrap());
+        db::insert_mail(&st.db, Some("d1"), db::now(), None, None, Some("code"), None, None, None, &[], true, Some("disneyplus"), None).unwrap();
+        let mail_id: i64 = st
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT id FROM mails WHERE message_id = 'd1'", [], |r| r.get(0))
+            .unwrap();
+
+        let login = |via: &'static str| async move {
+            let session = test_session();
+            session.insert(S_USER, &"a".to_string()).await.unwrap();
+            session.insert(S_NAME, &"a@x".to_string()).await.unwrap();
+            session.insert(S_AUTH_VIA, via).await.unwrap();
+            session
+        };
+        let rename = |s: Session| {
+            let st = st.clone();
+            async move {
+                allow_rename(State(st), s, hdrs(&[]), Path("203.0.113.5".into()), Json(LabelReq { label: Some("改".into()) }))
+                    .await
+                    .map_err(|e| e.0)
+            }
+        };
+        let get_status = |s: Session| {
+            let st = st.clone();
+            async move { status(State(st), s, hdrs(&[]), Query(StatusQuery { ip: None })).await.map_err(|e| e.0).unwrap().0 }
+        };
+
+        let otp = login(AUTH_VIA_OTP).await;
+        let err = mail_get(State(st.clone()), otp.clone(), Path(mail_id)).await.map_err(|e| e.0).expect_err("讀別人的信要被當 member 拒絕");
+        assert!(err.to_string().contains("查無此信件"), "拿到的是：{err}");
+        let err = allow_remove(State(st.clone()), otp.clone(), hdrs(&[]), Path("203.0.113.5".into()))
+            .await
+            .map_err(|e| e.0)
+            .expect_err("刪別人的 IP 要被當 member 拒絕");
+        assert!(err.to_string().contains("只能移除自己新增的"), "拿到的是：{err}");
+        let err = rename(otp.clone()).await.expect_err("改別人的 IP 名稱要被當 member 拒絕");
+        assert!(err.to_string().contains("只能重新命名自己新增的"), "拿到的是：{err}");
+        let s = get_status(otp.clone()).await;
+        assert!(!s.is_admin, "status.is_admin 要跟後端實際給的特權一致");
+        assert_eq!(s.role.as_deref(), Some("admin"), "但角色照實說，前端才能解釋");
+        assert_eq!(s.auth_via.as_deref(), Some(AUTH_VIA_OTP));
+        assert!(s.entries.is_empty(), "白名單也只看得到自己的");
+
+        // 同一位 admin 用 Passkey 登入：特權都在。
+        let pk = login(AUTH_VIA_PASSKEY).await;
+        let _ = mail_get(State(st.clone()), pk.clone(), Path(mail_id)).await.map_err(|e| e.0).expect("Passkey 登入的 admin 讀得到所有信");
+        let _ = rename(pk.clone()).await.expect("Passkey 登入的 admin 能改別人的條目");
+        let s = get_status(pk).await;
+        assert!(s.is_admin);
+        assert_eq!(s.role.as_deref(), Some("admin"));
+        assert_eq!(s.entries.len(), 1, "admin 看得到全部白名單");
+    }
+
+    /// 三支匿名的登入端點跟 join 那幾支一樣被同一個限流器擋。
+    /// login/any/start 每次都在 session 留一份挑戰；otp/start 每次寫一列稽核。
+    #[tokio::test]
+    async fn login_any_start_and_the_otp_endpoints_are_rate_limited_too() {
+        let st = test_state();
+        let h = || hdrs(&[("cf-connecting-ip", "203.0.113.20")]);
+        for _ in 0..JOIN_LIMIT_PER_IP {
+            let _ = login_any_start(State(st.clone()), test_session(), h()).await.map_err(|e| e.0).unwrap();
+        }
+        let err = login_any_start(State(st.clone()), test_session(), h()).await.map_err(|e| e.0).unwrap_err();
+        assert!(err.to_string().contains("太頻繁"), "{err}");
+
+        let st = state_with_mailer();
+        let h = || hdrs(&[("cf-connecting-ip", "203.0.113.21")]);
+        let body = || EmailReq { email: "nobody@x.tw".into() };
+        for _ in 0..JOIN_LIMIT_PER_IP {
+            let _ = login_otp_start(State(st.clone()), h(), Json(body())).await.map_err(|e| e.0).unwrap();
+        }
+        let before = audit_rows(&st.db);
+        assert_eq!(before, JOIN_LIMIT_PER_IP as i64, "每一次查無帳號都寫一列");
+        let err = login_otp_start(State(st.clone()), h(), Json(body())).await.map_err(|e| e.0).unwrap_err();
+        assert!(err.to_string().contains("太頻繁"), "{err}");
+        assert_eq!(audit_rows(&st.db), before, "被限流的請求不能再寫稽核");
+
+        let st = test_state();
+        let h = || hdrs(&[("cf-connecting-ip", "203.0.113.22")]);
+        let body = || VerifyReq { email: "x@y.z".into(), code: "123456".into() };
+        let mut last = None;
+        for _ in 0..JOIN_LIMIT_PER_IP {
+            last = Some(
+                login_otp_verify(State(st.clone()), test_session(), h(), Json(body()))
+                    .await
+                    .map_err(|e| e.0)
+                    .unwrap_err(),
+            );
+        }
+        assert!(last.unwrap().to_string().contains("已過期"), "前 N 次要真的跑到業務邏輯");
+        let err = login_otp_verify(State(st.clone()), test_session(), h(), Json(body()))
+            .await
+            .map_err(|e| e.0)
+            .unwrap_err();
+        assert!(err.to_string().contains("太頻繁"), "{err}");
+    }
+
+    /// 匿名起手留下的 session 只活 15 分鐘；登入成功就回到預設的兩週。
+    /// 報告 #1 的另一半：限流只是讓灌得慢，短壽命才讓灌進來的東西自己消失。
+    ///
+    /// 看的是 `save` 之後 store 裡那筆 `Record` 的 `expiry_date`，不是
+    /// `Session::expiry_date()` —— 前者才是 `BoundedMemoryStore` 掃過期、
+    /// 踢人時看的東西。
+    #[tokio::test]
+    async fn anonymous_starts_get_a_short_session_and_login_restores_the_default() {
+        use tower_sessions::cookie::time::{Duration, OffsetDateTime};
+        use tower_sessions::session_store::SessionStore;
+
+        /// 存進 store，再從 store 讀回這筆紀錄離到期還有多久。
+        async fn stored_ttl(store: &BoundedMemoryStore, session: &Session) -> Duration {
+            session.save().await.unwrap();
+            let id = session.id().expect("save 之後一定有 id");
+            let rec = store.load(&id).await.unwrap().expect("store 裡要有這筆");
+            rec.expiry_date - OffsetDateTime::now_utc()
+        }
+        let about = |left: Duration, minutes: i64| (left - Duration::minutes(minutes)).abs() < Duration::minutes(1);
+        let long_lived = |left: Duration| left > Duration::days(1);
+
+        let st = test_state();
+        db::create_user_with_platforms(&st.db, "u1", "a@x.tw", "a@x.tw", "member", Some("a@x.tw"), &[]).unwrap();
+
+        // 全新的 session 預設是兩週
+        let (session, store) = test_session_with_store();
+        assert!(long_lived(stored_ttl(&store, &session).await));
+
+        // Passkey 登入起手 → 15 分鐘
+        let _ = login_any_start(State(st.clone()), session.clone(), hdrs(&[])).await.map_err(|e| e.0).unwrap();
+        let left = stored_ttl(&store, &session).await;
+        assert!(about(left, ANON_SESSION_MINUTES), "剩 {left}");
+
+        // 加入流程的信箱證明也一樣
+        let (joiner, joiner_store) = test_session_with_store();
+        db::invite_email(&st.db, "mei@x.tw", "member", &[]).unwrap();
+        let hash = otp::hash(&st.db, "mei@x.tw", "482913").unwrap();
+        db::put_otp(&st.db, "mei@x.tw", db::OTP_JOIN, &hash, otp::TTL_SECS).unwrap();
+        let _ = join_verify(
+            State(st.clone()),
+            joiner.clone(),
+            hdrs(&[]),
+            Json(VerifyReq { email: "mei@x.tw".into(), code: "482913".into() }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap();
+        let left = stored_ttl(&joiner_store, &joiner).await;
+        assert!(about(left, ANON_SESSION_MINUTES), "剩 {left}");
+
+        // 未登入的註冊起手在**最早**的檢查（名稱太長）就失敗，存回去的也要是
+        // 15 分鐘：`clear_auth_flows` 已經改動了 session，middleware 會照樣存，
+        // 縮壽命若排在這道檢查之後，這份匿名 session 就以兩週存回。
+        let (stranger, stranger_store) = test_session_with_store();
+        let err = register_start(
+            State(st.clone()),
+            stranger.clone(),
+            hdrs(&[]),
+            Json(RegisterStart {
+                email: Some("nobody@x.tw".into()),
+                bootstrap_token: None,
+                nickname: Some("x".repeat(MAX_LABEL_LEN + 1)),
+            }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap_err();
+        assert!(err.to_string().contains("最多"), "{err}");
+        let left = stored_ttl(&stranger_store, &stranger).await;
+        assert!(about(left, ANON_SESSION_MINUTES), "失敗的註冊起手存回去剩 {left}");
+
+        // 驗證碼登入成功 → 回到預設
+        let hash = otp::hash(&st.db, "a@x.tw", "482913").unwrap();
+        db::put_otp(&st.db, "a@x.tw", db::OTP_LOGIN, &hash, otp::TTL_SECS).unwrap();
+        let _ = login_otp_verify(
+            State(st.clone()),
+            session.clone(),
+            hdrs(&[]),
+            Json(VerifyReq { email: "a@x.tw".into(), code: "482913".into() }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap();
+        assert!(long_lived(stored_ttl(&store, &session).await), "登入後不該還是 15 分鐘");
+
+        // 登入著再去打登入起手，不能把自己的 session 縮回 15 分鐘
+        let _ = login_any_start(State(st.clone()), session.clone(), hdrs(&[])).await.map_err(|e| e.0).unwrap();
+        assert!(long_lived(stored_ttl(&store, &session).await));
+    }
+
+    /// 報告 #1 的情境：拿掉限流、用 500 個全新的瀏覽器打登入起手，
+    /// store 也不能長過上限。這裡的 store 故意開很小，才看得出上限有在守。
+    #[tokio::test]
+    async fn a_flood_of_anonymous_login_starts_cannot_grow_the_store_past_its_cap() {
+        let st = state_with_limits(Config::from_env().unwrap(), "", u32::MAX, u32::MAX);
+        let store = BoundedMemoryStore::new(100);
+        for i in 0..500u32 {
+            // 每次都是新的 cookie（沒有 id），save 走的是 store 的 create
+            let session = Session::new(None, Arc::new(store.clone()), None);
+            let h = hdrs(&[("cf-connecting-ip", &format!("203.0.113.{}", i % 250))]);
+            let _ = login_any_start(State(st.clone()), session.clone(), h).await.map_err(|e| e.0).unwrap();
+            session.save().await.unwrap();
+            assert!(store.len() <= 100, "第 {i} 筆之後 store 有 {} 筆", store.len());
+        }
+        assert_eq!(store.len(), 100);
+    }
+
+    /// join/start 對「沒被邀請」與「已有帳號」的回應要跟真的寄出去一樣 ——
+    /// 兩支寄碼端點都對外開放，講明白等於讓任何人列舉家人的信箱。
+    #[tokio::test]
+    async fn join_start_does_not_say_whether_an_address_is_invited_or_registered() {
+        let st = state_with_mailer();
+        db::create_user_with_platforms(&st.db, "u1", "a@x.tw", "a@x.tw", "member", Some("a@x.tw"), &[]).unwrap();
+        let start = |email: &str| {
+            let st = st.clone();
+            let email = email.to_string();
+            async move {
+                join_start(State(st), hdrs(&[]), Json(EmailReq { email }))
+                    .await
+                    .map_err(|e| e.0)
+                    .expect("不該報錯")
+                    .0
+            }
+        };
+
+        let has_account = start("a@x.tw").await;
+        let not_invited = start("nobody@x.tw").await;
+        assert_eq!(has_account.cooldown, not_invited.cooldown);
+        assert_eq!(has_account.cooldown, otp::RESEND_COOLDOWN_SECS, "跟剛寄出時回的一樣");
+        assert_eq!(otp_rows(&st.db), 0, "兩種情況都不寫碼");
+        assert_eq!(audit_count(&st.db, "join_has_account"), 1);
+        assert_eq!(audit_count(&st.db, "join_not_invited"), 1);
+
+        // 被邀請、剛寄過（冷卻中）：回的也是同一個常數。回剩餘秒數的話，
+        // 「有個值在倒數」本身就洩漏了這個位址剛剛真的被寄過碼。
+        db::invite_email(&st.db, "mei@x.tw", "admin", &[]).unwrap();
+        db::put_otp(&st.db, "mei@x.tw", db::OTP_JOIN, "sent-a-moment-ago", otp::TTL_SECS).unwrap();
+        let invited_cooling = start("mei@x.tw").await;
+        assert_eq!(invited_cooling.cooldown, not_invited.cooldown, "冷卻中的回應要跟沒被邀請的一樣");
+        assert_eq!(otp_rows(&st.db), 1, "冷卻中不重寄、不覆寫");
+    }
+
+    /// 信箱證明是身分升級，寫進 session 之前要換 id —— 驗證碼與邀請連結
+    /// 兩條路都是。
+    #[tokio::test]
+    async fn earning_an_email_proof_rotates_the_session_id() {
+        let st = test_state();
+        db::put_otp(&st.db, "mei@x.tw", db::OTP_JOIN, &otp::hash(&st.db, "mei@x.tw", "482913").unwrap(), otp::TTL_SECS).unwrap();
+        let session = test_session();
+        let before = saved_id(&session).await;
+        let _ = join_verify(
+            State(st.clone()), session.clone(), hdrs(&[]),
+            Json(VerifyReq { email: "mei@x.tw".into(), code: "482913".into() }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap();
+        assert_ne!(saved_id(&session).await, before);
+        assert_eq!(session.get::<String>(S_EMAIL_PROOF).await.unwrap().as_deref(), Some("mei@x.tw"), "換 id 不能弄丟資料");
+
+        db::invite_email(&st.db, "yu@x.tw", "admin", &[]).unwrap();
+        let token = invite::generate();
+        db::set_invite_token(&st.db, "yu@x.tw", &invite::hash(&st.db, &token).unwrap()).unwrap();
+        let session = test_session();
+        let before = saved_id(&session).await;
+        let _ = join_invite(State(st.clone()), session.clone(), hdrs(&[]), Json(InviteTokenReq { token }))
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        assert_ne!(saved_id(&session).await, before);
+        assert_eq!(session.get::<String>(S_EMAIL_PROOF).await.unwrap().as_deref(), Some("yu@x.tw"));
+    }
+
+    #[test]
+    fn email_must_look_like_an_address_and_fit_rfc_5321() {
+        assert!(valid_email("a@b.c"));
+        assert!(!valid_email("no-at"));
+        assert!(!valid_email("a b@c"));
+        assert!(!valid_email(&format!("{}@x", "a".repeat(MAX_EMAIL_LEN))));
+    }
+
+    fn audit_rows(db: &db::Db) -> i64 {
+        db.lock().unwrap().query_row("SELECT count(*) FROM audit", [], |r| r.get(0)).unwrap()
+    }
+
+    /// 公開的 join/start 每次未受邀都寫一列稽核；沒有限流就是一台免費寫入機。
+    /// （未受邀的回應現在是 Ok，不是錯誤 —— 但稽核照寫，限流也照擋。）
+    #[tokio::test]
+    async fn join_start_is_rate_limited_per_ip() {
+        let st = state_with_mailer();
+        let h = || hdrs(&[("cf-connecting-ip", "203.0.113.9")]);
+        for _ in 0..JOIN_LIMIT_PER_IP {
+            let _ = join_start(State(st.clone()), h(), Json(EmailReq { email: "x@y.z".into() }))
+                .await
+                .map_err(|e| e.0)
+                .expect("未受邀的位址要拿到跟寄出時一樣的 Ok");
+        }
+        let err = join_start(State(st.clone()), h(), Json(EmailReq { email: "x@y.z".into() }))
+            .await
+            .map_err(|e| e.0)
+            .unwrap_err();
+        assert!(err.to_string().contains("太頻繁"), "{err}");
+        assert_eq!(
+            audit_rows(&st.db),
+            JOIN_LIMIT_PER_IP as i64,
+            "放行的每一次都該寫一列，被限流的那次一列都不能寫"
+        );
+    }
+
+    /// join/verify 也是公開端點，而且鎖住的碼每被戳一次就寫一列
+    /// `join_code_locked` —— 不限流的話，一組作廢的碼就是一台寫入機。
+    #[tokio::test]
+    async fn join_verify_is_rate_limited_too() {
+        let st = test_state();
+        // 直接把次數推到上限：驗證碼本身不是這條測試的重點，
+        // 而且用真的猜錯去燒次數會先把限流額度花掉。
+        db::put_otp(&st.db, "x@y.z", db::OTP_JOIN, "hash-good", 600).unwrap();
+        st.db
+            .lock()
+            .unwrap()
+            .execute(&format!("UPDATE email_otp SET attempts = {}", otp::MAX_ATTEMPTS), [])
+            .unwrap();
+
+        let h = || hdrs(&[("cf-connecting-ip", "203.0.113.11")]);
+        let body = || VerifyReq { email: "x@y.z".into(), code: "123456".into() };
+        let mut last = None;
+        for _ in 0..JOIN_LIMIT_PER_IP {
+            last = Some(
+                join_verify(State(st.clone()), test_session(), h(), Json(body()))
+                    .await
+                    .map_err(|e| e.0)
+                    .unwrap_err(),
+            );
+        }
+        assert!(last.unwrap().to_string().contains("錯誤次數過多"), "前 N 次要真的跑到業務邏輯");
+        let before = audit_rows(&st.db);
+        assert_eq!(before, JOIN_LIMIT_PER_IP as i64, "每一次被鎖都寫一列");
+
+        let err = join_verify(State(st.clone()), test_session(), h(), Json(body()))
+            .await
+            .map_err(|e| e.0)
+            .unwrap_err();
+        assert!(err.to_string().contains("太頻繁"), "{err}");
+        assert_eq!(audit_rows(&st.db), before, "被限流的請求不能再寫稽核");
+    }
+
+    /// 加註備援 passkey 要先登入，額度該留給真正打不開門的人 ——
+    /// 一家人躲在同一個 NAT 後面時，這條路不能被公開流量的額度拖下水。
+    #[tokio::test]
+    async fn adding_a_backup_passkey_while_logged_in_is_not_throttled() {
+        let st = test_state();
+        db::create_user_with_platforms(&st.db, "u1", "a@x.tw", "a@x.tw", "member", Some("a@x.tw"), &[])
+            .unwrap();
+        let h = || hdrs(&[("cf-connecting-ip", "203.0.113.12")]);
+        for i in 0..(JOIN_LIMIT_PER_IP + 5) {
+            let session = test_session();
+            session.insert(S_USER, &"u1".to_string()).await.unwrap();
+            session.insert(S_NAME, &"a@x.tw".to_string()).await.unwrap();
+            let res = register_start(
+                State(st.clone()),
+                session,
+                h(),
+                Json(RegisterStart { email: None, bootstrap_token: None, nickname: None }),
+            )
+            .await;
+            if let Err(e) = res {
+                panic!("第 {} 次就被擋了: {}", i + 1, e.0);
+            }
+        }
+    }
+
+    /// register/start 與 join/invite 同樣不需要登入、同樣每次失敗寫一列稽核。
+    /// 只擋 join/start 等於把洪水改個門牌就放進來 —— 而列數上限會讓這波洪水
+    /// 在下一次清理時把真正的稽核軌跡整批擠掉。
+    #[tokio::test]
+    async fn register_start_and_join_invite_are_rate_limited_too() {
+        // register/start：庫裡先有帳號，未受邀的位址才走得到 register_not_invited
+        let st = test_state();
+        db::create_user_with_platforms(&st.db, "u1", "a@x.tw", "a@x.tw", "admin", Some("a@x.tw"), &[])
+            .unwrap();
+        let h = || hdrs(&[("cf-connecting-ip", "203.0.113.7")]);
+        let body = || RegisterStart {
+            email: Some("nobody@x.tw".into()),
+            bootstrap_token: None,
+            nickname: None,
+        };
+        let mut last = None;
+        for _ in 0..JOIN_LIMIT_PER_IP {
+            last = Some(
+                register_start(State(st.clone()), test_session(), h(), Json(body()))
+                    .await
+                    .map_err(|e| e.0)
+                    .unwrap_err(),
+            );
+        }
+        assert!(last.unwrap().to_string().contains("沒有被邀請"), "前 N 次要真的跑到業務邏輯");
+        let before = audit_rows(&st.db);
+        assert_eq!(before, JOIN_LIMIT_PER_IP as i64, "每一次未受邀都寫一列");
+
+        let err = register_start(State(st.clone()), test_session(), h(), Json(body()))
+            .await
+            .map_err(|e| e.0)
+            .unwrap_err();
+        assert!(err.to_string().contains("太頻繁"), "{err}");
+        assert_eq!(audit_rows(&st.db), before, "被限流的請求不能再寫稽核");
+
+        // join/invite：亂猜的權杖每次都寫一列 invite_link_bad
+        let st = test_state();
+        let h = || hdrs(&[("cf-connecting-ip", "203.0.113.8")]);
+        let body = || InviteTokenReq { token: "not-a-real-token".into() };
+        let mut last = None;
+        for _ in 0..JOIN_LIMIT_PER_IP {
+            last = Some(
+                join_invite(State(st.clone()), test_session(), h(), Json(body()))
+                    .await
+                    .map_err(|e| e.0)
+                    .unwrap_err(),
+            );
+        }
+        assert!(last.unwrap().to_string().contains("無效或已經用過"), "前 N 次要真的跑到業務邏輯");
+        let before = audit_rows(&st.db);
+        assert_eq!(before, JOIN_LIMIT_PER_IP as i64);
+
+        let err = join_invite(State(st.clone()), test_session(), h(), Json(body()))
+            .await
+            .map_err(|e| e.0)
+            .unwrap_err();
+        assert!(err.to_string().contains("太頻繁"), "{err}");
+        assert_eq!(audit_rows(&st.db), before, "被限流的請求不能再寫稽核");
+    }
+
+    /// 上面那條攻擊鏈其實停在 `clear_auth_flows`，走不到 owner 檢查。
+    /// 這裡直接餵它該擋的情境：`register_start` 之後 session 的身分被換掉，
+    /// 而註冊狀態原封不動 —— 沒有這道檢查，憑證就會寫給換上來的那個人。
+    #[tokio::test]
+    async fn a_registration_is_refused_when_the_session_identity_changed() {
+        use webauthn_authenticator_rs::{softpasskey::SoftPasskey, WebauthnAuthenticator};
+        let st = test_state();
+        let origin = Url::parse("http://localhost").unwrap();
+        db::create_user_with_platforms(&st.db, "admin", "admin@x", "admin@x", "admin", Some("admin@x"), &[]).unwrap();
+        db::create_user_with_platforms(&st.db, "mem", "mem@x", "mem@x", "member", Some("mem@x"), &[]).unwrap();
+
+        let session = test_session();
+        session.insert(S_USER, &"mem".to_string()).await.unwrap();
+        session.insert(S_NAME, &"mem@x".to_string()).await.unwrap();
+
+        // 1. member 正常開始「新增 Passkey」，目標是自己
+        let ccr = register_start(
+            State(st.clone()), session.clone(), hdrs(&[]),
+            Json(RegisterStart { email: None, bootstrap_token: None, nickname: None }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap()
+        .0;
+
+        // 2. 換人 —— 不經任何清除，只有「誰在這個 session 上」變了
+        session.insert(S_USER, &"admin".to_string()).await.unwrap();
+
+        // 3. 提交第 1 步的註冊回應
+        let mut key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let cred = key.do_registration(origin, ccr).unwrap();
+        let err = register_finish(State(st.clone()), session.clone(), hdrs(&[]), Json(cred))
+            .await
+            .expect_err("註冊目標與登入者不符就不該通過");
+
+        assert!(err.0.to_string().contains("不符"), "要擋在 owner 檢查，拿到的是：{}", err.0);
+        assert!(db::credentials_for(&st.db, "admin").unwrap().is_empty(), "admin 不得多出憑證");
+        assert!(db::credentials_for(&st.db, "mem").unwrap().is_empty(), "member 也不該拿到");
+    }
+
+    /// 報告 #10：登入後要把 passkey 學到的狀態寫回 DB。softpasskey 每次簽章
+    /// counter 都 +1，所以連登兩次之後 DB 裡那份 JSON 的 counter 必須跟著動 ——
+    /// 之前是 `let _ = touch_credential`，只記時間、憑證材料永遠停在註冊當下。
+    ///
+    /// softpasskey 不是瀏覽器：可探索登入的挑戰 `allowCredentials` 是空的，
+    /// 它挑不出金鑰、也不會帶 userHandle。這裡代替瀏覽器做那兩件事，
+    /// 其餘（簽章、counter）都是它真的算出來的。
+    #[tokio::test]
+    async fn a_login_writes_the_passkey_state_back() {
+        use webauthn_authenticator_rs::{softpasskey::SoftPasskey, WebauthnAuthenticator};
+        let st = test_state();
+        let origin = Url::parse("http://localhost").unwrap();
+        let uid = Uuid::new_v4();
+        db::create_user_with_platforms(&st.db, &uid.to_string(), "mei@x.tw", "mei", "member", Some("mei@x.tw"), &[]).unwrap();
+
+        // 註冊一把
+        let mut key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let reg = test_session();
+        reg.insert(S_USER, &uid.to_string()).await.unwrap();
+        reg.insert(S_NAME, &"mei@x.tw".to_string()).await.unwrap();
+        let ccr = register_start(
+            State(st.clone()), reg.clone(), hdrs(&[]),
+            Json(RegisterStart { email: None, bootstrap_token: None, nickname: None }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap()
+        .0;
+        let cred = key.do_registration(origin.clone(), ccr).unwrap();
+        let _ = register_finish(State(st.clone()), reg, hdrs(&[]), Json(cred)).await.map_err(|e| e.0).unwrap();
+
+        let stored = || {
+            let json = db::credentials_for(&st.db, &uid.to_string()).unwrap().remove(0);
+            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let pk: Passkey = serde_json::from_str(&json).expect("回寫後仍要能反序列化成 Passkey");
+            (v["cred"]["counter"].as_u64().unwrap(), base64_url(pk.cred_id().as_ref()))
+        };
+        let (counter0, cred_id) = stored();
+
+        let do_login = async |key: &mut WebauthnAuthenticator<SoftPasskey>| {
+            let session = test_session();
+            let rcr = login_any_start(State(st.clone()), session.clone(), hdrs(&[]))
+                .await
+                .map_err(|e| e.0)
+                .unwrap()
+                .0;
+            // 代替瀏覽器：把可用的金鑰塞回挑戰、回應補上 userHandle
+            let mut v = serde_json::to_value(&rcr).unwrap();
+            v["publicKey"]["allowCredentials"] = serde_json::json!([{ "type": "public-key", "id": cred_id }]);
+            let rcr: RequestChallengeResponse = serde_json::from_value(v).unwrap();
+            let mut cred = key.do_authentication(origin.clone(), rcr).unwrap();
+            cred.response.user_handle = Some(uid.as_bytes().to_vec().into());
+            let _ = login_any_finish(State(st.clone()), session.clone(), hdrs(&[]), Json(cred))
+                .await
+                .map_err(|e| e.0)
+                .unwrap();
+            assert_eq!(current_user(&session).await.map(|(id, _)| id), Some(uid.to_string()));
+        };
+
+        do_login(&mut key).await;
+        let (counter1, _) = stored();
+        do_login(&mut key).await;
+        let (counter2, _) = stored();
+
+        assert!(counter1 > counter0, "第一次登入後 counter 要前進：{counter0} → {counter1}");
+        assert!(counter2 > counter1, "第二次登入後也要：{counter1} → {counter2}");
+        assert!(db::list_credentials(&st.db, &uid.to_string()).unwrap()[0].last_used_at.is_some());
+    }
+
+    /// 對稱檢查：註冊那一側也要清得乾淨。登入流程留下的挑戰若活過
+    /// `register_start`，下一次 finish 就有另一條流程的目標可讀。
+    #[tokio::test]
+    async fn starting_a_registration_wipes_any_pending_login() {
+        let st = test_state();
+        db::create_user_with_platforms(&st.db, "u1", "mei@x.tw", "mei", "member", Some("mei@x.tw"), &[]).unwrap();
+
+        let session = test_session();
+        session.insert(S_USER, &"u1".to_string()).await.unwrap();
+        session.insert(S_NAME, &"mei@x.tw".to_string()).await.unwrap();
+        // `clear_auth_flows` 按鍵清除、不看型別，放什麼都會被清掉
+        session.insert(S_DISC, &serde_json::json!("stale")).await.unwrap();
+
+        let _ = register_start(
+            State(st.clone()), session.clone(), hdrs(&[]),
+            Json(RegisterStart { email: None, bootstrap_token: None, nickname: None }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap();
+
+        assert!(session.get::<serde_json::Value>(S_DISC).await.unwrap().is_none());
+        // 清完之後才輪到自己的狀態進場
+        assert!(session.get::<PendingReg>(S_REG_USER).await.unwrap().is_some());
+        // 登入身分刻意留著 —— 加備援金鑰本來就要在登入狀態下做
+        assert_eq!(current_user(&session).await.map(|(id, _)| id).as_deref(), Some("u1"));
+    }
+
+    /// 可探索登入也是一條獨立的狀態機，開始時同樣要把註冊那側清空。
+    #[tokio::test]
+    async fn starting_a_discoverable_login_wipes_any_pending_registration() {
+        let st = test_state();
+        let session = test_session();
+        let (_, reg_state) = st
+            .webauthn
+            .start_passkey_registration(Uuid::new_v4(), "a@x", "a@x", None)
+            .unwrap();
+        session.insert(S_REG, &reg_state).await.unwrap();
+        session
+            .insert(S_REG_USER, &PendingReg {
+                user_id: "u1".into(), username: "a@x".into(), email: None, is_new: false,
+                role: "member".into(), bootstrap_token: None, nickname: None,
+            })
+            .await
+            .unwrap();
+
+        let _ = login_any_start(State(st.clone()), session.clone(), hdrs(&[])).await.map_err(|e| e.0).unwrap();
+
+        assert!(session.get::<PasskeyRegistration>(S_REG).await.unwrap().is_none());
+        assert!(session.get::<PendingReg>(S_REG_USER).await.unwrap().is_none());
+        // 清完之後才輪到自己的挑戰進場
+        assert!(session.get::<DiscoverableAuthentication>(S_DISC).await.unwrap().is_some());
+    }
+
     /// 白名單的授權對象必須是**那一戶的 IPv4**，不是連線來源。
     ///
     /// 面板走 Cloudflare Tunnel，看到的是開面板那台裝置連到 Cloudflare 用的
@@ -3484,13 +5418,11 @@ mod tests {
     /// 公網 IPv4 帶進 `?ip=`，這裡釘住後端會採信它。
     #[tokio::test]
     async fn the_claimed_ipv4_wins_over_the_ipv6_connection_address() {
-        use tower_sessions::{MemoryStore, Session};
-
         let st = test_state();
         db::create_user_with_platforms(&st.db, "u1", "mei@x.tw", "mei", "member", Some("mei@x.tw"), &[]).unwrap();
         db::upsert_allow(&st.db, "4.3.2.1", None, Some("mei@x.tw"), db::now() + 86400, 1).unwrap();
 
-        let session = Session::new(None, std::sync::Arc::new(MemoryStore::default()), None);
+        let session = test_session();
         session.insert(S_USER, "u1".to_string()).await.unwrap();
         session.insert(S_NAME, "mei@x.tw".to_string()).await.unwrap();
 
@@ -3521,10 +5453,99 @@ mod tests {
 
         // ⚠️ 未登入時一律不採信：這支端點不需要登入就打得到，採信了它就變成
         //    「某個 IP 在不在白名單裡」的探測器。
-        let anon = Session::new(None, std::sync::Arc::new(MemoryStore::default()), None);
+        let anon = test_session();
         let out = status(State(st), anon, h, q(Some("4.3.2.1"))).await.map_err(|e| e.0).unwrap().0;
         assert_eq!(out.my_ip.as_deref(), Some("2001:db8:5c07:5ec7::1"));
         assert!(!out.my_ip_allowed, "未登入不得靠 ?ip= 問出白名單內容");
+    }
+
+    /// ⚠️ 別人加過的 IP 不是「延長授權」，而是改寫別人的條目：標籤、到期
+    /// 時間、天數都會被蓋掉，到期提醒也被重設。member 一律擋下，所有權爭議
+    /// 交給 admin。
+    #[tokio::test]
+    async fn a_member_cannot_rewrite_another_members_allow_entry() {
+        let st = test_state();
+        db::create_user_with_platforms(&st.db, "ua", "a@x", "a", "member", Some("a@x"), &[]).unwrap();
+        db::create_user_with_platforms(&st.db, "ub", "b@x", "b", "member", Some("b@x"), &[]).unwrap();
+        db::upsert_allow(&st.db, "4.3.2.1", Some("老家"), Some("a@x"), db::now() + 30 * 86400, 30).unwrap();
+
+        let session = test_session();
+        session.insert(S_USER, "ub".to_string()).await.unwrap();
+        session.insert(S_NAME, "b@x".to_string()).await.unwrap();
+
+        let err = allow_add(
+            State(st.clone()),
+            session,
+            hdrs(&[]),
+            Json(AllowReq {
+                ip: Some("4.3.2.1".into()),
+                label: Some("hijack".into()),
+                ttl_days: Some(1),
+            }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .expect_err("別人名下的 IP 不該讓 member 改寫");
+        assert!(err.to_string().contains("不是你新增的"), "拿到的是：{err}");
+
+        let e = db::list_allow(&st.db).unwrap().into_iter().find(|e| e.ip == "4.3.2.1").unwrap();
+        assert_eq!(
+            (e.added_by.as_deref(), e.label.as_deref(), e.ttl_days),
+            (Some("a@x"), Some("老家"), 30),
+            "被拒絕的請求不得留下任何痕跡"
+        );
+    }
+
+    /// 報告 #3：已登入的人不能無限加 Passkey。`register_start` 就要說清楚
+    /// 為什麼，不必等到裝置確認完才在 finish 被打回。
+    #[tokio::test]
+    async fn register_start_refuses_when_the_passkey_cap_is_reached() {
+        let st = test_state();
+        db::create_user_with_platforms(&st.db, "u1", "mei@x.tw", "mei", "member", Some("mei@x.tw"), &[]).unwrap();
+        for i in 0..MAX_PASSKEYS_PER_USER {
+            assert!(db::add_credential(&st.db, &format!("c{i}"), "u1", "{}", None, MAX_PASSKEYS_PER_USER).unwrap());
+        }
+
+        let session = test_session();
+        session.insert(S_USER, &"u1".to_string()).await.unwrap();
+        session.insert(S_NAME, &"mei@x.tw".to_string()).await.unwrap();
+
+        let err = register_start(
+            State(st.clone()), session.clone(), hdrs(&[]),
+            Json(RegisterStart { email: None, bootstrap_token: None, nickname: None }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .expect_err("滿額就不該發挑戰");
+        assert!(err.to_string().contains("已達上限"), "拿到的是：{err}");
+        assert!(session.get::<PendingReg>(S_REG_USER).await.unwrap().is_none(), "不該留下註冊狀態");
+    }
+
+    /// 額度只在「全新的 IP」時扣，但那條路要真的擋得住 —— 額度滿了就不能
+    /// 再授權沒看過的網路。
+    #[tokio::test]
+    async fn a_full_quota_rejects_a_new_ip() {
+        let mut cfg = Config::from_env().unwrap();
+        cfg.max_per_user = 1;
+        let st = state_with(cfg);
+        db::create_user_with_platforms(&st.db, "ua", "a@x", "a", "member", Some("a@x"), &[]).unwrap();
+        db::upsert_allow(&st.db, "4.3.2.1", None, Some("a@x"), db::now() + 86400, 1).unwrap();
+
+        let session = test_session();
+        session.insert(S_USER, "ua".to_string()).await.unwrap();
+        session.insert(S_NAME, "a@x".to_string()).await.unwrap();
+
+        let err = allow_add(
+            State(st.clone()),
+            session,
+            hdrs(&[]),
+            Json(AllowReq { ip: Some("1.2.3.4".into()), label: None, ttl_days: Some(1) }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .expect_err("額度滿了就不該再收新的 IP");
+        assert!(err.to_string().contains("額度已滿"), "拿到的是：{err}");
+        assert_eq!(db::list_allow(&st.db).unwrap().len(), 1, "被擋下的請求不得留下條目");
     }
 
     /// 前端呼叫的每個端點都必須接受它實際送出的方法。
@@ -3541,6 +5562,11 @@ mod tests {
 
         // (方法, 路徑)。跟 api.js 的呼叫一一對應。
         let cases: &[(&str, &str)] = &[
+            // 登入的兩條路（可探索 Passkey／Email 驗證碼）與加入
+            ("POST", "/api/login/any/start"),
+            ("POST", "/api/login/otp/start"),
+            ("POST", "/api/login/otp/verify"),
+            ("POST", "/api/join/start"),
             // 不帶 body —— api.js 必須明寫 method: 'POST'
             ("POST", "/api/recipients/1/verify"),
             ("POST", "/api/mailboxes"),
@@ -3557,6 +5583,8 @@ mod tests {
             ("POST", "/api/me/forwarding"),
             // ⚠️ 這支不帶 body —— api.js 必須明寫 method: 'POST'
             ("POST", "/api/me/forwarding/resend"),
+            // 全文只從這支出去（清單只有摘要），跟同路徑的 DELETE 併在一條路由上
+            ("GET", "/api/mail/1"),
         ];
 
         for (method, path) in cases {
@@ -3616,5 +5644,28 @@ mod tests {
     #[test]
     fn router_builds_without_conflicts() {
         let _ = routes(test_state());
+    }
+
+    /// 寄件者宣告的日期只當顯示用，太舊或在未來都改用現在。
+    /// 「太舊」以保留期為界 —— 留不了 14 天以上的信，就不該顯示得比那更舊。
+    #[test]
+    fn claimed_dates_are_clamped_to_a_sane_window() {
+        let now = 1_800_000_000;
+        let keep = 14;
+        assert_eq!(clamp_received(None, now, keep), now);
+        assert_eq!(clamp_received(Some(now - 60), now, keep), now - 60);
+        assert_eq!(clamp_received(Some(now + 10 * 365 * 86400), now, keep), now);
+        assert_eq!(clamp_received(Some(now - 400 * 86400), now, keep), now);
+        assert_eq!(
+            clamp_received(Some(now - 13 * 86400), now, keep),
+            now - 13 * 86400,
+            "還在保留期內的日期照原樣顯示"
+        );
+        assert_eq!(
+            clamp_received(Some(now - 15 * 86400), now, keep),
+            now,
+            "比保留期還舊的信根本不可能在庫裡，那日期是假的"
+        );
+        assert_eq!(clamp_received(Some(now + 1800), now, keep), now + 1800, "時鐘誤差一小時內接受");
     }
 }

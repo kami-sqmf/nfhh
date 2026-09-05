@@ -1,6 +1,7 @@
 <script>
   import { app, notify, fail } from '../../lib/state.svelte.js'
   import { api } from '../../lib/api.js'
+  import { mailList } from '../../lib/mail.svelte.js'
   import { stamp } from '../../lib/time.js'
   import SubHeader from '../../components/SubHeader.svelte'
   import Pill from '../../components/Pill.svelte'
@@ -9,9 +10,9 @@
 
   // 設計 1n。不做平台過濾也不做驗證過濾 —— 這是 admin 診斷
   // 「為什麼某封信沒出現在驗證碼分頁」的地方，看得到全部才有用。
-  let mails = $state([])
+  const list = mailList(api.inbox)
+  const mails = $derived(list.mails)
   let filter = $state('all')
-  let viewing = $state(null)
 
   const platform = (c) => app.status?.platforms?.find((p) => p.code === c)
   const platformName = (c) => platform(c)?.name ?? (c ?? '未知')
@@ -45,12 +46,8 @@
     unknown: { tone: 'none', text: '無驗證資訊' },
   }
 
-  async function load() {
-    try { mails = await api.inbox() } catch (e) { fail(e) }
-  }
-
   async function del(id) {
-    try { await api.deleteMail(id); mails = mails.filter((m) => m.id !== id) } catch (e) { fail(e) }
+    try { await api.deleteMail(id); list.mails = mails.filter((m) => m.id !== id) } catch (e) { fail(e) }
   }
 
   async function purge() {
@@ -58,11 +55,11 @@
     try {
       const r = await api.purgeMails()
       notify(`已刪除 ${r.deleted} 封`, true)
-      mails = []
+      list.mails = []
     } catch (e) { fail(e) }
   }
 
-  $effect(() => { load() })
+  $effect(() => { list.load() })
 </script>
 
 <SubHeader title="收件匣">
@@ -106,7 +103,7 @@
         </div>
         <div class="flex gap-1.5 shrink-0">
           <button
-            onclick={() => (viewing = m)}
+            onclick={() => list.view(m)}
             class="px-2.5 py-2 min-h-0 rounded-sm border-[1.5px] border-line-firm text-label font-medium"
           >原始信件</button>
           <button
@@ -132,4 +129,4 @@
   {/each}
 </div>
 
-<MailView mail={viewing} onclose={() => (viewing = null)} />
+<MailView mail={list.viewing} onclose={() => (list.viewing = null)} />

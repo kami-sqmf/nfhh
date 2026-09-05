@@ -125,10 +125,11 @@ fn text_body(code: &str, ttl_minutes: i64) -> String {
     format!(
         "你的驗證碼是 {code}\n\n\
          請在 {ttl_minutes} 分鐘內回到控制台輸入。\n\n\
-         這組碼只用來確認這個信箱是你的。通過後會請你在手機上建立 Passkey，\n\
-         之後登入都不再需要信箱或密碼。\n\n\
-         如果你沒有要求加入，忽略這封信即可 —— 沒有你的 Passkey，\n\
-         光有這組碼不能登入任何東西。\n"
+         這組碼用來確認這個信箱是你的：第一次加入時，通過後會請你在手機上\n\
+         建立 Passkey，之後登入都不再需要信箱或密碼；已經有帳號的人可以用它\n\
+         暫時登入一次。\n\n\
+         如果你沒有要求這組碼，忽略這封信即可，但不要把它交給任何人 ——\n\
+         拿到它的人就能以你的身分進到控制台。\n"
     )
 }
 
@@ -224,13 +225,14 @@ mod tests {
         println!("已寄至 {to}");
     }
 
-    /// 內文要講清楚「光有這組碼不能登入」，否則收到釣魚信的人
-    /// 會以為自己的帳號正在被入侵。
+    /// 驗證碼現在也能登入（見 otp.rs），內文得講清楚「別把它給任何人」——
+    /// 而且不能再寫「光有碼不能登入」，那句已經不是真的。
     #[test]
-    fn body_explains_that_the_code_alone_grants_nothing() {
+    fn body_tells_the_reader_not_to_hand_the_code_to_anyone() {
         let b = text_body("482913", 10);
         assert!(b.contains("482913"));
         assert!(b.contains("10 分鐘"));
-        assert!(b.contains("不能登入"));
+        assert!(b.contains("不要把它交給任何人"));
+        assert!(!b.contains("不能登入"));
     }
 }

@@ -27,8 +27,28 @@ const JWT_LIFETIME_SECS: i64 = 12 * 3600;
 /// RFC 8188 的記錄大小。酬載遠小於這個值，只會有一筆記錄。
 const RECORD_SIZE: u32 = 4096;
 
-const B64: base64::engine::general_purpose::GeneralPurpose =
+pub(crate) const B64: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+/// 瀏覽器給的 p256dh 是 65 bytes 的未壓縮 P-256 公鑰、auth 是 16 bytes。
+/// 先擋字串長度（87 與 22 個 base64url 字元，多一點容錯），再解碼，
+/// 最後確認 p256dh 真的是曲線上的點 —— 解不開、長度不對、不在曲線上的
+/// 都不是訂閱，是想塞進資料庫的任意字串。
+///
+/// ⚠️ 長度要**剛好 65**，不能只問 `from_sec1_bytes` 收不收：33 bytes 的
+///    壓縮點它會自己解壓縮，ECDH 因此算得出來、推送服務照樣回 201，但
+///    `encrypt` 是把呼叫端給的那串位元組原封不動放進 RFC 8291 的 key_info，
+///    而瀏覽器那邊用的是自己的未壓縮形式 —— 兩邊的 key_info 不同，
+///    那台裝置一輩子解不開，而且沒有任何一次會回報失敗。
+pub fn valid_keys(p256dh: &str, auth: &str) -> bool {
+    if p256dh.len() > 88 || auth.len() > 24 {
+        return false;
+    }
+    let (Ok(pk), Ok(a)) = (B64.decode(p256dh), B64.decode(auth)) else {
+        return false;
+    };
+    a.len() == 16 && pk.len() == 65 && p256::PublicKey::from_sec1_bytes(&pk).is_ok()
+}
 
 /// 要送到裝置上的通知。欄位名對應 service worker 讀的那幾個。
 #[derive(Debug, Clone, Serialize)]
@@ -55,8 +75,17 @@ impl Push {
         Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
+                // endpoint 是成員自填的字串。reqwest 預設跟 10 次轉址，跟著
+                // 30x 走等於讓人拿主機的網路位置去戳內網（Location 指到
+                // 10.x／127.x 就到了）。推送服務從不轉址，收到 3xx 直接當
+                // 失敗（`send` 的 `!is_success()` 已涵蓋）。`https_only` 是
+                // 第二道：訂閱時擋過 http，這裡再擋一次，兩邊誰漏了都還有另一邊。
+                .redirect(reqwest::redirect::Policy::none())
+                .https_only(true)
                 .build()
-                .unwrap_or_default(),
+                // 不退回 `Client::default()`：那顆會跟轉址、也收 http，上面
+                // 兩道防線就靜靜消失了。建不起來就在啟動時炸出來。
+                .expect("建立推播用的 HTTP 客戶端失敗"),
             contact: format!("mailto:{}", mail_from.trim()),
         }
     }
@@ -92,7 +121,17 @@ impl Push {
             return Ok(false);
         }
         if !status.is_success() {
-            let detail = res.text().await.unwrap_or_default();
+            // 只讀前 4 KiB：推送服務的錯誤內容不值得為它佔記憶體，
+            // 惡意 endpoint 更可能回一大坨
+            let mut res = res;
+            let mut buf = Vec::new();
+            while let Ok(Some(chunk)) = res.chunk().await {
+                buf.extend_from_slice(&chunk);
+                if buf.len() >= 4096 {
+                    break;
+                }
+            }
+            let detail = String::from_utf8_lossy(&buf);
             bail!("推送服務回 {status}：{}", detail.chars().take(200).collect::<String>());
         }
         Ok(true)

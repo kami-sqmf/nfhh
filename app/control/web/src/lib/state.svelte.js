@@ -29,10 +29,10 @@ export const app = $state({
   tab: 'home',
   /** 管理分頁的子頁：null = 管理首頁 */
   sub: null,
-  /** 未登入時的流程：login | join | joincode | invited */
+  /** 未登入時的流程：login | join | joincode | invited | loginemail | logincode */
   authStep: inviteToken ? 'invited' : 'login',
-  /** 加入流程進行中的信箱，在三個畫面之間傳遞 */
-  joinEmail: '',
+  /** 加入／驗證碼登入流程進行中的信箱，在信箱頁與驗證碼頁之間傳遞（兩個流程共用） */
+  flowEmail: '',
   /** 邀請函連結帶進來的權杖。null = 從一般入口進來的 */
   inviteToken,
   msg: null, // { text, ok }

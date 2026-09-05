@@ -92,6 +92,34 @@ fn read_head(path: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// 該平台清單檔裡的網域（跳過註解與空行、一律小寫）。給連結背書用：
+/// 卡片只替落在這些網域下的連結畫品牌按鈕。
+///
+/// ⚠️ 因此清單裡只能放**平台自己持有**的網域（見 DECISIONS.md）。
+pub fn domains(dir: &str, code: &str) -> Vec<String> {
+    let path = format!("{dir}/{code}.list");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            // 檔案不在（平台為空、清單被 disabled）是正常情況；權限錯之類的要留下線索，
+            // 否則按鈕集體消失沒人知道為什麼。
+            // 只警告一次：這支在每次清單請求、每個平台都會被叫到，前端又會輪詢。
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if e.kind() != std::io::ErrorKind::NotFound
+                && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                tracing::warn!("讀不到平台清單 {path}（{e}），該平台的連結不會有品牌按鈕；之後同類錯誤不再記錄");
+            }
+            return Vec::new();
+        }
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.to_lowercase())
+        .collect()
+}
+
 /// 從收件信箱推平台：`netflix@share.example.com` → `netflix`。
 ///
 /// 用信箱而不是 DKIM 簽章網域：信箱是你自己指派的，意圖明確；
@@ -356,5 +384,13 @@ mod tests {
     #[test]
     fn missing_directory_yields_empty_list() {
         assert!(list("/nonexistent/domain-set").is_empty());
+    }
+
+    #[test]
+    fn domains_reads_the_list_skipping_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("netflix.list"), "# platform-name: Netflix\n\nnetflix.com\nNFLXEXT.com\n").unwrap();
+        assert_eq!(domains(dir.path().to_str().unwrap(), "netflix"), vec!["netflix.com", "nflxext.com"]);
+        assert!(domains(dir.path().to_str().unwrap(), "nope").is_empty());
     }
 }

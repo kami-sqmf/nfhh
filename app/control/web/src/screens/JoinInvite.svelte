@@ -107,7 +107,7 @@
   <button
     onclick={() => {
       // 位址帶過去，那頁就不必再打一次（打錯會被當成沒被邀請）
-      app.joinEmail = invite?.email ?? app.joinEmail
+      app.flowEmail = invite?.email ?? app.flowEmail
       app.authStep = 'join'
     }}
     class="mt-4 mb-8 w-full py-2.5 min-h-0 text-body text-fg-faint"

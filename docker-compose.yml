@@ -74,6 +74,11 @@ services:
       # Email Worker 推送信件用的共用密鑰，值在 .env。留空則 /api/mail/ingest 停用。
       NFHH_MAIL_SECRET: "${NFHH_MAIL_SECRET:-}"
       NFHH_MAIL_KEEP_DAYS: "14"
+      # 只採信這個 authserv-id 寫的 Authentication-Results。見 docs/DECISIONS.md
+      NFHH_MAIL_AUTHSERV_ID: "${NFHH_MAIL_AUTHSERV_ID:-mx.cloudflare.net}"
+      # 稽核表的保留期與列數上限。公開端點的每次失敗都寫一列，沒有上限就是免費的磁碟
+      NFHH_AUDIT_KEEP_DAYS: "${NFHH_AUDIT_KEEP_DAYS:-90}"
+      NFHH_AUDIT_MAX_ROWS: "${NFHH_AUDIT_MAX_ROWS:-20000}"
       # 註冊流程寄 Email 驗證碼與邀請函用。留空則兩者都停用。
       NFHH_RESEND_KEY: "${RESEND_API_KEY:-}"
       NFHH_MAIL_FROM: "${NFHH_MAIL_FROM:-share@${NFHH_DOMAIN}}"

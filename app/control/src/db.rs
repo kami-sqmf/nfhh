@@ -71,6 +71,49 @@ fn migrate(conn: &Connection) -> Result<()> {
         migrate_v11(conn)?;
         conn.pragma_update(None, "user_version", 11)?;
     }
+    if version < 12 {
+        migrate_v12(conn)?;
+        conn.pragma_update(None, "user_version", 12)?;
+    }
+    if version < 13 {
+        migrate_v13(conn)?;
+        conn.pragma_update(None, "user_version", 13)?;
+    }
+    Ok(())
+}
+
+/// v13：驗證碼的用途。
+///
+/// 驗證碼從只給「加入」用，變成也能「登入」（見 otp.rs 檔頭）。兩種碼寄到
+/// 同一個信箱、長得一樣，卻換到不同的東西：一個換「可以建帳號」，一個換
+/// 「直接進到面板」。沒有這欄，加入流程寄出的碼可以拿去登入端點試，反之
+/// 登入碼也能拿去過 `register_start` 的信箱證明。`check_otp` 與
+/// `otp_recently_verified` 只認同用途的列。
+///
+/// 既有的列一律視為 `join`：升級當下在途的碼全是加入流程寄的。
+fn migrate_v13(conn: &Connection) -> Result<()> {
+    add_column(conn, "email_otp", "purpose", "TEXT NOT NULL DEFAULT 'join'")
+}
+
+/// v12：可信的接收時間。
+///
+/// `received_at` 來自寄件者的 `Date:` 表頭 —— 拿它排序與清除，一封未來日期的
+/// 信可以永遠排第一、永遠不被清。`ingested_at` 是面板自己的時鐘，
+/// 排序、分頁、保留期一律只看它；`received_at` 降為顯示用。
+///
+/// 這欄的契約是「永不為 NULL」：遷移後仍是 NULL 的列一律當成過期資料清掉
+/// （見 [`purge_old_mails`]）—— 舊版執行檔滾回這顆庫上會插出沒填這欄的信，
+/// 留著就永遠躲過保留期。
+fn migrate_v12(conn: &Connection) -> Result<()> {
+    add_column(conn, "mails", "ingested_at", "INTEGER")?;
+    // 回填不能原樣抄 received_at：升級前就躺在表裡的偽造未來日期會直接變成
+    // 「可信」時間，繼續置頂、繼續逃過清理。夾到遷移當下。
+    conn.execute_batch(
+        "UPDATE mails SET ingested_at = min(received_at, unixepoch()) WHERE ingested_at IS NULL;
+         CREATE INDEX IF NOT EXISTS idx_mails_ingested ON mails(ingested_at DESC);
+         -- 已經沒有任何查詢對 received_at 排序或過濾，這條索引只剩維護成本
+         DROP INDEX IF EXISTS idx_mails_at;",
+    )?;
     Ok(())
 }
 
@@ -247,7 +290,8 @@ fn migrate_v6(conn: &Connection) -> Result<()> {
             expires_at  INTEGER NOT NULL,
             attempts    INTEGER NOT NULL DEFAULT 0,
             sent_at     INTEGER NOT NULL,  -- 重寄冷卻的基準
-            verified_at INTEGER
+            verified_at INTEGER,
+            purpose     TEXT NOT NULL DEFAULT 'join'  -- join／login，見 v13
         );
 
         -- 成員 × 平台的授權矩陣。
@@ -435,8 +479,8 @@ pub struct User {
     pub display_name: String,
     /// "admin" 可管理邀請碼並移除任何人的白名單；"member" 只能管自己加的
     pub role: String,
-    /// 面板一律以 email 稱呼使用者。v6 之前註冊的帳號為 None，
-    /// 首次登入時會被要求補填。
+    /// 面板一律以 email 稱呼使用者。v6 之後建立的帳號一定有值 ——
+    /// 補填流程已隨遷移期一起移除，欄位可空只是 schema 還留著的形狀。
     pub email: Option<String>,
 }
 
@@ -445,10 +489,20 @@ impl User {
         self.role == "admin"
     }
 
-    /// 畫面上顯示用。舊帳號還沒補 email 之前退回 username。
+    /// 畫面上顯示用。email 是可空欄位，沒有值就退回 username。
     pub fn label(&self) -> &str {
         self.email.as_deref().unwrap_or(&self.username)
     }
+}
+
+/// 遷移期已結束，不該再有沒有 email 的帳號。啟動時點名漏網的 ——
+/// 回的是 username，因為那種帳號正好沒有 email 可以稱呼。
+pub fn users_without_email(db: &Db) -> Result<Vec<String>> {
+    let conn = db.lock().unwrap();
+    let mut stmt =
+        conn.prepare("SELECT username FROM users WHERE email IS NULL ORDER BY username")?;
+    let rows = stmt.query_map([], |r| r.get(0))?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
 pub fn user_count(db: &Db) -> Result<i64> {
@@ -466,17 +520,6 @@ fn row_to_user(r: &rusqlite::Row) -> rusqlite::Result<User> {
         role: r.get(3)?,
         email: r.get(4)?,
     })
-}
-
-pub fn find_user(db: &Db, username: &str) -> Result<Option<User>> {
-    let conn = db.lock().unwrap();
-    Ok(conn
-        .query_row(
-            &format!("SELECT {USER_COLS} FROM users WHERE username = ?1"),
-            params![username],
-            row_to_user,
-        )
-        .optional()?)
 }
 
 /// 登入以 email 為入口。位址一律正規化後比對。
@@ -509,15 +552,6 @@ pub fn list_users(db: &Db) -> Result<Vec<User>> {
     ))?;
     let rows = stmt.query_map([], row_to_user)?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
-}
-
-pub fn set_user_email(db: &Db, id: &str, email: &str) -> Result<()> {
-    let conn = db.lock().unwrap();
-    conn.execute(
-        "UPDATE users SET email = ?2 WHERE id = ?1",
-        params![id, norm(email)],
-    )?;
-    Ok(())
 }
 
 /// 角色升降。呼叫端負責擋掉「拿掉最後一個 admin」——
@@ -644,20 +678,26 @@ pub struct Credential {
     pub last_used_at: Option<i64>,
 }
 
+/// 幫某人存一把新 passkey。回 false = 這個人已有 `max_per_user` 把，沒有寫入。
+///
+/// 上限檢查與 INSERT 是同一句 SQL（`INSERT … SELECT … WHERE count < max`）：
+/// 兩個分頁同時按「新增 Passkey」時，不會各自數到 9 把然後各寫一把變 11。
 pub fn add_credential(
     db: &Db,
     cred_id: &str,
     user_id: &str,
     passkey_json: &str,
     nickname: Option<&str>,
-) -> Result<()> {
+    max_per_user: i64,
+) -> Result<bool> {
     let conn = db.lock().unwrap();
-    conn.execute(
+    let n = conn.execute(
         "INSERT INTO credentials (id, user_id, passkey, nickname, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![cred_id, user_id, passkey_json, nickname, now()],
+         SELECT ?1, ?2, ?3, ?4, ?5
+         WHERE (SELECT COUNT(*) FROM credentials WHERE user_id = ?2) < ?6",
+        params![cred_id, user_id, passkey_json, nickname, now(), max_per_user],
     )?;
-    Ok(())
+    Ok(n == 1)
 }
 
 pub fn list_credentials(db: &Db, user_id: &str) -> Result<Vec<Credential>> {
@@ -723,12 +763,29 @@ pub fn credential_count(db: &Db, user_id: &str) -> Result<i64> {
     )?)
 }
 
-pub fn touch_credential(db: &Db, cred_id: &str) -> Result<()> {
+/// 登入成功後回寫這把 passkey 的狀態：`last_used_at` 一定更新；
+/// `passkey_json` 有值時（counter 前進、備份旗標翻了）連同新的憑證材料
+/// 一起寫，**同一句 UPDATE**。不回寫 counter 的話，被複製的 passkey
+/// 用舊 counter 登入時 webauthn-rs 就抓不到（報告 #10）。
+///
+/// WHERE 帶 `user_id`：這把是剛從那個人名下讀出來的，寫回去也只能寫回
+/// 那個人名下。改到 0 列 = 讀跟寫之間被移除了，那次登入就不算成功 ——
+/// 呼叫端不該吞掉這個錯誤。
+pub fn update_credential(
+    db: &Db,
+    cred_id: &str,
+    user_id: &str,
+    passkey_json: Option<&str>,
+) -> Result<()> {
     let conn = db.lock().unwrap();
-    conn.execute(
-        "UPDATE credentials SET last_used_at = ?1 WHERE id = ?2",
-        params![now(), cred_id],
+    let n = conn.execute(
+        "UPDATE credentials SET last_used_at = ?3, passkey = coalesce(?4, passkey)
+         WHERE id = ?1 AND user_id = ?2",
+        params![cred_id, user_id, now(), passkey_json],
     )?;
+    if n != 1 {
+        anyhow::bail!("這把 Passkey 已被移除");
+    }
     Ok(())
 }
 
@@ -780,21 +837,6 @@ pub fn allow_count_by(db: &Db, added_by: &str) -> Result<i64> {
     )?)
 }
 
-/// 把白名單的擁有者標記從舊的稱呼改成新的。
-///
-/// `added_by` 存的是**顯示名稱**而不是 user_id —— 這是 v1 就留下的形狀，
-/// 而額度與「只能移除自己加的」都靠它比對。舊帳號補填 email 之後稱呼會變，
-/// 不一起改的話那個人的條目會突然變成「不是我的」，額度也會歸零。
-///
-/// 稽核紀錄刻意**不改**：那是歷史，當時的 actor 就是叫那個名字。
-pub fn rename_owner(db: &Db, from: &str, to: &str) -> Result<usize> {
-    let conn = db.lock().unwrap();
-    Ok(conn.execute(
-        "UPDATE allowlist SET added_by = ?2 WHERE added_by = ?1",
-        params![from, to],
-    )?)
-}
-
 /// 改名不動到期時間 —— 這是純標記操作，不該偷偷續命。
 pub fn rename_allow(db: &Db, ip: &str, label: Option<&str>) -> Result<usize> {
     let conn = db.lock().unwrap();
@@ -832,6 +874,9 @@ pub fn purge_expired(db: &Db) -> Result<usize> {
     Ok(conn.execute("DELETE FROM allowlist WHERE expires_at <= ?1", params![now()])?)
 }
 
+/// ⚠️ 這支**不做任何所有權檢查**，任何呼叫者都能改寫任何人的條目。
+/// 只給 `nft::import_legacy`（開機匯入，當下還沒有使用者）與測試用；
+/// handler 一律走 `allow_add_atomic`。
 pub fn upsert_allow(
     db: &Db,
     ip: &str,
@@ -857,6 +902,124 @@ pub fn upsert_allow(
     Ok(())
 }
 
+/// 新增或改寫一條白名單。既有條目只有擁有者（或 admin）能改寫；別人的 IP
+/// 直接拒絕，回 false 且什麼都不動。
+///
+/// 檢查與寫入是同一句 SQL：`DO UPDATE … WHERE` 不成立時 changes() 是 0，
+/// 沒有「先查 owner 再 UPDATE」中間被人插隊的空隙。admin 改寫**有主**的條目
+/// 時 `added_by` 保持原擁有者 —— 那是「誰的網路」，不是「誰最後按了按鈕」；
+/// 只有**無主**的條目（`clients.nft` 匯入的沒有 added_by）會就這樣認到
+/// admin 名下，讓它從此有人負責。`coalesce` 保證這不會奪走別人的條目。
+///
+/// 這是 `allow_add_atomic` 的最後一步，吃的是呼叫端已經拿在手上的連線
+/// （或 transaction），才能跟前面的存在／額度檢查共用同一把鎖。
+fn upsert_allow_owned_on(
+    conn: &Connection,
+    ip: &str,
+    label: Option<&str>,
+    owner: &str,
+    expires_at: i64,
+    ttl_days: i64,
+    is_admin: bool,
+) -> rusqlite::Result<bool> {
+    let n = conn.execute(
+        "INSERT INTO allowlist (ip, label, added_by, added_at, expires_at, ttl_days)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(ip) DO UPDATE SET
+             label       = coalesce(excluded.label, allowlist.label),
+             expires_at  = excluded.expires_at,
+             ttl_days    = excluded.ttl_days,
+             added_by    = coalesce(allowlist.added_by, excluded.added_by),
+             expiry_notified_at = NULL
+         WHERE allowlist.added_by = excluded.added_by OR ?7",
+        params![ip, label, owner, now(), expires_at, ttl_days, is_admin],
+    )?;
+    Ok(n == 1)
+}
+
+/// 測試用：單獨驅動上面那句 SQL 的所有權語意，不必先湊出帳號與額度。
+/// handler 走 `allow_add_atomic`。
+#[cfg(test)]
+pub fn upsert_allow_owned(
+    db: &Db,
+    ip: &str,
+    label: Option<&str>,
+    owner: &str,
+    expires_at: i64,
+    ttl_days: i64,
+    is_admin: bool,
+) -> Result<bool> {
+    let conn = db.lock().unwrap();
+    Ok(upsert_allow_owned_on(&conn, ip, label, owner, expires_at, ttl_days, is_admin)?)
+}
+
+/// `allow_add_atomic` 的結果。三個失敗態各對一句給使用者看的話，
+/// 由 handler 決定怎麼講。
+#[derive(Debug, PartialEq, Eq)]
+pub enum AllowAdd {
+    Added,
+    /// 全新的 IP，但這個人的條目已經 `mine` 條、上限 `max`。
+    QuotaFull { mine: i64, max: i64 },
+    /// IP 已存在且是別人的（`is_admin` 為 false 時）。
+    NotOwner,
+    /// 呼叫者的帳號在這期間被刪了。
+    UserGone,
+}
+
+/// 新增或續期一條白名單：帳號還在 → 額度 → 寫入，**同一把鎖、同一個
+/// transaction**。
+///
+/// 分成四次呼叫時有兩個空隙：(1) admin 刪掉這個人之後、他手上還在跑的
+/// `allow_add` 照樣寫進一條無主的白名單（`delete_user` 是照 `added_by` 清
+/// 的，之後再寫進去的就沒人管）；(2) 同一個人同時開幾個請求，各自數到
+/// `max - 1` 然後各寫一條，額度就破了。兩個都是「先查再寫」的競態，
+/// 解法一樣：查跟寫之間不放鎖。
+///
+/// 額度只在「全新的 IP」時扣：已在自己名下的是延長；別人的會被 upsert
+/// 的 WHERE 拒絕（`NotOwner`），不該先扣掉呼叫者的額度。
+#[allow(clippy::too_many_arguments)]
+pub fn allow_add_atomic(
+    db: &Db,
+    user_id: &str,
+    ip: &str,
+    label: Option<&str>,
+    owner: &str,
+    expires_at: i64,
+    ttl_days: i64,
+    is_admin: bool,
+    max_per_user: i64,
+) -> Result<AllowAdd> {
+    let mut conn = db.lock().unwrap();
+    let tx = conn.transaction()?;
+
+    let user_exists: Option<i64> = tx
+        .query_row("SELECT 1 FROM users WHERE id = ?1", params![user_id], |r| r.get(0))
+        .optional()?;
+    if user_exists.is_none() {
+        return Ok(AllowAdd::UserGone);
+    }
+
+    let ip_exists: Option<i64> = tx
+        .query_row("SELECT 1 FROM allowlist WHERE ip = ?1", params![ip], |r| r.get(0))
+        .optional()?;
+    if ip_exists.is_none() {
+        let mine: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM allowlist WHERE added_by = ?1",
+            params![owner],
+            |r| r.get(0),
+        )?;
+        if mine >= max_per_user {
+            return Ok(AllowAdd::QuotaFull { mine, max: max_per_user });
+        }
+    }
+
+    if !upsert_allow_owned_on(&tx, ip, label, owner, expires_at, ttl_days, is_admin)? {
+        return Ok(AllowAdd::NotOwner);
+    }
+    tx.commit()?;
+    Ok(AllowAdd::Added)
+}
+
 pub fn remove_allow(db: &Db, ip: &str) -> Result<usize> {
     let conn = db.lock().unwrap();
     Ok(conn.execute("DELETE FROM allowlist WHERE ip = ?1", params![ip])?)
@@ -876,7 +1039,11 @@ pub struct AuditRow {
     pub client_ip: Option<String>,
 }
 
+/// 稽核明細的上限。detail 可能夾帶攻擊者控制的輸入。
+pub const AUDIT_DETAIL_MAX_CHARS: usize = 512;
+
 pub fn audit(db: &Db, actor: Option<&str>, action: &str, detail: Option<&str>, ip: Option<&str>) {
+    let detail = detail.map(|d| d.chars().take(AUDIT_DETAIL_MAX_CHARS).collect::<String>());
     if let Ok(conn) = db.lock() {
         let _ = conn.execute(
             "INSERT INTO audit (at, actor, action, detail, client_ip) VALUES (?1,?2,?3,?4,?5)",
@@ -903,6 +1070,17 @@ pub fn recent_audit(db: &Db, limit: i64) -> Result<Vec<AuditRow>> {
         })
     })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// 稽核的保留期與列數上限。這張表以前只進不出，公開端點的每一次失敗都永久佔一列。
+pub fn purge_old_audit(db: &Db, keep_days: i64, max_rows: i64) -> Result<usize> {
+    let conn = db.lock().unwrap();
+    let a = conn.execute("DELETE FROM audit WHERE at < ?1", params![now() - keep_days * 86400])?;
+    let b = conn.execute(
+        "DELETE FROM audit WHERE id NOT IN (SELECT id FROM audit ORDER BY at DESC, id DESC LIMIT ?1)",
+        params![max_rows],
+    )?;
+    Ok(a + b)
 }
 
 // ── 驗證碼信件 ────────────────────────────────────────
@@ -932,6 +1110,72 @@ pub struct Mail {
     pub primary_link: Option<String>,
 }
 
+/// 清單用的瘦身版：沒有 html / links，body 只用來跑篩選器、不序列化。
+/// 全文只在點開原始信件時才以 [`get_mail`] 單封取得。
+///
+/// 首頁與驗證碼分頁每 20 秒輪詢一次，把 body（20k 字）、html（400k 字）
+/// 與無上限的 links 一起送出去，等於讓寄件者決定每個開著的分頁要吃多少流量。
+#[derive(Debug, Serialize)]
+pub struct MailSummary {
+    pub id: i64,
+    pub received_at: i64,
+    pub sender: Option<String>,
+    pub recipient: Option<String>,
+    pub subject: Option<String>,
+    pub code: Option<String>,
+    /// 只給 [`crate::MailScope`] 跑關鍵字篩選用。刻意不在 ingest 時把
+    /// 「這封算不算驗證碼信」存成欄位：關鍵字與排除字改了要立刻生效。
+    #[serde(skip_serializing)]
+    pub body: Option<String>,
+    pub verified: Option<bool>,
+    pub platform: Option<String>,
+    pub skip_reason: Option<String>,
+    pub primary_link: Option<String>,
+}
+
+/// 清單查詢。`platforms` = None 表示不過濾（管理收件匣）；Some 只取這些
+/// 平台的信 —— 過濾放進 SQL 而不是先取 N 封再過濾，否則別的平台塞滿前
+/// N 封時，成員自己的信會從清單消失。
+///
+/// None 同時代表「不需要 body」：管理收件匣看得到全部，不跑
+/// [`crate::MailScope`] 的關鍵字篩選，於是 `body` 也不從庫裡撈出來。
+/// 反過來說，將來若有「不過濾平台但要篩關鍵字」的呼叫點，
+/// 得先把這個相依關係拆成獨立參數，不能直接傳 None。
+pub fn recent_mail_summaries(
+    db: &Db,
+    platforms: Option<&[String]>,
+    limit: i64,
+) -> Result<Vec<MailSummary>> {
+    let conn = db.lock().unwrap();
+    let json = platforms.map(|p| serde_json::to_string(p).unwrap_or_else(|_| "[]".into()));
+    let cols = SUMMARY_COLS.replace("{body}", if json.is_some() { "body" } else { "NULL" });
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {cols}
+         FROM mails
+         WHERE (?2 IS NULL OR platform IN (SELECT value FROM json_each(?2)))
+         ORDER BY ingested_at DESC, id DESC LIMIT ?1"
+    ))?;
+    let rows = stmt.query_map(params![limit, json], |r| {
+        let links: Vec<String> =
+            serde_json::from_str(&r.get::<_, String>(10).unwrap_or_else(|_| "[]".into()))
+                .unwrap_or_default();
+        Ok(MailSummary {
+            id: r.get(0)?,
+            received_at: r.get(1)?,
+            sender: r.get(2)?,
+            recipient: r.get(3)?,
+            subject: r.get(4)?,
+            code: r.get(5)?,
+            body: r.get(6)?,
+            verified: r.get::<_, Option<i64>>(7).unwrap_or(None).map(|v| v != 0),
+            platform: r.get(8)?,
+            skip_reason: r.get(9)?,
+            primary_link: crate::mail::primary_link(&links),
+        })
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
 /// 回傳 true 表示是新信件；false 表示 Message-ID 已存在（Worker 重送）。
 #[allow(clippy::too_many_arguments)]
 pub fn insert_mail(
@@ -953,8 +1197,8 @@ pub fn insert_mail(
     let n = conn.execute(
         "INSERT OR IGNORE INTO mails
          (message_id, received_at, sender, recipient, subject, code, body, html, links,
-          verified, platform, skip_reason)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+          verified, platform, skip_reason, ingested_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
         params![
             message_id,
             received_at,
@@ -967,39 +1211,73 @@ pub fn insert_mail(
             serde_json::to_string(links).unwrap_or_else(|_| "[]".into()),
             verified as i64,
             platform,
-            skip_reason
+            skip_reason,
+            // 面板自己的時鐘。排序與保留期只看這欄，寄件者插不上手。
+            now()
         ],
     )?;
     Ok(n == 1)
 }
 
+/// 讀**全文**的欄位清單。單封讀取與刪除前的取列共用同一串 ——
+/// 欄位順序一旦跟 [`row_to_mail`] 的索引對不上就是全體對不上，
+/// 不會只有其中一支悄悄讀錯。清單走的是另一串（[`SUMMARY_COLS`]），
+/// 因為它刻意不讀 html。
+const MAIL_COLS: &str = "id, received_at, sender, subject, code, body, links, html, verified,
+                         platform, skip_reason, recipient";
+
+/// 讀**摘要**的欄位清單，紀律跟 [`MAIL_COLS`] 一樣：順序對不上
+/// [`recent_mail_summaries`] 的索引就是全體對不上。
+///
+/// `{body}` 由呼叫端填：只有要跑關鍵字篩選的路徑需要 body，管理收件匣
+/// 不篩選，那 60 列的 body 讀出來沒人用（一列上限 20k 字，60 列就是
+/// 幾 MB 在鎖裡搬）。
+const SUMMARY_COLS: &str = "id, received_at, sender, recipient, subject, code, {body}, verified,
+                            platform, skip_reason, links";
+
+fn row_to_mail(r: &rusqlite::Row) -> rusqlite::Result<Mail> {
+    let links_json: String = r.get(6).unwrap_or_else(|_| "[]".into());
+    let mut links: Vec<String> = serde_json::from_str(&links_json).unwrap_or_default();
+    // mail::MAX_LINK_LEN 是後加的，只擋得住之後進來的信；在那之前進庫的
+    // 列還帶著超長連結，讀出來一樣會原樣送到前端。
+    links.retain(|u| u.len() <= crate::mail::MAX_LINK_LEN);
+    Ok(Mail {
+        id: r.get(0)?,
+        received_at: r.get(1)?,
+        sender: r.get(2)?,
+        subject: r.get(3)?,
+        code: r.get(4)?,
+        body: r.get(5)?,
+        html: r.get(7).unwrap_or(None),
+        primary_link: crate::mail::primary_link(&links),
+        links,
+        verified: r.get::<_, Option<i64>>(8).unwrap_or(None).map(|v| v != 0),
+        platform: r.get(9).unwrap_or(None),
+        skip_reason: r.get(10).unwrap_or(None),
+        recipient: r.get(11).unwrap_or(None),
+    })
+}
+
+/// 測試用：整批取全文。正式路徑上沒有這種東西了 —— 清單只回
+/// [`MailSummary`]，全文一次只給一封（[`get_mail`]）。測試要驗的常是
+/// 「這幾封信的欄位長怎樣」，留一支整批取比每筆各查一次好讀。
+#[cfg(test)]
 pub fn recent_mails(db: &Db, limit: i64) -> Result<Vec<Mail>> {
     let conn = db.lock().unwrap();
-    let mut stmt = conn.prepare(
-        "SELECT id, received_at, sender, subject, code, body, links, html, verified,
-                platform, skip_reason, recipient
-         FROM mails ORDER BY received_at DESC LIMIT ?1",
-    )?;
-    let rows = stmt.query_map(params![limit], |r| {
-        let links_json: String = r.get(6).unwrap_or_else(|_| "[]".into());
-        let links: Vec<String> = serde_json::from_str(&links_json).unwrap_or_default();
-        Ok(Mail {
-            id: r.get(0)?,
-            received_at: r.get(1)?,
-            sender: r.get(2)?,
-            subject: r.get(3)?,
-            code: r.get(4)?,
-            body: r.get(5)?,
-            html: r.get(7).unwrap_or(None),
-            primary_link: crate::mail::primary_link(&links),
-            links,
-            verified: r.get::<_, Option<i64>>(8).unwrap_or(None).map(|v| v != 0),
-            platform: r.get(9).unwrap_or(None),
-            skip_reason: r.get(10).unwrap_or(None),
-            recipient: r.get(11).unwrap_or(None),
-        })
-    })?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {MAIL_COLS} FROM mails ORDER BY ingested_at DESC, id DESC LIMIT ?1"
+    ))?;
+    let rows = stmt.query_map(params![limit], row_to_mail)?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// 單封讀取：全文（body / html / links）的唯一出口。走的是跟清單、
+/// 刪除同一條可見性規則，可見性判斷在 `/api/mail/{id}` 那支重跑一次。
+pub fn get_mail(db: &Db, id: i64) -> Result<Option<Mail>> {
+    let conn = db.lock().unwrap();
+    Ok(conn
+        .query_row(&format!("SELECT {MAIL_COLS} FROM mails WHERE id = ?1"), params![id], row_to_mail)
+        .optional()?)
 }
 
 /// 「全部刪除」。回傳刪掉的筆數。
@@ -1176,13 +1454,25 @@ pub fn delete_recipient(db: &Db, id: i64) -> Result<usize> {
     Ok(conn.execute("DELETE FROM mail_recipients WHERE id = ?1", params![id])?)
 }
 
-/// 清除逾期信件，保留天數由呼叫端決定。
+/// 信件總量上限。日期可以偽造、Message-ID 可以每封不同，只有列數是寄件者
+/// 控制不了的。
+pub const MAX_MAILS: i64 = 2000;
+
+/// 清除逾期信件並套用總量上限。兩者都只看 `ingested_at`。
 pub fn purge_old_mails(db: &Db, keep_days: i64) -> Result<usize> {
     let conn = db.lock().unwrap();
-    Ok(conn.execute(
-        "DELETE FROM mails WHERE received_at < ?1",
+    // NULL 也算過期：正常路徑一定會填，填不出來的是舊版執行檔寫的列，
+    // 而 `NULL < x` 永遠不成立 —— 不特別點名就永遠清不掉。
+    let a = conn.execute(
+        "DELETE FROM mails WHERE ingested_at IS NULL OR ingested_at < ?1",
         params![now() - keep_days * 86400],
-    )?)
+    )?;
+    let b = conn.execute(
+        "DELETE FROM mails WHERE id NOT IN
+           (SELECT id FROM mails ORDER BY ingested_at DESC, id DESC LIMIT ?1)",
+        params![MAX_MAILS],
+    )?;
+    Ok(a + b)
 }
 
 /// 取出所有信件的主旨與內文供重新抽取驗證碼。
@@ -1200,8 +1490,20 @@ pub fn update_mail_code(db: &Db, id: i64, code: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-pub fn delete_mail(db: &Db, id: i64) -> Result<usize> {
+/// 讀出、判斷、刪除都在同一把鎖內：判斷用的是刪除當下那一列，不會被中間
+/// 插進來的寫入改變。`pred` 回 false 與列不存在都回 0 —— 不給枚舉 id 的人
+/// 一個存在性 oracle。
+///
+/// `pred` 在鎖內執行，不可再碰 `db` —— 這把鎖不可重入，碰了就是整個行程卡死。
+pub fn delete_mail_if(db: &Db, id: i64, pred: impl Fn(&Mail) -> bool) -> Result<usize> {
     let conn = db.lock().unwrap();
+    let row = conn
+        .query_row(&format!("SELECT {MAIL_COLS} FROM mails WHERE id = ?1"), params![id], row_to_mail)
+        .optional()?;
+    let Some(m) = row else { return Ok(0) };
+    if !pred(&m) {
+        return Ok(0);
+    }
     Ok(conn.execute("DELETE FROM mails WHERE id = ?1", params![id])?)
 }
 
@@ -1556,23 +1858,35 @@ pub fn invited_email_by_token(db: &Db, token_hash: &str) -> Result<Option<Invite
 
 // ── Email 一次性驗證碼 ────────────────────────────────
 
+/// 加入流程寄的碼：通過後換到的是「可以在這個瀏覽器建帳號」。
+pub const OTP_JOIN: &str = "join";
+/// 登入流程寄的碼：通過後直接以那個信箱的帳號登入（弱認證，見 otp.rs）。
+pub const OTP_LOGIN: &str = "login";
+
 /// 同一個信箱同時只會有一組有效的碼 —— 重寄直接覆蓋，
 /// 舊碼當場失效，避免「攻擊者觸發重寄、舊碼還能用」的窗口。
-pub fn put_otp(db: &Db, email: &str, code_hash: &str, ttl_secs: i64) -> Result<()> {
+///
+/// 用途一起覆寫：同一個信箱在「沒帳號」與「有帳號」之間切換時
+/// （家人剛註冊完），殘留的加入碼不該還被當成加入碼認。
+pub fn put_otp(db: &Db, email: &str, purpose: &str, code_hash: &str, ttl_secs: i64) -> Result<()> {
     let conn = db.lock().unwrap();
     let t = now();
     conn.execute(
-        "INSERT INTO email_otp (email, code_hash, expires_at, attempts, sent_at)
-         VALUES (?1,?2,?3,0,?4)
+        "INSERT INTO email_otp (email, code_hash, expires_at, attempts, sent_at, purpose)
+         VALUES (?1,?2,?3,0,?4,?5)
          ON CONFLICT(email) DO UPDATE SET
              code_hash=excluded.code_hash, expires_at=excluded.expires_at,
-             attempts=0, sent_at=excluded.sent_at, verified_at=NULL",
-        params![norm(email), code_hash, t + ttl_secs, t],
+             attempts=0, sent_at=excluded.sent_at, verified_at=NULL,
+             purpose=excluded.purpose",
+        params![norm(email), code_hash, t + ttl_secs, t, purpose],
     )?;
     Ok(())
 }
 
 /// 距離可以重寄還剩幾秒。0 代表現在就能重寄。
+///
+/// 刻意**不看用途**：冷卻保護的是那個信箱不被當成寄信目標洗，
+/// 加入碼跟登入碼寄到的是同一個收件匣。
 pub fn otp_cooldown(db: &Db, email: &str, cooldown_secs: i64) -> Result<i64> {
     let conn = db.lock().unwrap();
     let sent: Option<i64> = conn
@@ -1594,13 +1908,23 @@ pub enum OtpCheck {
 
 /// 驗證並在成功時標記通過。失敗一律累加 attempts ——
 /// 六位數只有一百萬種，沒有次數上限就等於沒有保護。
-pub fn check_otp(db: &Db, email: &str, code_hash: &str, max_attempts: i64) -> Result<OtpCheck> {
+///
+/// 只認同用途的列：拿加入碼來登入、拿登入碼來註冊，在這裡都跟「沒有這組碼」
+/// 一樣回 `Expired`。不累加 attempts —— 那一列根本不是這條流程的碼。
+pub fn check_otp(
+    db: &Db,
+    email: &str,
+    purpose: &str,
+    code_hash: &str,
+    max_attempts: i64,
+) -> Result<OtpCheck> {
     let conn = db.lock().unwrap();
     let email = norm(email);
     let row: Option<(String, i64, i64)> = conn
         .query_row(
-            "SELECT code_hash, expires_at, attempts FROM email_otp WHERE email = ?1",
-            params![email],
+            "SELECT code_hash, expires_at, attempts FROM email_otp
+             WHERE email = ?1 AND purpose = ?2",
+            params![email, purpose],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
@@ -1608,11 +1932,14 @@ pub fn check_otp(db: &Db, email: &str, code_hash: &str, max_attempts: i64) -> Re
     let Some((stored, expires_at, attempts)) = row else {
         return Ok(OtpCheck::Expired);
     };
-    if attempts >= max_attempts {
-        return Ok(OtpCheck::TooManyAttempts);
-    }
+    // 到期先判，次數後判：反過來的話，燒完次數的那一列會永遠回
+    // `TooManyAttempts`，連 TTL 過了都不會自癒 —— 而呼叫端每次都寫一列
+    // `join_code_locked` 稽核。鎖不該比它鎖住的那組碼活得更久。
     if expires_at <= now() {
         return Ok(OtpCheck::Expired);
+    }
+    if attempts >= max_attempts {
+        return Ok(OtpCheck::TooManyAttempts);
     }
     if stored != code_hash {
         conn.execute(
@@ -1630,12 +1957,15 @@ pub fn check_otp(db: &Db, email: &str, code_hash: &str, max_attempts: i64) -> Re
 
 /// 這個信箱剛剛通過 OTP 了嗎？註冊 passkey 前的最後一道確認。
 /// 給一個短的有效窗口，避免「幾天前驗過」還能拿來建帳號。
-pub fn otp_recently_verified(db: &Db, email: &str, window_secs: i64) -> Result<bool> {
+///
+/// 同樣只認同用途的列：登入碼通過後 `verified_at` 也會被寫上，
+/// 但那不是「可以建帳號」的證明。
+pub fn otp_recently_verified(db: &Db, email: &str, purpose: &str, window_secs: i64) -> Result<bool> {
     let conn = db.lock().unwrap();
     let v: Option<i64> = conn
         .query_row(
-            "SELECT verified_at FROM email_otp WHERE email = ?1",
-            params![norm(email)],
+            "SELECT verified_at FROM email_otp WHERE email = ?1 AND purpose = ?2",
+            params![norm(email), purpose],
             |r| r.get(0),
         )
         .optional()?
@@ -1654,14 +1984,15 @@ pub fn otp_recently_verified(db: &Db, email: &str, window_secs: i64) -> Result<b
 /// `sent_at` 新建時給 0、既有的不動：那欄是重寄冷卻的基準，而這裡根本沒寄
 /// 任何東西。給 `now()` 的話，走完連結又想退回「用 Email 加入」的人會被
 /// 擋在「請等 60 秒」後面，而他等的是一封從來沒寄出的信。
-pub fn mark_email_verified(db: &Db, email: &str) -> Result<()> {
+pub fn mark_email_verified(db: &Db, email: &str, purpose: &str) -> Result<()> {
     let conn = db.lock().unwrap();
     conn.execute(
-        "INSERT INTO email_otp (email, code_hash, expires_at, attempts, sent_at, verified_at)
-         VALUES (?1,'-',0,0,0,?2)
+        "INSERT INTO email_otp (email, code_hash, expires_at, attempts, sent_at, verified_at, purpose)
+         VALUES (?1,'-',0,0,0,?2,?3)
          ON CONFLICT(email) DO UPDATE SET
-             code_hash='-', expires_at=0, attempts=0, verified_at=excluded.verified_at",
-        params![norm(email), now()],
+             code_hash='-', expires_at=0, attempts=0, verified_at=excluded.verified_at,
+             purpose=excluded.purpose",
+        params![norm(email), now(), purpose],
     )?;
     Ok(())
 }
@@ -1759,10 +2090,14 @@ fn row_to_push(r: &rusqlite::Row) -> rusqlite::Result<PushSub> {
     })
 }
 
-/// 新增或更新一筆訂閱。
+/// 連續失敗這麼多次就不再對它扇出。
+pub const PUSH_MAX_FAILS: i64 = 10;
+
+/// 新增或更新一筆訂閱。回 false = 這個人的裝置數已達 `max_per_user`。
 ///
 /// endpoint 衝突時整筆蓋掉並把 `fail_count` 歸零 —— 那台裝置又活著了。
-/// `user_id` 也一起更新：同一台裝置可能換人登入。
+/// 只有「已經是自己的 endpoint」不佔新配額；接手別人的算新裝置，否則
+/// 配額用「重新登記別人的 endpoint」就繞掉了。整段在同一把鎖內。
 pub fn add_push_sub(
     db: &Db,
     user_id: &str,
@@ -1770,8 +2105,27 @@ pub fn add_push_sub(
     p256dh: &str,
     auth: &str,
     label: Option<&str>,
-) -> Result<()> {
+    max_per_user: i64,
+) -> Result<bool> {
     let conn = db.lock().unwrap();
+    let endpoint = endpoint.trim();
+    let owner: Option<String> = conn
+        .query_row(
+            "SELECT user_id FROM push_subscriptions WHERE endpoint = ?1",
+            params![endpoint],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if owner.as_deref() != Some(user_id) {
+        let n: i64 = conn.query_row(
+            "SELECT count(*) FROM push_subscriptions WHERE user_id = ?1",
+            params![user_id],
+            |r| r.get(0),
+        )?;
+        if n >= max_per_user {
+            return Ok(false);
+        }
+    }
     conn.execute(
         "INSERT INTO push_subscriptions
              (user_id, endpoint, p256dh, auth, label, created_at)
@@ -1779,9 +2133,9 @@ pub fn add_push_sub(
          ON CONFLICT(endpoint) DO UPDATE SET
              user_id = excluded.user_id, p256dh = excluded.p256dh,
              auth = excluded.auth, label = excluded.label, fail_count = 0",
-        params![user_id, endpoint.trim(), p256dh, auth, label, now()],
+        params![user_id, endpoint, p256dh, auth, label, now()],
     )?;
-    Ok(())
+    Ok(true)
 }
 
 pub fn list_push_subs(db: &Db, user_id: &str) -> Result<Vec<PushSub>> {
@@ -1846,37 +2200,45 @@ pub fn delete_push_sub_by_endpoint(db: &Db, endpoint: &str) -> Result<usize> {
 ///
 /// 平台過濾走 `user_platforms`，跟驗證碼分頁同一條規則（見 `mail_list`）——
 /// 分兩份寫遲早會歪。admin 一樣要被授權，沒有特例。
+///
+/// 連續失敗 `PUSH_MAX_FAILS` 次的一併排除：那種 endpoint 只會每次都逾時，
+/// 每封信都替它多等一輪，而且沒有任何辦法自己好起來（真的復活了會在
+/// 重新訂閱時把 `fail_count` 歸零）。
 pub fn push_subs_for_platform(db: &Db, platform: &str) -> Result<Vec<PushSub>> {
     let conn = db.lock().unwrap();
     let mut stmt = conn.prepare(&format!(
         "SELECT {} FROM push_subscriptions s
          JOIN users u ON u.id = s.user_id
          JOIN user_platforms p ON p.user_id = s.user_id
-         WHERE p.platform = ?1 AND u.notify_codes = 1",
+         WHERE p.platform = ?1 AND u.notify_codes = 1 AND s.fail_count < ?2",
         PUSH_COLS
             .split(", ")
             .map(|c| format!("s.{c}"))
             .collect::<Vec<_>>()
             .join(", ")
     ))?;
-    let rows = stmt.query_map(params![platform], row_to_push)?;
+    let rows = stmt.query_map(params![platform, PUSH_MAX_FAILS], row_to_push)?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
 /// 某個人所有開著「授權快到期」的訂閱。
+///
+/// 跟 `push_subs_for_platform` 一樣排除連續失敗 `PUSH_MAX_FAILS` 次的。
+/// 這條更禁不起拖：`renew_active` 是逐條白名單 `await` 過去的，一個吃滿
+/// timeout 的死 endpoint 會擋住後面所有條目的續期。
 pub fn push_subs_for_expiry(db: &Db, user_id: &str) -> Result<Vec<PushSub>> {
     let conn = db.lock().unwrap();
     let mut stmt = conn.prepare(&format!(
         "SELECT {} FROM push_subscriptions s
          JOIN users u ON u.id = s.user_id
-         WHERE s.user_id = ?1 AND u.notify_expiry = 1",
+         WHERE s.user_id = ?1 AND u.notify_expiry = 1 AND s.fail_count < ?2",
         PUSH_COLS
             .split(", ")
             .map(|c| format!("s.{c}"))
             .collect::<Vec<_>>()
             .join(", ")
     ))?;
-    let rows = stmt.query_map(params![user_id], row_to_push)?;
+    let rows = stmt.query_map(params![user_id, PUSH_MAX_FAILS], row_to_push)?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
@@ -2109,6 +2471,132 @@ mod tests {
         assert_eq!(e.ttl_days, 30, "改天數要生效");
     }
 
+    /// 既有條目只有擁有者或 admin 能改寫；別人的 IP 一律拒絕，而且判斷放在
+    /// 同一句 SQL 裡，沒有「先查 owner 再寫」的競態。
+    #[test]
+    fn only_the_owner_or_an_admin_can_rewrite_an_entry() {
+        let db = test_db();
+        let t30 = now() + 30 * 86400;
+        let find = |db: &Db| list_allow(db).unwrap().into_iter().find(|e| e.ip == "1.2.3.4").unwrap();
+        assert!(upsert_allow_owned(&db, "1.2.3.4", Some("老家"), "a@x", t30, 30, false).unwrap());
+
+        // 別人：拒絕，什麼都不變
+        assert!(!upsert_allow_owned(&db, "1.2.3.4", Some("改名"), "b@x", now() + 86400, 1, false).unwrap());
+        let e = find(&db);
+        assert_eq!(
+            (e.expires_at, e.ttl_days, e.label.as_deref(), e.added_by.as_deref()),
+            (t30, 30, Some("老家"), Some("a@x"))
+        );
+
+        // 擁有者：可改
+        assert!(upsert_allow_owned(&db, "1.2.3.4", None, "a@x", t30 + 86400, 7, false).unwrap());
+        let e = find(&db);
+        assert_eq!((e.expires_at, e.ttl_days, e.label.as_deref()), (t30 + 86400, 7, Some("老家")));
+
+        // admin：可改，但 owner 不變
+        assert!(upsert_allow_owned(&db, "1.2.3.4", Some("管理員改"), "root@x", t30, 30, true).unwrap());
+        let e = find(&db);
+        assert_eq!((e.label.as_deref(), e.added_by.as_deref()), (Some("管理員改"), Some("a@x")));
+    }
+
+    /// `clients.nft` 匯入的條目沒有 added_by。無主不等於大家的：member 一樣
+    /// 改不動，而 admin 改寫時順手認領，讓它從此有人負責（也才刪得掉）。
+    #[test]
+    fn ownerless_legacy_rows_are_admin_only() {
+        let db = test_db();
+        let t7 = now() + 7 * 86400;
+        let find = |db: &Db| list_allow(db).unwrap().into_iter().find(|e| e.ip == "5.6.7.8").unwrap();
+        upsert_allow(&db, "5.6.7.8", Some("由 clients.nft 匯入"), None, t7, 7).unwrap();
+
+        // member：改不動，也不能靠「延長」把它變成自己的
+        assert!(!upsert_allow_owned(&db, "5.6.7.8", Some("我的"), "b@x", t7 + 86400, 30, false).unwrap());
+        let e = find(&db);
+        assert_eq!(
+            (e.added_by.as_deref(), e.label.as_deref(), e.expires_at),
+            (None, Some("由 clients.nft 匯入"), t7)
+        );
+
+        // admin：改得動，而且順手認領
+        assert!(upsert_allow_owned(&db, "5.6.7.8", None, "root@x", t7 + 86400, 30, true).unwrap());
+        let e = find(&db);
+        assert_eq!((e.added_by.as_deref(), e.expires_at, e.ttl_days), (Some("root@x"), t7 + 86400, 30));
+    }
+
+    /// 報告 #5：同一個人同時開 N 個請求各加一個新 IP，額度檢查跟寫入若不在
+    /// 同一把鎖裡，每個都會數到「還沒滿」然後各寫一條。這裡真的開多執行緒
+    /// 打同一顆 DB，最後條目數不得超過上限，而且成功回 `Added` 的次數要剛好等於上限。
+    #[test]
+    fn concurrent_adds_by_one_owner_never_exceed_the_quota() {
+        let db = test_db();
+        create_user_with_platforms(&db, "u1", "a@x", "a", "member", Some("a@x"), &[]).unwrap();
+        const MAX: i64 = 4;
+        const N: usize = 16;
+        let t = now() + 86400;
+
+        let added = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|sc| {
+            for i in 0..N {
+                let (db, added) = (&db, &added);
+                sc.spawn(move || {
+                    let ip = format!("203.0.113.{i}");
+                    let r = allow_add_atomic(db, "u1", &ip, None, "a@x", t, 1, false, MAX).unwrap();
+                    match r {
+                        AllowAdd::Added => {
+                            added.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        AllowAdd::QuotaFull { mine, max } => {
+                            assert!(mine >= max, "被拒時額度應已滿：{mine}/{max}");
+                        }
+                        other => panic!("不該出現 {other:?}"),
+                    }
+                });
+            }
+        });
+
+        assert_eq!(allow_count_by(&db, "a@x").unwrap(), MAX);
+        assert_eq!(added.load(std::sync::atomic::Ordering::SeqCst), MAX as usize);
+    }
+
+    /// 額度只算新的 IP：已在自己名下的是續期，滿額時照樣能延長；
+    /// 別人的 IP 是 `NotOwner`，而且不會偷偷扣到自己的額度。
+    #[test]
+    fn renewing_an_owned_ip_does_not_consume_quota() {
+        let db = test_db();
+        create_user_with_platforms(&db, "u1", "a@x", "a", "member", Some("a@x"), &[]).unwrap();
+        create_user_with_platforms(&db, "u2", "b@x", "b", "member", Some("b@x"), &[]).unwrap();
+        let t = now() + 86400;
+        let add = |uid: &str, ip: &str, owner: &str, exp: i64| {
+            allow_add_atomic(&db, uid, ip, None, owner, exp, 1, false, 1).unwrap()
+        };
+
+        assert_eq!(add("u1", "1.1.1.1", "a@x", t), AllowAdd::Added);
+        assert_eq!(add("u1", "2.2.2.2", "a@x", t), AllowAdd::QuotaFull { mine: 1, max: 1 });
+        // 續期：同一個 IP 再加一次，額度已滿也要過，而且到期時間真的往後
+        assert_eq!(add("u1", "1.1.1.1", "a@x", t + 3600), AllowAdd::Added);
+        let e = list_allow(&db).unwrap().into_iter().find(|e| e.ip == "1.1.1.1").unwrap();
+        assert_eq!(e.expires_at, t + 3600);
+        assert_eq!(allow_count_by(&db, "a@x").unwrap(), 1);
+
+        // 別人碰它：拒絕，兩邊的額度都不動
+        assert_eq!(add("u2", "1.1.1.1", "b@x", t), AllowAdd::NotOwner);
+        assert_eq!(allow_count_by(&db, "b@x").unwrap(), 0);
+        let e = list_allow(&db).unwrap().into_iter().find(|e| e.ip == "1.1.1.1").unwrap();
+        assert_eq!((e.added_by.as_deref(), e.expires_at), (Some("a@x"), t + 3600));
+    }
+
+    /// 報告 #2：admin 刪掉這個人之後，他手上還在跑的 `allow_add` 不得寫進
+    /// 一條無主的白名單 —— 存在檢查跟寫入在同一個 transaction 裡。
+    #[test]
+    fn a_deleted_user_cannot_add_an_entry() {
+        let db = test_db();
+        create_user_with_platforms(&db, "u1", "a@x", "a", "member", Some("a@x"), &[]).unwrap();
+        delete_user(&db, "u1", "a@x").unwrap();
+
+        let r = allow_add_atomic(&db, "u1", "9.9.9.9", None, "a@x", now() + 86400, 1, false, 4).unwrap();
+        assert_eq!(r, AllowAdd::UserGone);
+        assert!(list_allow(&db).unwrap().is_empty(), "帳號不在了就不該有新列");
+    }
+
     /// 自動續期要依條目自己的 ttl_days，不是全域預設。
     #[test]
     fn renewal_uses_entry_own_ttl() {
@@ -2206,18 +2694,18 @@ mod tests {
     #[test]
     fn marking_verified_opens_the_registration_window() {
         let db = mem();
-        assert!(!otp_recently_verified(&db, "mei@example.com", 900).unwrap());
-        mark_email_verified(&db, "Mei@Example.com").unwrap();
-        assert!(otp_recently_verified(&db, "mei@example.com", 900).unwrap());
+        assert!(!otp_recently_verified(&db, "mei@example.com", OTP_JOIN, 900).unwrap());
+        mark_email_verified(&db, "Mei@Example.com", OTP_JOIN).unwrap();
+        assert!(otp_recently_verified(&db, "mei@example.com", OTP_JOIN, 900).unwrap());
     }
 
     /// 但那一筆不是一組能拿去輸入的碼 —— 它連「還沒過期」都不是。
     #[test]
     fn marking_verified_does_not_hand_out_a_usable_code() {
         let db = mem();
-        mark_email_verified(&db, "mei@example.com").unwrap();
+        mark_email_verified(&db, "mei@example.com", OTP_JOIN).unwrap();
         assert!(matches!(
-            check_otp(&db, "mei@example.com", "-", 5).unwrap(),
+            check_otp(&db, "mei@example.com", OTP_JOIN, "-", 5).unwrap(),
             OtpCheck::Expired
         ));
     }
@@ -2227,7 +2715,7 @@ mod tests {
     #[test]
     fn marking_verified_does_not_start_a_resend_cooldown() {
         let db = mem();
-        mark_email_verified(&db, "mei@example.com").unwrap();
+        mark_email_verified(&db, "mei@example.com", OTP_JOIN).unwrap();
         assert_eq!(otp_cooldown(&db, "mei@example.com", 60).unwrap(), 0);
     }
 
@@ -2235,8 +2723,8 @@ mod tests {
     #[test]
     fn marking_verified_keeps_an_existing_cooldown() {
         let db = mem();
-        put_otp(&db, "mei@example.com", "h", 600).unwrap();
-        mark_email_verified(&db, "mei@example.com").unwrap();
+        put_otp(&db, "mei@example.com", OTP_JOIN, "h", 600).unwrap();
+        mark_email_verified(&db, "mei@example.com", OTP_JOIN).unwrap();
         assert!(otp_cooldown(&db, "mei@example.com", 60).unwrap() > 0);
     }
 
@@ -2246,54 +2734,80 @@ mod tests {
     fn marking_verified_replaces_a_pending_code() {
         let db = mem();
         let h = crate::otp::hash(&db, "mei@example.com", "123456").unwrap();
-        put_otp(&db, "mei@example.com", &h, 600).unwrap();
-        mark_email_verified(&db, "mei@example.com").unwrap();
-        assert!(matches!(check_otp(&db, "mei@example.com", &h, 5).unwrap(), OtpCheck::Expired));
+        put_otp(&db, "mei@example.com", OTP_JOIN, &h, 600).unwrap();
+        mark_email_verified(&db, "mei@example.com", OTP_JOIN).unwrap();
+        assert!(matches!(check_otp(&db, "mei@example.com", OTP_JOIN, &h, 5).unwrap(), OtpCheck::Expired));
     }
 
     /// 六位數只有一百萬種，沒有次數上限等於沒有保護。
     #[test]
     fn otp_locks_out_after_too_many_attempts() {
         let db = mem();
-        put_otp(&db, "mei@example.com", "hash-good", 600).unwrap();
+        put_otp(&db, "mei@example.com", OTP_JOIN, "hash-good", 600).unwrap();
 
         for _ in 0..3 {
             assert!(matches!(
-                check_otp(&db, "mei@example.com", "hash-bad", 3).unwrap(),
+                check_otp(&db, "mei@example.com", OTP_JOIN, "hash-bad", 3).unwrap(),
                 OtpCheck::Wrong
             ));
         }
         // 用完次數之後，連正確的碼也不放行
         assert!(matches!(
-            check_otp(&db, "mei@example.com", "hash-good", 3).unwrap(),
+            check_otp(&db, "mei@example.com", OTP_JOIN, "hash-good", 3).unwrap(),
             OtpCheck::TooManyAttempts
         ));
+    }
+
+    /// 鎖住不等於永久作廢。次數檢查排在到期檢查前面的話，這一列會永遠回
+    /// `TooManyAttempts` —— 而面板每收到一次就寫一列 `join_code_locked`，
+    /// 等於留了一支不需要任何憑據就能無限寫稽核的端點。
+    #[test]
+    fn a_locked_code_expires_like_any_other() {
+        let db = mem();
+        put_otp(&db, "mei@example.com", OTP_JOIN, "hash-good", 600).unwrap();
+        for _ in 0..3 {
+            check_otp(&db, "mei@example.com", OTP_JOIN, "hash-bad", 3).unwrap();
+        }
+        // 時窗內照舊鎖住：這是原本就有的語義，不能因為換順序而消失
+        assert!(matches!(
+            check_otp(&db, "mei@example.com", OTP_JOIN, "hash-good", 3).unwrap(),
+            OtpCheck::TooManyAttempts
+        ));
+
+        db.lock()
+            .unwrap()
+            .execute("UPDATE email_otp SET expires_at = 1", [])
+            .unwrap();
+        assert!(
+            matches!(check_otp(&db, "mei@example.com", OTP_JOIN, "hash-good", 3).unwrap(), OtpCheck::Expired),
+            "過了 TTL 就該跟任何一組碼一樣單純過期，鎖不能比碼活得更久"
+        );
     }
 
     /// 重寄必須讓舊碼當場失效，否則會多開一個可用窗口。
     #[test]
     fn resending_invalidates_the_previous_code() {
         let db = mem();
-        put_otp(&db, "mei@example.com", "hash-old", 600).unwrap();
-        put_otp(&db, "mei@example.com", "hash-new", 600).unwrap();
+        put_otp(&db, "mei@example.com", OTP_JOIN, "hash-old", 600).unwrap();
+        put_otp(&db, "mei@example.com", OTP_JOIN, "hash-new", 600).unwrap();
 
         assert!(matches!(
-            check_otp(&db, "mei@example.com", "hash-old", 3).unwrap(),
+            check_otp(&db, "mei@example.com", OTP_JOIN, "hash-old", 3).unwrap(),
             OtpCheck::Wrong
         ));
         assert!(matches!(
-            check_otp(&db, "mei@example.com", "hash-new", 3).unwrap(),
+            check_otp(&db, "mei@example.com", OTP_JOIN, "hash-new", 3).unwrap(),
             OtpCheck::Ok
         ));
-        assert!(otp_recently_verified(&db, "mei@example.com", 600).unwrap());
+        assert!(otp_recently_verified(&db, "mei@example.com", OTP_JOIN, 600).unwrap());
     }
 
     #[test]
     fn expired_otp_is_rejected() {
         let db = mem();
-        put_otp(&db, "mei@example.com", "h", -1).unwrap();
+        put_otp(&db, "mei@example.com", OTP_JOIN, "h", -1).unwrap();
         assert!(matches!(
-            check_otp(&db, "mei@example.com", "h", 3).unwrap(),
+            check_otp(&db, "mei@example.com", OTP_JOIN, "h", 3).unwrap(),
             OtpCheck::Expired
         ));
     }
@@ -2302,9 +2816,69 @@ mod tests {
     #[test]
     fn stale_verification_does_not_count() {
         let db = mem();
-        put_otp(&db, "mei@example.com", "h", 600).unwrap();
-        check_otp(&db, "mei@example.com", "h", 3).unwrap();
-        assert!(!otp_recently_verified(&db, "mei@example.com", -1).unwrap());
+        put_otp(&db, "mei@example.com", OTP_JOIN, "h", 600).unwrap();
+        check_otp(&db, "mei@example.com", OTP_JOIN, "h", 3).unwrap();
+        assert!(!otp_recently_verified(&db, "mei@example.com", OTP_JOIN, -1).unwrap());
+    }
+
+    /// 加入碼跟登入碼長得一樣、寄到同一個信箱，但換到的東西不同 ——
+    /// 拿錯用途的碼來，要跟「沒有這組碼」一樣，而且不燒次數。
+    #[test]
+    fn a_code_only_counts_for_the_purpose_it_was_issued_for() {
+        let db = mem();
+        put_otp(&db, "mei@example.com", OTP_JOIN, "h", 600).unwrap();
+        assert!(matches!(
+            check_otp(&db, "mei@example.com", OTP_LOGIN, "h", 3).unwrap(),
+            OtpCheck::Expired
+        ));
+        let attempts: i64 = db
+            .lock()
+            .unwrap()
+            .query_row("SELECT attempts FROM email_otp", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(attempts, 0, "用錯流程不該算成猜錯");
+        assert!(matches!(
+            check_otp(&db, "mei@example.com", OTP_JOIN, "h", 3).unwrap(),
+            OtpCheck::Ok
+        ));
+    }
+
+    /// 登入碼通過後也會寫 `verified_at`，但那不是「可以建帳號」的證明。
+    #[test]
+    fn a_verified_login_code_does_not_open_the_registration_window() {
+        let db = mem();
+        put_otp(&db, "mei@example.com", OTP_LOGIN, "h", 600).unwrap();
+        assert!(matches!(
+            check_otp(&db, "mei@example.com", OTP_LOGIN, "h", 3).unwrap(),
+            OtpCheck::Ok
+        ));
+        assert!(otp_recently_verified(&db, "mei@example.com", OTP_LOGIN, 600).unwrap());
+        assert!(!otp_recently_verified(&db, "mei@example.com", OTP_JOIN, 600).unwrap());
+    }
+
+    /// 重寄會連用途一起換：剛註冊完的人殘留的加入碼，不該在他改寄登入碼之後
+    /// 還被當成加入碼認。
+    #[test]
+    fn resending_replaces_the_purpose_too() {
+        let db = mem();
+        put_otp(&db, "mei@example.com", OTP_JOIN, "old", 600).unwrap();
+        put_otp(&db, "mei@example.com", OTP_LOGIN, "new", 600).unwrap();
+        assert!(matches!(
+            check_otp(&db, "mei@example.com", OTP_JOIN, "old", 3).unwrap(),
+            OtpCheck::Expired
+        ));
+        assert!(matches!(
+            check_otp(&db, "mei@example.com", OTP_LOGIN, "new", 3).unwrap(),
+            OtpCheck::Ok
+        ));
+    }
+
+    /// 冷卻不分用途：保護的是那個收件匣，不是某一條流程。
+    #[test]
+    fn cooldown_is_shared_across_purposes() {
+        let db = mem();
+        put_otp(&db, "mei@example.com", OTP_JOIN, "h", 600).unwrap();
+        assert!(otp_cooldown(&db, "mei@example.com", 60).unwrap() > 0);
     }
 
     /// UI 改過的設定不該被下一次重啟的環境變數種子蓋掉。
@@ -2352,23 +2926,14 @@ mod tests {
         assert_eq!(u.label(), "alex@example.com", "有 email 就以 email 稱呼");
     }
 
-    /// 補填 email 之後，這個人既有的白名單條目不能變成「不是我的」。
-    /// added_by 存的是稱呼不是 id，稱呼變了要一起搬。
+    /// 遷移期結束後不該再有缺 email 的帳號，啟動檢查靠這支點名。
     #[test]
-    fn backfilling_email_moves_ownership() {
+    fn users_without_email_are_listed() {
         let db = mem();
-        create_user_with_platforms(&db, "u1", "alex", "alex", "admin", None, &[]).unwrap();
-        upsert_allow(&db, "1.1.1.1", Some("家裡"), Some("alex"), 999, 7).unwrap();
-        upsert_allow(&db, "2.2.2.2", None, Some("someone-else"), 999, 7).unwrap();
-        assert_eq!(allow_count_by(&db, "alex").unwrap(), 1);
-
-        set_user_email(&db, "u1", "alex@example.com").unwrap();
-        assert_eq!(rename_owner(&db, "alex", "alex@example.com").unwrap(), 1);
-
-        assert_eq!(allow_count_by(&db, "alex@example.com").unwrap(), 1);
-        assert_eq!(allow_count_by(&db, "alex").unwrap(), 0);
-        // 別人的條目不能被順手搬走
-        assert_eq!(allow_count_by(&db, "someone-else").unwrap(), 1);
+        create_user_with_platforms(&db, "a", "a", "a", "member", Some("a@x"), &[]).unwrap();
+        assert!(users_without_email(&db).unwrap().is_empty());
+        create_user_with_platforms(&db, "b", "b", "b", "member", None, &[]).unwrap();
+        assert_eq!(users_without_email(&db).unwrap(), vec!["b"]);
     }
 
     /// credential id 會出現在登入回應裡，不是機密。刪除必須綁上擁有者，
@@ -2378,8 +2943,8 @@ mod tests {
         let db = mem();
         create_user_with_platforms(&db, "u1", "a", "a", "admin", None, &[]).unwrap();
         create_user_with_platforms(&db, "u2", "b", "b", "member", None, &[]).unwrap();
-        add_credential(&db, "c1", "u1", "{}", Some("iPhone")).unwrap();
-        add_credential(&db, "c2", "u1", "{}", None).unwrap();
+        assert!(add_credential(&db, "c1", "u1", "{}", Some("iPhone"), 10).unwrap());
+        assert!(add_credential(&db, "c2", "u1", "{}", None, 10).unwrap());
 
         // u2 拿著 u1 的 credential id 也刪不掉、改不動
         assert_eq!(delete_credential(&db, "u2", "c1").unwrap(), 0);
@@ -2395,7 +2960,7 @@ mod tests {
     fn listing_credentials_omits_the_key_material() {
         let db = mem();
         create_user_with_platforms(&db, "u1", "a", "a", "admin", None, &[]).unwrap();
-        add_credential(&db, "c1", "u1", "{\"secret\":\"不該外流\"}", Some("iPhone")).unwrap();
+        assert!(add_credential(&db, "c1", "u1", "{\"secret\":\"不該外流\"}", Some("iPhone"), 10).unwrap());
 
         let list = list_credentials(&db, "u1").unwrap();
         assert_eq!(list.len(), 1);
@@ -2410,7 +2975,7 @@ mod tests {
     fn nickname_can_be_set_and_cleared() {
         let db = mem();
         create_user_with_platforms(&db, "u1", "a", "a", "admin", None, &[]).unwrap();
-        add_credential(&db, "c1", "u1", "{}", None).unwrap();
+        assert!(add_credential(&db, "c1", "u1", "{}", None, 10).unwrap());
         assert_eq!(list_credentials(&db, "u1").unwrap()[0].nickname, None);
 
         rename_credential(&db, "u1", "c1", Some("備援金鑰")).unwrap();
@@ -2420,14 +2985,52 @@ mod tests {
         assert_eq!(list_credentials(&db, "u1").unwrap()[0].nickname, None);
     }
 
-    /// 登入會更新 last_used_at，帳號頁靠它分辨「哪一把還在用」。
+    /// 登入會更新 last_used_at，帳號頁靠它分辨「哪一把還在用」；憑證材料
+    /// 只在有新版本時才換，沒給就保留原本那份。
     #[test]
     fn using_a_credential_records_the_time() {
         let db = mem();
         create_user_with_platforms(&db, "u1", "a", "a", "admin", None, &[]).unwrap();
-        add_credential(&db, "c1", "u1", "{}", None).unwrap();
-        touch_credential(&db, "c1").unwrap();
+        assert!(add_credential(&db, "c1", "u1", "{\"v\":1}", None, 10).unwrap());
+
+        update_credential(&db, "c1", "u1", None).unwrap();
         assert!(list_credentials(&db, "u1").unwrap()[0].last_used_at.is_some());
+        assert_eq!(credentials_for(&db, "u1").unwrap(), vec!["{\"v\":1}"], "沒給就不動");
+
+        update_credential(&db, "c1", "u1", Some("{\"v\":2}")).unwrap();
+        assert_eq!(credentials_for(&db, "u1").unwrap(), vec!["{\"v\":2}"]);
+    }
+
+    /// 回寫綁擁有者：拿別人的 id 寫不進去；剛被移除的也一樣，而且要報錯 ——
+    /// 呼叫端靠這個錯誤讓那次登入失敗。
+    #[test]
+    fn credential_write_back_is_bound_to_the_owner() {
+        let db = mem();
+        create_user_with_platforms(&db, "u1", "a", "a", "admin", None, &[]).unwrap();
+        create_user_with_platforms(&db, "u2", "b", "b", "member", None, &[]).unwrap();
+        assert!(add_credential(&db, "c1", "u1", "{}", None, 10).unwrap());
+
+        assert!(update_credential(&db, "c1", "u2", Some("{\"stolen\":1}")).is_err());
+        assert_eq!(credentials_for(&db, "u1").unwrap(), vec!["{}"]);
+
+        delete_credential(&db, "u1", "c1").unwrap();
+        assert!(update_credential(&db, "c1", "u1", None).is_err());
+    }
+
+    /// 報告 #3：每人 passkey 有上限，而且是在 INSERT 那句 SQL 裡守的 ——
+    /// 滿了就回 false、一列都不多。
+    #[test]
+    fn credentials_per_user_are_capped_atomically() {
+        let db = mem();
+        create_user_with_platforms(&db, "u1", "a", "a", "admin", None, &[]).unwrap();
+        create_user_with_platforms(&db, "u2", "b", "b", "member", None, &[]).unwrap();
+        for i in 0..10 {
+            assert!(add_credential(&db, &format!("c{i}"), "u1", "{}", None, 10).unwrap());
+        }
+        assert!(!add_credential(&db, "c10", "u1", "{}", None, 10).unwrap(), "第 11 把要被擋");
+        assert_eq!(credential_count(&db, "u1").unwrap(), 10);
+        // 上限是每人各算的，別人滿了不影響我
+        assert!(add_credential(&db, "d0", "u2", "{}", None, 10).unwrap());
     }
 
     /// 登記時選的平台要原封不動傳到註冊完成的那一刻。
@@ -2480,7 +3083,7 @@ mod tests {
         let db = mem();
         create_user_with_platforms(&db, "u1", "mei@x.tw", "mei", "member", Some("mei@x.tw"), &[]).unwrap();
         create_user_with_platforms(&db, "u2", "other@x.tw", "other", "admin", Some("other@x.tw"), &[]).unwrap();
-        add_credential(&db, "c1", "u1", "{}", None).unwrap();
+        assert!(add_credential(&db, "c1", "u1", "{}", None, 10).unwrap());
         grant_platform(&db, "u1", "netflix", "admin").unwrap();
         upsert_allow(&db, "1.1.1.1", None, Some("mei@x.tw"), 999, 7).unwrap();
         upsert_allow(&db, "2.2.2.2", None, Some("mei@x.tw"), 999, 7).unwrap();
@@ -2561,8 +3164,8 @@ mod tests {
         .unwrap();
 
         // 他名下的每一種資料各放一筆
-        add_credential(&db, "cred1", "u1", "passkey-json", Some("iPhone")).unwrap();
-        add_push_sub(&db, "u1", "https://push.example/aaa", "pub", "auth", None).unwrap();
+        assert!(add_credential(&db, "cred1", "u1", "passkey-json", Some("iPhone"), 10).unwrap());
+        assert!(add_push_sub(&db, "u1", "https://push.example/aaa", "pub", "auth", None, 8).unwrap());
         upsert_allow(&db, "1.2.3.4", None, Some("mei@x.tw"), now() + 86400, 7).unwrap();
         add_recipient(&db, "netflix@share.example.com", "mei@x.tw", None, "admin").unwrap();
         invite_email(&db, "mei@x.tw", "admin", &[]).unwrap();
@@ -2571,7 +3174,7 @@ mod tests {
 
         // 另一個人的同類資料，用來確認刪除有界線
         create_user_with_platforms(&db, "u2", "ann@x.tw", "ann", "member", Some("ann@x.tw"), &[]).unwrap();
-        add_credential(&db, "cred2", "u2", "passkey-json", None).unwrap();
+        assert!(add_credential(&db, "cred2", "u2", "passkey-json", None, 10).unwrap());
         upsert_allow(&db, "5.6.7.8", None, Some("ann@x.tw"), now() + 86400, 7).unwrap();
         add_recipient(&db, "netflix@share.example.com", "ann@x.tw", None, "admin").unwrap();
 
@@ -2675,7 +3278,7 @@ mod tests {
             db, id, &format!("{id}@x.tw"), id, "member", Some(&format!("{id}@x.tw")), &[],
         )
         .unwrap();
-        add_push_sub(db, id, endpoint, "pub", "auth", Some("iPhone")).unwrap();
+        assert!(add_push_sub(db, id, endpoint, "pub", "auth", Some("iPhone"), 8).unwrap());
     }
 
     /// 同一台裝置重新訂閱不該累積第二筆 —— endpoint 是去重鍵。
@@ -2683,7 +3286,7 @@ mod tests {
     fn resubscribing_the_same_device_replaces_the_old_row() {
         let db = mem();
         user_with_push(&db, "u1", "https://push.example/aaa");
-        add_push_sub(&db, "u1", "https://push.example/aaa", "pub2", "auth2", Some("iPad")).unwrap();
+        assert!(add_push_sub(&db, "u1", "https://push.example/aaa", "pub2", "auth2", Some("iPad"), 8).unwrap());
 
         let subs = list_push_subs(&db, "u1").unwrap();
         assert_eq!(subs.len(), 1, "同一個 endpoint 只該有一筆");
@@ -2703,6 +3306,50 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_ne!(rows[0].id, rows[1].id);
         assert!(rows[0].id > rows[1].id, "同秒的兩列要照 id 由新到舊，順序不能隨機");
+    }
+
+    /// detail 會夾帶攻擊者控制的輸入（未受邀的 Email、白名單標籤）。
+    /// 不截斷等於讓公開端點無限寫入磁碟。
+    #[test]
+    fn audit_detail_is_truncated() {
+        let db = test_db();
+        audit(&db, None, "t", Some(&"é".repeat(10_000)), None);
+        let row = recent_audit(&db, 1).unwrap().remove(0);
+        assert_eq!(row.detail.unwrap().chars().count(), AUDIT_DETAIL_MAX_CHARS);
+    }
+
+    #[test]
+    fn audit_is_pruned_by_age_and_row_count() {
+        let db = test_db();
+        for i in 0..30 {
+            audit(&db, None, "t", Some(&i.to_string()), None);
+        }
+        db.lock().unwrap().execute("UPDATE audit SET at = 0 WHERE id <= 5", []).unwrap();
+        purge_old_audit(&db, 90, 20).unwrap();
+        let n: i64 = db.lock().unwrap().query_row("SELECT count(*) FROM audit", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 20);
+        let oldest: i64 = db.lock().unwrap().query_row("SELECT min(at) FROM audit", [], |r| r.get(0)).unwrap();
+        assert!(oldest > 0, "0 秒那幾筆要先因保留期被清");
+    }
+
+    /// 上面那條在列數上限比總列數小的時候，光靠上限也會湊巧通過。
+    /// 這裡把上限放到用不到的位置，逼保留期自己交出成績。
+    #[test]
+    fn audit_retention_deletes_old_rows_even_when_the_row_cap_is_slack() {
+        let db = test_db();
+        for i in 0..30 {
+            audit(&db, None, "t", Some(&i.to_string()), None);
+        }
+        db.lock().unwrap().execute("UPDATE audit SET at = 0 WHERE id <= 5", []).unwrap();
+        assert_eq!(purge_old_audit(&db, 90, 100).unwrap(), 5, "只有逾期的那 5 列該消失");
+        let n: i64 = db.lock().unwrap().query_row("SELECT count(*) FROM audit", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 25);
+        let stale: i64 = db
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM audit WHERE at = 0", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stale, 0, "保留期沒生效的話這裡還會是 5");
     }
 
     /// 別台裝置撤掉之後，這台要問得出來「我已經不在名單裡了」。
@@ -2730,8 +3377,50 @@ mod tests {
         bump_push_fail(&db, id).unwrap();
         assert_eq!(list_push_subs(&db, "u1").unwrap()[0].fail_count, 2);
 
-        add_push_sub(&db, "u1", "https://push.example/aaa", "pub", "auth", None).unwrap();
+        assert!(add_push_sub(&db, "u1", "https://push.example/aaa", "pub", "auth", None, 8).unwrap());
         assert_eq!(list_push_subs(&db, "u1").unwrap()[0].fail_count, 0);
+    }
+
+    /// 訂閱是「每台裝置一筆」，一個人不可能有幾百台。配額檢查與寫入在同一把鎖內。
+    /// 接手別人的 endpoint 也算新裝置 —— 否則配額用「重新登記別人的 endpoint」就繞掉了。
+    #[test]
+    fn push_subscriptions_are_capped_per_user() {
+        let db = test_db();
+        create_user_with_platforms(&db, "u", "u", "u", "member", None, &[]).unwrap();
+        create_user_with_platforms(&db, "v", "v", "v", "member", None, &[]).unwrap();
+        for i in 0..3 {
+            assert!(add_push_sub(&db, "u", &format!("https://p.example/{i}"), "k", "a", None, 3).unwrap());
+        }
+        assert!(!add_push_sub(&db, "u", "https://p.example/new", "k", "a", None, 3).unwrap(), "第 4 台要拒絕");
+        // 既有、自己的 endpoint 重新訂閱不算新裝置
+        assert!(add_push_sub(&db, "u", "https://p.example/1", "k2", "a2", None, 3).unwrap());
+        // 別人的 endpoint：對 u 來說是新裝置，配額已滿就拒絕，所有權也不會轉移
+        assert!(add_push_sub(&db, "v", "https://p.example/v", "k", "a", None, 3).unwrap());
+        assert!(!add_push_sub(&db, "u", "https://p.example/v", "k", "a", None, 3).unwrap());
+        assert_eq!(list_push_subs(&db, "u").unwrap().len(), 3);
+        assert_eq!(list_push_subs(&db, "v").unwrap().len(), 1);
+    }
+
+    /// 反覆失敗的訂閱不再參與扇出：攻擊者的假 endpoint 只能拖慢一陣子。
+    ///
+    /// 兩條查詢都要排除。到期提醒那條尤其禁不起拖 —— 它是 `renew_active`
+    /// 逐條白名單 await 過去的，死 endpoint 會擋住後面條目的續期。
+    #[test]
+    fn repeatedly_failing_subscriptions_leave_the_fanout() {
+        let db = test_db();
+        create_user_with_platforms(&db, "u", "u", "u", "member", None, &["netflix".into()]).unwrap();
+        add_push_sub(&db, "u", "https://p.example/1", "k", "a", None, 8).unwrap();
+        // 「授權快到期」預設關著，先開起來，才看得出後面是 fail_count 擋掉的
+        set_notify_prefs(&db, "u", true, true).unwrap();
+        let id = list_push_subs(&db, "u").unwrap()[0].id;
+        assert_eq!(push_subs_for_platform(&db, "netflix").unwrap().len(), 1);
+        assert_eq!(push_subs_for_expiry(&db, "u").unwrap().len(), 1);
+
+        for _ in 0..PUSH_MAX_FAILS {
+            bump_push_fail(&db, id).unwrap();
+        }
+        assert!(push_subs_for_platform(&db, "netflix").unwrap().is_empty());
+        assert!(push_subs_for_expiry(&db, "u").unwrap().is_empty(), "到期提醒也要排除");
     }
 
     /// 推送對象與驗證碼分頁同一條規則：沒有這個平台就收不到通知。
@@ -2753,7 +3442,7 @@ mod tests {
     fn admins_are_not_exempt_from_platform_filtering() {
         let db = mem();
         create_user_with_platforms(&db, "a1", "boss@x.tw", "boss", "admin", Some("boss@x.tw"), &[]).unwrap();
-        add_push_sub(&db, "a1", "https://push.example/aaa", "pub", "auth", None).unwrap();
+        assert!(add_push_sub(&db, "a1", "https://push.example/aaa", "pub", "auth", None, 8).unwrap());
 
         assert!(push_subs_for_platform(&db, "netflix").unwrap().is_empty());
     }
@@ -3014,7 +3703,7 @@ mod tests {
         migrate(&conn).unwrap();
         migrate(&conn).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 11);
+        assert_eq!(v, 13);
     }
 
     /// ⚠️ 已經跑過 v10 的資料庫必須也拿得到後來補的那幾個欄位。
@@ -3077,5 +3766,273 @@ mod tests {
         let new = mails.iter().find(|m| m.subject.as_deref() == Some("新信")).unwrap();
         assert_eq!(old.verified, None, "舊資料應為未知，而不是未通過");
         assert_eq!(new.verified, Some(false));
+    }
+
+    /// `received_at` 是寄件者說的 `Date:`，寄件者說了算。排序與清除只能用
+    /// 面板自己的時鐘 `ingested_at`，否則一封未來日期的信永遠排第一、永遠不被清。
+    #[test]
+    fn purge_and_ordering_use_ingested_at_not_the_claimed_date() {
+        let db = test_db();
+        let far_future = now() + 10 * 365 * 86400;
+        insert_mail(
+            &db, Some("future"), far_future, None, None, Some("未來"), None, None, None, &[],
+            true, Some("netflix"), None,
+        )
+        .unwrap();
+        insert_mail(
+            &db, Some("normal"), now(), None, None, Some("正常"), None, None, None, &[], true,
+            Some("netflix"), None,
+        )
+        .unwrap();
+
+        let list = recent_mails(&db, 10).unwrap();
+        assert_eq!(list[0].subject.as_deref(), Some("正常"), "後收到的排前面，不看 Date");
+
+        // 把「未來」那封的 ingested_at 撥回 30 天前，保留期 14 天要把它清掉
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE mails SET ingested_at = ?1 WHERE message_id = 'future'",
+                params![now() - 30 * 86400],
+            )
+            .unwrap();
+        assert_eq!(purge_old_mails(&db, 14).unwrap(), 1);
+        assert_eq!(recent_mails(&db, 10).unwrap().len(), 1);
+    }
+
+    /// 已經在 v12 的資料庫也要拿得到 `purpose`，而且既有的列要被視為加入碼 ——
+    /// 升級當下在途的碼全是加入流程寄的，讓它們失效等於讓正在註冊的人重來。
+    #[test]
+    fn a_database_already_at_v12_gets_the_purpose_column_with_join_as_default() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch("ALTER TABLE email_otp DROP COLUMN purpose;").unwrap();
+        conn.pragma_update(None, "user_version", 12).unwrap();
+        conn.execute(
+            "INSERT INTO email_otp (email, code_hash, expires_at, attempts, sent_at)
+             VALUES ('mei@example.com', 'h', ?1, 0, ?1)",
+            params![now() + 600],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 13);
+        let purpose: String = conn
+            .query_row("SELECT purpose FROM email_otp", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(purpose, OTP_JOIN);
+    }
+
+    /// 升級前就存在的未來日期郵件，不能把偽造的時間原樣搬進可信欄位。
+    /// 造一顆 v11 的庫（跟 `migration_is_idempotent` 同一招：退版號、拿掉欄位）。
+    #[test]
+    fn v12_backfill_clamps_pre_existing_future_dates() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_mails_ingested; ALTER TABLE mails DROP COLUMN ingested_at;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 11).unwrap();
+        let future = now() + 10 * 365 * 86400;
+        conn.execute(
+            "INSERT INTO mails (message_id, received_at) VALUES ('f', ?1), ('p', 100)",
+            params![future],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 13);
+        let f: i64 = conn
+            .query_row("SELECT ingested_at FROM mails WHERE message_id = 'f'", [], |r| r.get(0))
+            .unwrap();
+        let p: i64 = conn
+            .query_row("SELECT ingested_at FROM mails WHERE message_id = 'p'", [], |r| r.get(0))
+            .unwrap();
+        assert!(f <= now(), "未來日期要被夾到遷移當下");
+        assert_eq!(p, 100, "正常的保留原值");
+    }
+
+    /// 總量配額：不管日期怎麼寫，超過上限就從最舊收到的開始丟。
+    #[test]
+    fn mail_table_is_capped_by_row_count() {
+        let db = test_db();
+        for i in 0..(MAX_MAILS + 5) {
+            insert_mail(
+                &db, Some(&format!("m{i}")), now(), None, None, None, None, None, None, &[],
+                true, None, None,
+            )
+            .unwrap();
+        }
+        purge_old_mails(&db, 14).unwrap();
+
+        let conn = db.lock().unwrap();
+        let n: i64 = conn.query_row("SELECT count(*) FROM mails", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, MAX_MAILS);
+
+        // 數量對了還不夠，要丟對邊：留最新收到的，丟最早收到的
+        let alive = |mid: String| -> bool {
+            conn.prepare("SELECT 1 FROM mails WHERE message_id = ?1")
+                .unwrap()
+                .exists(params![mid])
+                .unwrap()
+        };
+        assert!(alive(format!("m{}", MAX_MAILS + 4)), "最後收到的那封要留著");
+        assert!(!alive("m0".into()), "最早收到的那封先被丟掉");
+    }
+
+    /// 舊版執行檔滾回 v12 的庫上，會插出沒填 `ingested_at` 的列。
+    /// 那種列不能因為「NULL 比不出大小」就永遠躲過保留期。
+    #[test]
+    fn rows_without_an_ingest_time_are_purged_not_kept_forever() {
+        let db = test_db();
+        db.lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO mails (message_id, received_at, ingested_at)
+                 VALUES ('legacy', ?1, NULL)",
+                params![now()],
+            )
+            .unwrap();
+
+        assert_eq!(purge_old_mails(&db, 14).unwrap(), 1, "沒有收信時間的列一律當過期");
+        let n: i64 = db
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM mails", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    /// Worker 重送同一封信不能刷新 `ingested_at`，否則只要持續重送，
+    /// 一封信就永遠不會過保留期。
+    #[test]
+    fn redelivery_keeps_the_original_ingested_at() {
+        let db = test_db();
+        insert_mail(
+            &db, Some("dup"), now(), None, None, Some("原信"), None, None, None, &[], true,
+            None, None,
+        )
+        .unwrap();
+        let backdated = now() - 30 * 86400;
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE mails SET ingested_at = ?1 WHERE message_id = 'dup'",
+                params![backdated],
+            )
+            .unwrap();
+
+        let is_new = insert_mail(
+            &db, Some("dup"), now(), None, None, Some("重送"), None, None, None, &[], true,
+            None, None,
+        )
+        .unwrap();
+        assert!(!is_new, "同一個 Message-ID 是重送，不是新信");
+
+        let got: i64 = db
+            .lock()
+            .unwrap()
+            .query_row("SELECT ingested_at FROM mails WHERE message_id = 'dup'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(got, backdated, "重送不得把收信時間往後推，那等於免死金牌");
+    }
+
+    /// 首頁每 20 秒輪詢一次清單，清單裡不能有 body / html / links ——
+    /// 一封信最大 8 MiB，30 封就是每 20 秒幾百 MB。
+    #[test]
+    fn mail_summaries_carry_no_content_fields() {
+        let db = test_db();
+        insert_mail(
+            &db, Some("a"), now(), None, None, Some("s"), None, Some("body"), Some("<b>h</b>"),
+            &["https://x.example/y".into()], true, Some("netflix"), None,
+        )
+        .unwrap();
+
+        let v = serde_json::to_value(recent_mail_summaries(&db, None, 10).unwrap()).unwrap();
+        let row = &v[0];
+        assert!(row.get("body").is_none(), "body 只用來跑篩選器，不得序列化出去");
+        assert!(row.get("html").is_none());
+        assert!(row.get("links").is_none());
+        assert_eq!(row["subject"], "s");
+        assert_eq!(row["primary_link"], "https://x.example/y", "要按的那顆連結還是得給");
+
+        // 上面幾條斷言在 `{body}` 那個三元運算子寫反時照樣通過 —— 序列化本來
+        // 就不帶 body。所以這裡分別釘住兩條路徑：成員清單要撈得到 body，
+        // 否則 MailScope 的關鍵字篩選對每封信都當作空內文，抽不到碼的
+        // 「暫時存取碼」信會從清單靜靜消失。
+        assert!(
+            recent_mail_summaries(&db, Some(&["netflix".into()]), 1).unwrap()[0].body.is_some(),
+            "成員清單要跑關鍵字篩選，body 得讀出來"
+        );
+        assert!(
+            recent_mail_summaries(&db, None, 1).unwrap()[0].body.is_none(),
+            "管理收件匣不撈 body"
+        );
+    }
+
+    /// 上限是後加的，只擋得住之後進來的信。部署前就進庫的那些列還帶著
+    /// 超長連結 —— 讀取端不擋，清單的 primary_link 與單封的 links
+    /// 照樣把那 8 MiB 送出去。
+    #[test]
+    fn oversized_links_are_dropped_on_read_too() {
+        let db = test_db();
+        let huge = format!("https://x.example/{}", "a".repeat(3 * 1024));
+        insert_mail(
+            &db, Some("only"), now(), None, None, Some("只有超長那條"), None, None, None,
+            std::slice::from_ref(&huge), true, Some("netflix"), None,
+        )
+        .unwrap();
+        insert_mail(
+            &db, Some("both"), now(), None, None, Some("還有一條正常的"), None, None, None,
+            &[huge.clone(), "https://ok.example/go".into()], true, Some("netflix"), None,
+        )
+        .unwrap();
+
+        let sums = recent_mail_summaries(&db, None, 10).unwrap();
+        let find = |subject: &str| {
+            sums.iter().find(|m| m.subject.as_deref() == Some(subject)).unwrap()
+        };
+        assert_eq!(find("只有超長那條").primary_link, None, "超長的不是要按的連結");
+        assert_eq!(
+            find("還有一條正常的").primary_link.as_deref(),
+            Some("https://ok.example/go"),
+            "跳過超長那條，換下一條"
+        );
+
+        let m = get_mail(&db, find("只有超長那條").id).unwrap().unwrap();
+        assert!(m.links.is_empty(), "全文的 links 也不得帶著它");
+        let m = get_mail(&db, find("還有一條正常的").id).unwrap().unwrap();
+        assert_eq!(m.links, vec!["https://ok.example/go".to_string()]);
+    }
+
+    /// 平台過濾要進 SQL：先取 60 封再過濾，別的平台塞滿前 60 封，
+    /// 成員自己的信就從清單消失。
+    #[test]
+    fn summaries_filter_by_platform_before_the_limit() {
+        let db = test_db();
+        for i in 0..70 {
+            insert_mail(
+                &db, Some(&format!("d{i}")), now(), None, None, None, None, None, None, &[],
+                true, Some("disneyplus"), None,
+            )
+            .unwrap();
+        }
+        insert_mail(
+            &db, Some("n"), now() - 100, None, None, Some("我的"), None, None, None, &[], true,
+            Some("netflix"), None,
+        )
+        .unwrap();
+
+        let mine = recent_mail_summaries(&db, Some(&["netflix".into()]), 60).unwrap();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].subject.as_deref(), Some("我的"));
+        assert!(
+            recent_mail_summaries(&db, Some(&[]), 60).unwrap().is_empty(),
+            "沒有授權就什麼都看不到"
+        );
+        assert_eq!(recent_mail_summaries(&db, None, 60).unwrap().len(), 60, "admin 不過濾");
     }
 }

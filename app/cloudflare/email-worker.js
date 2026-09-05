@@ -8,6 +8,7 @@
  *
  * ⚠️ 面板掛掉不能讓信轉不出去 —— 推送失敗就退回 FORWARD_MAP 照送，
  *    且刻意不做任何過濾。少轉幾封廣告 vs 漏掉一組碼，代價不對等。
+ *    **拒收**（4xx）不算掛掉，只轉給 FALLBACK_TO。
  *
  * 無 import、無相依，直接貼進 Dashboard 的 Worker 編輯器。
  *
@@ -29,22 +30,16 @@ const INGEST_TIMEOUT_MS = 5000;
 
 export default {
   async email(message, env) {
-    const panel = await pushToPanel(message, env);
-
-    let targets;
-    if (panel) {
+    const outcome = await pushToPanel(message, env);
+    if (outcome.kind === "ok") {
+      const panel = outcome.panel;
       console.log(
         `面板回覆：篩選器${panel.actionable ? "通過" : "擋下"}` +
           ` verified=${panel.verified} 家人 ${(panel.forward_to || []).length} 人` +
           `${panel.new === false ? "（重送，已存在）" : ""}`
       );
-      targets = withFallback(panel.forward_to, env);
-    } else {
-      // 「面板掛了」的唯一信號。密鑰打錯也走這裡 —— 面板的錯誤一律回 400，
-      // 這支分不出「密鑰不符」和「面板忙」。
-      console.log("⚠️ 面板無回應，改用 FORWARD_MAP 轉發（面板不會有這封信的紀錄）");
-      targets = withFallback(fallbackRecipients(message.to, env), env);
     }
+    const targets = decideTargets(outcome, message.to, env);
 
     if (targets.length === 0) {
       console.log(`⚠️ ${mask(message.to)} 沒有任何轉發目標，信件不會轉出去`);
@@ -72,15 +67,21 @@ export default {
 };
 
 /**
- * 推信給面板並回傳它的判定；逾時、連不上、非 2xx、JSON 壞掉一律回 null
- * 讓呼叫端走退路，絕不 throw。
+ * 推信給面板並分類結果，絕不 throw：
+ *   { kind: "ok", panel }            2xx 且 JSON 合法
+ *   { kind: "rejected", status }     4xx（408／429 除外）、或 2xx 但 JSON
+ *                                    壞掉／不是物件 —— 永久性
+ *   { kind: "unavailable", reason }  5xx、408、429、逾時、連不上 —— 暫時性
+ *   { kind: "unconfigured" }         沒有 PANEL_ENDPOINT / PANEL_SECRET —— 部署狀態，
+ *                                    不是攻擊面（攻擊者改不了 Worker 的環境變數）。
+ *                                    面板還沒上線時 FORWARD_MAP 是唯一的轉發路徑。
  *
  * x-nfhh-mailbox 帶的是信封收件位址：只靠 To: 表頭在轉寄鏈上會查錯名單。
  */
 async function pushToPanel(message, env) {
   if (!env.PANEL_ENDPOINT || !env.PANEL_SECRET) {
-    console.log("PANEL_ENDPOINT / PANEL_SECRET 未設定，略過推送");
-    return null;
+    console.log("⚠️ PANEL_ENDPOINT / PANEL_SECRET 未設定：沒有寄件者驗證，只依 FORWARD_MAP 轉發");
+    return { kind: "unconfigured" };
   }
 
   try {
@@ -94,21 +95,65 @@ async function pushToPanel(message, env) {
       body: await new Response(message.raw).arrayBuffer(),
       signal: AbortSignal.timeout(INGEST_TIMEOUT_MS),
     });
-
-    if (!res.ok) {
-      // 面板的錯誤回應是 {"error": …}，不含信件內容，可安全記錄
-      const detail = await res.text().catch(() => "");
-      console.log("panel rejected:", res.status, detail.slice(0, 200));
-      return null;
-    }
-    return await res.json();
+    return await classifyResponse(res);
   } catch (e) {
     console.log("push failed:", e && e.message);
-    return null;
+    return { kind: "unavailable", reason: e && e.message };
   }
 }
 
-/** 面板無回應時查 FORWARD_MAP。未知位址回空陣列，呼叫端仍會補 FALLBACK_TO。 */
+/**
+ * 這兩個 4xx 的語意是「等一下再試」而不是「這封信不收」，跟 5xx 同類：
+ * 408 是面板讀不完請求，429 可能根本不是面板發的 —— 前面的 Cloudflare
+ * Tunnel 自己就會限流。當成拒收會讓一次塞車害家人收不到碼。
+ */
+const RETRYABLE_STATUS = new Set([408, 429]);
+
+/** 把面板的回應分成「可用」「拒收」「不可用」三類。 */
+export async function classifyResponse(res) {
+  if (res.status >= 500 || RETRYABLE_STATUS.has(res.status)) {
+    return { kind: "unavailable", reason: `HTTP ${res.status}` };
+  }
+  if (!res.ok) {
+    // 面板的錯誤回應是 {"error": …}，不含信件內容，可安全記錄
+    const detail = await res.text().catch(() => "");
+    console.log("panel rejected:", res.status, detail.slice(0, 200));
+    return { kind: "rejected", status: res.status };
+  }
+  try {
+    const panel = await res.json();
+    // 合法 JSON 但不是面板會回的物件（null、陣列、代理塞的字串）。照 ok 走的話
+    // decideTargets 讀 panel.forward_to 就會拋，而那是在 try 之外、message.forward()
+    // 之前 —— 整封信轉不出去，正好違反這支存在的理由。當拒收處理。
+    if (panel === null || typeof panel !== "object" || Array.isArray(panel)) {
+      return { kind: "rejected", status: res.status, reason: "bad json" };
+    }
+    return { kind: "ok", panel };
+  } catch {
+    return { kind: "rejected", status: res.status, reason: "bad json" };
+  }
+}
+
+/**
+ * 決定轉發名單。只有「面板不可用」才准走 FORWARD_MAP；「面板拒收」只給
+ * FALLBACK_TO —— 拒收的信本來就不該無過濾地送進家人信箱。
+ */
+export function decideTargets(outcome, to, env) {
+  switch (outcome.kind) {
+    case "ok":
+      return withFallback(outcome.panel.forward_to, env);
+    case "rejected":
+      console.log(`⚠️ 面板拒收（${outcome.status}），只轉給 FALLBACK_TO，不走 FORWARD_MAP`);
+      return withFallback([], env);
+    case "unconfigured":
+      return withFallback(fallbackRecipients(to, env), env);
+    default:
+      console.log("⚠️ 面板無回應，改用 FORWARD_MAP 轉發（面板不會有這封信的紀錄）");
+      return withFallback(fallbackRecipients(to, env), env);
+  }
+}
+
+/** 面板不可用／未設定時查 FORWARD_MAP。未知位址回空陣列，呼叫端仍會補 FALLBACK_TO。 */
 function fallbackRecipients(to, env) {
   if (!env.FORWARD_MAP) {
     console.log("⚠️ FORWARD_MAP 未設定，本次只轉給 FALLBACK_TO");
@@ -124,10 +169,16 @@ function fallbackRecipients(to, env) {
   return [];
 }
 
-/** FALLBACK_TO 排第一，接上名單並去重、濾空。 */
+/**
+ * FALLBACK_TO 排第一，接上名單並去重、濾空。
+ *
+ * 只展開真的陣列：面板若回了 forward_to: 5 或 {}，展開會拋 TypeError，而這裡
+ * 在 message.forward() 之前、任何 try 之外 —— 整封信會不見。字串更陰險，
+ * 它可迭代，會被拆成一個個字元當成收件人。
+ */
 function withFallback(addrs, env) {
   const out = [];
-  for (const addr of [env.FALLBACK_TO, ...(addrs || [])]) {
+  for (const addr of [env.FALLBACK_TO, ...(Array.isArray(addrs) ? addrs : [])]) {
     if (typeof addr === "string" && addr && !out.includes(addr)) out.push(addr);
   }
   return out;

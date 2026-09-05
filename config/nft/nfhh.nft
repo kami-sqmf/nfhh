@@ -2,10 +2,23 @@
 #
 # nfhh.nft — 白名單 ACL。閘門 :53 / :443 / :853，非白名單來源一律 drop。
 #
-# 套用：sudo nft -f config/nft/nfhh.nft   檢視：sudo nft list table inet nfhh
+# 首次套用（表還不存在）：sudo nft -f config/nft/nfhh.nft   檢視：sudo nft list table inet nfhh
 # 移除：sudo nft delete table inet nfhh
+# 改完規則要重載（表已存在）：
+#   sudo sh -c 'cat config/nft/nfhh.nft generated/nft/clients.nft > /run/nfhh-rules.nft && nft -f /run/nfhh-rules.nft'
+#   一個交易同時換表與補白名單，中間沒有白名單空窗。只套 nfhh.nft 會把動態白名單清空，
+#   家人會被擋在外面直到面板下次寫入（最多 5 分鐘）。先寫成檔再套，是因為 pipe 裡
+#   clients.nft 不存在時 cat 只會報錯、nft 仍照第一個檔換表。先 nft -c -f 可以只檢查不套用。
 #
 # ⚠️ 先套這張表，再去路由器開 port forward。
+
+# 先宣告再刪除：讓這個檔案可以重複套用 —— 整個檔案是一個原子交易，舊表換成新表。
+# 少了這兩行，表已存在時再 nft -f 會整批失敗（lan_v4 的靜態元素已存在），nfhh-firewall.service
+# 的 restart 也跟著失敗；就算過了，也只是把 chain 裡的規則再疊一份，舊的 drop 排在前面，
+# 改過的規則永遠輪不到。
+# 表不存在時（開機）這兩行等於沒事。
+table inet nfhh
+delete table inet nfhh
 
 table inet nfhh {
 

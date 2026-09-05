@@ -2,6 +2,34 @@
 
 use serde::Serialize;
 
+/// 表頭欄位的上限。RFC 5322 一行是 998 bytes，主旨與位址實務上遠小於此；
+/// 超過的不是正常信，是想撐大資料庫的人。
+pub const MAX_SUBJECT_CHARS: usize = 500;
+pub const MAX_ADDR_CHARS: usize = 320;
+pub const MAX_MSGID_CHARS: usize = 998;
+
+/// 單一 URL 的上限。再長的不是要按的連結，是要塞進資料庫的酬載。
+pub const MAX_LINK_LEN: usize = 2048;
+
+/// 主旨純粹給人看，截斷不會讓任何判斷讀出錯誤結論。
+fn cap(s: String, max: usize) -> String {
+    if s.chars().count() <= max { s } else { s.chars().take(max).collect() }
+}
+
+/// 位址與 Message-ID 不能截斷，只能整個丟掉。
+///
+/// 截斷會**憑空造出一個看起來合理的值**：`evil@netflix.com.attacker.example`
+/// 剛好切在第 320 個字就成了 `evil@netflix.com`；而 Message-ID 是去重鍵，
+/// 截短等於讓寄件者自由製造碰撞，用一封信蓋掉另一封。
+/// 超長的本來就不是正常信，寧可當它沒有這個表頭。
+///
+/// 代價講明白：拒收超長的 Message-ID 等於那封信沒有去重鍵（SQLite 的
+/// UNIQUE 容許多個 NULL），Worker 重送幾次就進幾筆。比讓寄件者拿碰撞
+/// 蓋掉別人的信好 —— 而超長本身已經被表頭上限攔在正常信之外。
+fn reject_over(s: String, max: usize) -> Option<String> {
+    (s.chars().count() <= max).then_some(s)
+}
+
 #[derive(Debug, Serialize, Default)]
 pub struct Parsed {
     pub message_id: Option<String>,
@@ -51,29 +79,112 @@ impl SenderAuth {
     }
 }
 
+/// RFC 8601：第一個分號前是 authserv-id，可帶版本號，如 `mx.cloudflare.net 1`。
+fn authserv_matches(value: &str, expected: &str) -> bool {
+    let head = value.split(';').next().unwrap_or("");
+    head.split_whitespace()
+        .next()
+        .is_some_and(|id| id.eq_ignore_ascii_case(expected))
+}
+
+/// 把表頭正規化成「只剩結構」的樣子，之後才好照 `;` 與空白切開。做兩件事：
+///
+/// 1. 拿掉 CFWS 註解。`dkim=pass (1024-bit key)` 裡的括號段落是給人看的，
+///    內容不受限制 —— 留著它等於留一條夾帶判決的路。註解在語法上等於一個
+///    空白，所以換成空白而不是直接刪掉：`dkim=(x)pass` 變成 `dkim= pass`，
+///    兩個 token 都不成立，正好落在安全的一邊。括號沒閉合時後面整段丟掉，
+///    同樣往安全的一邊倒。
+/// 2. 吃掉引號字串裡的結構字元（`;` 與空白類）。`;`、空白、`=` 都是 RFC 5321
+///    引號本地部的合法字元，所以 `smtp.mailfrom="; dkim=pass header.d=x"@evil`
+///    這種**合法**的信封位址，會在切段之後長出一段假的判決。反過來，RFC 8601
+///    的 `reason=` 本來就是引號字串、裡面本來就可能有 `;`，把它當段落分隔會
+///    誤殺真信。兩邊的解法是同一個：引號內不留任何能開段落或開 token 的字元。
+///
+/// 引號內的**內容**保留（不是抹掉），`header.d="netflix.com"` 才照樣讀得出來。
+/// `\` 跳脫的下一個字元一律換成 `_`，`\"` 因此不會提早結束字串。
+///
+/// 這個轉換是冪等的，重複跑不會改變結果。
+fn strip_cfws(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let (mut depth, mut quoted, mut esc) = (0usize, false, false);
+    for c in raw.chars() {
+        if esc {
+            esc = false;
+            if depth == 0 {
+                out.push('_');
+            }
+            continue;
+        }
+        match c {
+            '\\' if quoted => esc = true,
+            '"' if depth == 0 => {
+                quoted = !quoted;
+                out.push('"');
+            }
+            '(' if !quoted => {
+                if depth == 0 {
+                    out.push(' ');
+                }
+                depth += 1;
+            }
+            ')' if !quoted => depth = depth.saturating_sub(1),
+            ';' | ' ' | '\t' | '\r' | '\n' if quoted && depth == 0 => {}
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// 這個 token 是不是 `method=pass`。RFC 8601 的形狀是
+/// `method [ "/" version ] "=" result`，版本號可有可無。
+fn is_pass(token: &str, method: &str) -> bool {
+    let Some((m, result)) = token.split_once('=') else {
+        return false;
+    };
+    m.split('/').next() == Some(method) && result == "pass"
+}
+
 /// 解析 `Authentication-Results`。各方法以 `;` 分隔，先切段再於段內比對。
+///
+/// 段內一律**以 token 為單位**比對，不做子字串搜尋：判決必須是該段的第一個
+/// token，`header.d=` 這類屬性也必須自成一個 token。理由是 MTA 會把寄件者
+/// 可控的字串原樣抄進自己的表頭 —— `smtp.mailfrom=` 就是信封寄件者 ——
+/// 於是 `dkim=pass.header.d=netflix.com@evil.com` 這個合法信箱名，在子字串
+/// 比對下會被讀成一則「通過」的判決。
 fn parse_auth_results(raw: &str) -> (Vec<String>, Option<String>) {
-    let lower = raw.to_lowercase();
+    let lower = strip_cfws(raw).to_lowercase();
     let mut dkim = Vec::new();
     let mut dmarc = None;
     for seg in lower.split(';') {
-        if seg.contains("dkim=pass")
-            && let Some(d) = value_after(seg, "header.d=")
+        // 判決是每段的開頭，之後才是 ptype.property。段首以外的都是資料。
+        let Some(verdict) = seg.split_whitespace().next() else {
+            continue;
+        };
+        if is_pass(verdict, "dkim")
+            && let Some(d) = property_domain(seg, "header.d=")
             && !dkim.contains(&d)
         {
             dkim.push(d);
         }
-        if seg.contains("dmarc=pass") && dmarc.is_none() {
-            dmarc = value_after(seg, "header.from=");
+        if is_pass(verdict, "dmarc") && dmarc.is_none() {
+            dmarc = property_domain(seg, "header.from=");
         }
     }
     (dkim, dmarc)
 }
 
-/// 取出 `key` 之後的網域值，遇到分隔字元就停。
-fn value_after(seg: &str, key: &str) -> Option<String> {
-    let start = seg.find(key)? + key.len();
-    let v: String = seg[start..]
+/// 取出 `key` 這個屬性的網域值。`key` 必須是整個 token 的開頭 ——
+/// 別的屬性的**值**裡出現同名字串不算數。
+fn property_domain(seg: &str, key: &str) -> Option<String> {
+    seg.split_whitespace()
+        .find_map(|t| t.strip_prefix(key))
+        .and_then(domain_value)
+}
+
+/// 只認網域字元，遇到別的就停（`@` 之後是本機部分，不是網域）。
+fn domain_value(raw: &str) -> Option<String> {
+    let v: String = raw
         .chars()
         .skip_while(|c| *c == '"' || *c == '\'')
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-')
@@ -83,7 +194,7 @@ fn value_after(seg: &str, key: &str) -> Option<String> {
     (!v.is_empty()).then_some(v)
 }
 
-pub fn parse(raw: &[u8]) -> Parsed {
+pub fn parse(raw: &[u8], authserv_id: &str) -> Parsed {
     let Some(msg) = mail_parser::MessageParser::default().parse(raw) else {
         // 解析失敗仍保留原始內容，驗證碼可能還在裡面
         let body = String::from_utf8_lossy(raw).chars().take(20_000).collect::<String>();
@@ -91,15 +202,25 @@ pub fn parse(raw: &[u8]) -> Parsed {
         return Parsed { body, code, ..Default::default() };
     };
 
-    // 可能有多個 Authentication-Results（每一跳一個），全部串起來一起看。
-    let auth_raw = msg
+    // 只採信**第一個**、且 authserv-id 是我們自己收信端的 Authentication-Results。
+    // 寄件者可以在原始信裡塞任意同名表頭，但收信端的表頭永遠加在最頂端；
+    // 把全部串起來看，等於讓寄件者替自己蓋「已認證」的章。
+    //
+    // 先挑出第一個同名表頭、再讀它的值：兩步不能合成一步。合起來寫的話，
+    // 第一個表頭的值是空的（`as_text()` 給 None）就會靜靜地滑到第二個，
+    // 而那個第二個正是寄件者塞的。
+    //
+    // 挑段之前先正規化：authserv-id 前面可以合法地帶一段 CFWS 註解
+    // （`(added by cf) mx.cloudflare.net; …`），不先拿掉會把真信判成別人寫的。
+    let auth = msg
         .headers()
         .iter()
-        .filter(|h| h.name().eq_ignore_ascii_case("authentication-results"))
-        .filter_map(|h| h.value().as_text())
-        .collect::<Vec<_>>()
-        .join("; ");
-    let (dkim_domains, dmarc_from) = parse_auth_results(&auth_raw);
+        .find(|h| h.name().eq_ignore_ascii_case("authentication-results"))
+        .and_then(|h| h.value().as_text())
+        .map(strip_cfws)
+        .filter(|v| authserv_matches(v, authserv_id))
+        .unwrap_or_default();
+    let (dkim_domains, dmarc_from) = parse_auth_results(&auth);
 
     let subject = msg.subject().map(|s| s.to_string());
 
@@ -110,6 +231,12 @@ pub fn parse(raw: &[u8]) -> Parsed {
 
     // 顯示用取比較有料的那份
     let body = if html.chars().count() > text.chars().count() { html.clone() } else { text.clone() };
+    // 先截斷再抽連結：以前是對完整 body 抽，body 的 20k 上限對 links 沒有效果。
+    // 代價：只出現在第 20 000 字之後的連結會抽不到 —— 那種信的行動按鈕
+    // （primary_link）就沒了，使用者只剩內文可讀。正常的驗證信遠短於此，
+    // 拿它換掉「一封信塞爆 links 欄位」的路。
+    let body: String = body.chars().take(20_000).collect();
+    let links = extract_links(&body);
 
     // 搜尋範圍涵蓋主旨與兩段內文
     let haystack = format!(
@@ -123,29 +250,31 @@ pub fn parse(raw: &[u8]) -> Parsed {
         .from()
         .and_then(|a| a.first())
         .and_then(|a| a.address())
-        .map(|s| s.to_string());
+        .and_then(|s| reject_over(s.to_string(), MAX_ADDR_CHARS));
+
+    // envelope_domain 只記錄不參與判斷，跟著被拒收的位址一起消失 ——
+    // 位址我們都不採信了，沒道理還把它的網域寫進日誌。
+    let envelope_domain = sender
+        .as_deref()
+        .and_then(|s| s.split('@').nth(1))
+        .map(|d| d.to_lowercase());
 
     Parsed {
-        auth: SenderAuth {
-            dkim_domains,
-            dmarc_from,
-            envelope_domain: sender
-                .as_deref()
-                .and_then(|s| s.split('@').nth(1))
-                .map(|d| d.to_lowercase()),
-        },
-        message_id: msg.message_id().map(|s| s.to_string()),
+        auth: SenderAuth { dkim_domains, dmarc_from, envelope_domain },
+        message_id: msg
+            .message_id()
+            .and_then(|s| reject_over(s.to_string(), MAX_MSGID_CHARS)),
         sender,
         recipient: msg
             .to()
             .and_then(|a| a.first())
             .and_then(|a| a.address())
-            .map(|s| s.to_string()),
-        subject,
+            .and_then(|s| reject_over(s.to_string(), MAX_ADDR_CHARS)),
+        subject: subject.map(|s| cap(s, MAX_SUBJECT_CHARS)),
         date: msg.date().map(|d| d.to_timestamp()),
         code: extract_code(&haystack),
-        links: extract_links(&body),
-        body: body.chars().take(20_000).collect(),
+        links,
+        body,
         // 上限避免夾帶大量內嵌圖片的信把資料庫撐爆
         html: raw_html.map(|h| h.chars().take(400_000).collect()),
     }
@@ -259,7 +388,7 @@ pub fn extract_links(text: &str) -> Vec<String> {
             .find(|c: char| c.is_whitespace() || c == '"' || c == '<' || c == '>' || c == ')')
             .unwrap_or(tail.len());
         let url: String = tail[..end].trim_end_matches(['.', ',', ';']).to_string();
-        if url.len() > 12 && !out.contains(&url) {
+        if url.len() > 12 && url.len() <= MAX_LINK_LEN && !out.contains(&url) {
             out.push(url);
         }
         rest = &tail[end.max(1)..];
@@ -278,8 +407,9 @@ fn decode_entities(s: &str) -> String {
     while let Some(amp) = rest.find('&') {
         out.push_str(&rest[..amp]);
         let tail = &rest[amp..];
-        // 實體最長十來個字元，找太遠代表這個 & 只是普通字元
-        let Some(semi) = tail[..tail.len().min(12)].find(';') else {
+        // 實體最長十來個字元。上限算「字元」不算 byte，才不會切在多位元字元中間
+        let window_end = tail.char_indices().nth(12).map(|(i, _)| i).unwrap_or(tail.len());
+        let Some(semi) = tail[..window_end].find(';') else {
             out.push('&');
             rest = &tail[1..];
             continue;
@@ -318,11 +448,16 @@ fn decode_entities(s: &str) -> String {
 fn html_to_text(html: &str) -> String {
     let mut out = String::with_capacity(html.len() / 2);
     let mut chars = html.char_indices().peekable();
-    let lower = html.to_lowercase();
+    // 只做 ASCII 小寫：byte 長度與字元邊界跟原字串完全相同，下面用原字串的
+    // `i` 去切 `lower` 才安全。要比對的標籤名本來就是 ASCII。
+    let lower = html.to_ascii_lowercase();
 
     while let Some((i, c)) = chars.next() {
         if c == '<' {
-            // script / style 的內容整段丟掉
+            // script / style 的內容整段丟掉。跳過之後直接 continue 外層迴圈 ——
+            // 不然會落到下面「吃到下一個 `>` 為止」那段，把區塊之後的正常內容
+            // 一起當成標籤內容吞掉。
+            let mut skipped = false;
             for tag in ["script", "style"] {
                 if lower[i..].starts_with(&format!("<{tag}")) {
                     if let Some(e) = lower[i..].find(&format!("</{tag}>")) {
@@ -331,8 +466,12 @@ fn html_to_text(html: &str) -> String {
                             if *j >= skip_to { break; }
                             chars.next();
                         }
+                        skipped = true;
                     }
                 }
+            }
+            if skipped {
+                continue;
             }
             // 區塊標籤換行
             if lower[i..].starts_with("<br") || lower[i..].starts_with("<p")
@@ -425,6 +564,12 @@ pub fn primary_link(links: &[String]) -> Option<String> {
     links
         .iter()
         .find(|u| {
+            // 上限在讀取端也擋一次：MAX_LINK_LEN 是後加的，比它早進庫的列
+            // 還帶著超長連結，而這顆值是清單回應裡唯一帶連結的欄位。
+            // 長度先判，才不會為了比對樣板去 lowercase 一條 8 MiB 的字串。
+            if u.len() > MAX_LINK_LEN {
+                return false;
+            }
             let low = u.to_lowercase();
             !BOILERPLATE.iter().any(|b| low.contains(b))
         })
@@ -586,7 +731,7 @@ Content-Type: text/html; charset=utf-8\r\n\
 \r\n\
 <html><body><p>Your verification code is</p><div>4821</div></body></html>\r\n\
 --b1--\r\n";
-        let p = parse(raw);
+        let p = parse(raw, "mx.cloudflare.net");
         assert_eq!(p.code, Some("4821".into()), "純文字段是空殼時要能從 HTML 抽到碼");
     }
 
@@ -631,6 +776,14 @@ Content-Type: text/html; charset=utf-8\r\n\
     fn extracts_links() {
         let l = extract_links(r#"go <a href="https://netflix.com/verify?x=1">here</a>"#);
         assert_eq!(l, vec!["https://netflix.com/verify?x=1"]);
+    }
+
+    /// 一個 URL 沒有長度上限，一封信就能帶 8 MiB 進 links 欄位與清單回應。
+    #[test]
+    fn oversized_links_are_dropped() {
+        let huge = format!("https://x.example/{}", "a".repeat(MAX_LINK_LEN));
+        let text = format!("{huge} https://ok.example/path");
+        assert_eq!(extract_links(&text), vec!["https://ok.example/path"]);
     }
 
     // ── 寄件者驗證（網域取自實際日誌）────────────────
@@ -711,6 +864,92 @@ Content-Type: text/html; charset=utf-8\r\n\
         assert!(!a.is_trusted(&allow()));
     }
 
+    /// MTA 會把寄件者可控的字串原樣抄進自己的 AR 表頭，最常見的是
+    /// `smtp.mailfrom=` 的信封位址。`dkim=pass.header.d=netflix.com@evil.com`
+    /// 是一個合法的信封位址 —— 判決只能是每段的**第一個 token**，否則寄件者
+    /// 光靠挑一個信箱名字就能替自己蓋章。
+    #[test]
+    fn sender_controlled_properties_cannot_smuggle_a_verdict() {
+        let a = auth_of(
+            "mx.cloudflare.net; dkim=none; \
+             spf=fail smtp.mailfrom=dkim=pass.header.d=netflix.com@evil.com",
+        );
+        assert!(a.dkim_domains.is_empty(), "smtp.mailfrom 的內容不是判決");
+        assert!(!a.is_trusted(&allow()));
+
+        let a = auth_of(
+            "mx.cloudflare.net; dmarc=none; \
+             spf=fail smtp.mailfrom=dmarc=pass.header.from=netflix.com@evil.com",
+        );
+        assert_eq!(a.dmarc_from, None, "smtp.mailfrom 的內容不是判決");
+        assert!(!a.is_trusted(&allow()));
+    }
+
+    /// 括號內是 CFWS 註解（常見於 `dkim=pass (1024-bit key)`），裡面可以是
+    /// 任何字元，所以它也是一條夾帶路徑。
+    #[test]
+    fn a_verdict_inside_a_comment_is_not_a_verdict() {
+        let a = auth_of("mx.cloudflare.net; dkim=none (dkim=pass header.d=netflix.com)");
+        assert!(a.dkim_domains.is_empty());
+        assert!(!a.is_trusted(&allow()));
+    }
+
+    /// 收緊之後，真實表頭（含 `header.i=` 與 `smtp.mailfrom=` 等額外欄位）
+    /// 仍要判成通過 —— 這條是誤殺的守門員。
+    #[test]
+    fn a_real_header_still_passes_after_token_anchoring() {
+        let a = auth_of(
+            "mx.cloudflare.net; dkim=pass header.d=netflix.com header.i=@netflix.com; \
+             spf=pass smtp.mailfrom=bounce@netflix.com",
+        );
+        assert_eq!(a.dkim_domains, vec!["netflix.com"]);
+        assert!(a.is_trusted(&allow()));
+    }
+
+    /// `;`、空白、`=` 都是 RFC 5321 引號本地部的合法字元，所以一個合法的
+    /// 信封位址可以在表頭裡「長出」一個新段落。引號內的東西不管長什麼樣，
+    /// 都不能開出新的段落或新的 token。
+    #[test]
+    fn a_quoted_property_value_cannot_open_a_segment() {
+        let a = auth_of(
+            r#"mx.cloudflare.net; spf=pass smtp.mailfrom="; dkim=pass header.d=netflix.com"@evil.com"#,
+        );
+        assert!(a.dkim_domains.is_empty(), "引號內的內容不能自成一段");
+        assert!(!a.is_trusted(&allow()));
+
+        // `\"` 是跳脫過的引號，不結束字串 —— 否則從這裡就能溜出去
+        let a = auth_of(
+            r#"mx.cloudflare.net; spf=pass smtp.mailfrom="\"; dkim=pass header.d=netflix.com"@evil.com"#,
+        );
+        assert!(a.dkim_domains.is_empty(), "跳脫的引號不結束字串");
+        assert!(!a.is_trusted(&allow()));
+
+        // token 的分隔不只有空格
+        let a = auth_of(
+            "mx.cloudflare.net; spf=pass smtp.mailfrom=\";\tdkim=pass\theader.d=netflix.com\"@evil.com",
+        );
+        assert!(a.dkim_domains.is_empty(), "tab 也是分隔字元");
+        assert!(!a.is_trusted(&allow()));
+    }
+
+    /// 反過來也要成立：RFC 8601 的 `reason=` 是引號字串，裡面本來就可能有
+    /// `;`。把引號內的分號當成段落分隔，真信會被判成沒通過。
+    #[test]
+    fn a_quoted_reason_with_a_semicolon_is_still_a_pass() {
+        let a = auth_of(
+            r#"mx.cloudflare.net; dkim=pass reason="key retrieved; ok" header.d=netflix.com"#,
+        );
+        assert_eq!(a.dkim_domains, vec!["netflix.com"]);
+        assert!(a.is_trusted(&allow()));
+    }
+
+    /// RFC 8601 的方法可以帶版本號：`method [ "/" version ] "=" result`。
+    #[test]
+    fn a_method_with_a_version_still_passes() {
+        let a = auth_of("mx.cloudflare.net; dkim/1=pass header.d=netflix.com");
+        assert!(a.is_trusted(&allow()));
+    }
+
     #[test]
     fn parses_auth_from_real_message() {
         let raw = b"From: Netflix <info@account.netflix.com>\r\n\
@@ -721,16 +960,180 @@ Authentication-Results: mx.cloudflare.net;\r\n\
 Subject: \xe9\xa9\x97\xe8\xad\x89\xe7\xa2\xbc\r\n\
 \r\n\
 \xe6\x82\xa8\xe7\x9a\x84\xe9\xa9\x97\xe8\xad\x89\xe7\xa2\xbc\xef\xbc\x9a123456\r\n";
-        let p = parse(raw);
+        let p = parse(raw, "mx.cloudflare.net");
         assert!(p.auth.is_trusted(&allow()), "折行的表頭要能正確解析");
         assert_eq!(p.auth.envelope_domain.as_deref(), Some("account.netflix.com"));
         assert_eq!(p.code, Some("123456".into()));
     }
 
+    fn raw_with(headers: &str) -> Vec<u8> {
+        format!("{headers}\r\nFrom: a@netflix.com\r\nSubject: x\r\n\r\nbody\r\n").into_bytes()
+    }
+
+    /// 寄件者可以自己塞任意同名表頭，但收信端（Cloudflare）的表頭永遠加在
+    /// 最頂端。只看第一個，而且它的 authserv-id 要是我們自己的。
+    #[test]
+    fn forged_auth_results_below_the_real_one_are_ignored() {
+        let m = parse(
+            &raw_with(
+                "Authentication-Results: mx.cloudflare.net; dkim=fail header.d=netflix.com\r\n\
+                 Authentication-Results: mx.cloudflare.net; dkim=pass header.d=netflix.com",
+            ),
+            "mx.cloudflare.net",
+        );
+        assert!(!m.auth.is_trusted(&["netflix.com".into()]));
+    }
+
+    #[test]
+    fn auth_results_from_an_unknown_authserv_are_ignored() {
+        let m = parse(
+            &raw_with("Authentication-Results: evil.example; dkim=pass header.d=netflix.com"),
+            "mx.cloudflare.net",
+        );
+        assert!(m.auth.dkim_domains.is_empty());
+    }
+
+    /// 第一個表頭不是我們的收信端時就到此為止，不會往下找到一個「合格」的。
+    #[test]
+    fn a_forged_header_below_a_non_matching_first_one_is_ignored() {
+        let m = parse(
+            &raw_with(
+                "Authentication-Results: other.example; dkim=none\r\n\
+                 Authentication-Results: mx.cloudflare.net; dkim=pass header.d=netflix.com",
+            ),
+            "mx.cloudflare.net",
+        );
+        assert!(!m.auth.is_trusted(&["netflix.com".into()]));
+    }
+
+    /// 第一個表頭的值是空的，也仍然是「第一個」—— 不得跳過它去讀第二個，
+    /// 否則寄件者只要在信頂塞一行空的同名表頭就能讓自己那行被採信。
+    #[test]
+    fn an_empty_first_header_does_not_fall_through_to_the_second() {
+        let m = parse(
+            &raw_with(
+                "Authentication-Results:\r\n\
+                 Authentication-Results: mx.cloudflare.net; dkim=pass header.d=netflix.com",
+            ),
+            "mx.cloudflare.net",
+        );
+        assert!(!m.auth.is_trusted(&["netflix.com".into()]));
+    }
+
+    /// 完全沒有 Authentication-Results 的信落在「未通過」。
+    #[test]
+    fn a_message_with_no_authentication_results_is_not_trusted() {
+        let m = parse(&raw_with(""), "mx.cloudflare.net");
+        assert!(!m.auth.is_trusted(&["netflix.com".into()]));
+    }
+
+    /// authserv-id 前面可以合法地帶一段 CFWS 註解。那是註解，不是別人的
+    /// 收信端 —— 不能因此把整封信扣住。
+    #[test]
+    fn a_leading_comment_before_the_authserv_id_is_fine() {
+        let m = parse(
+            &raw_with(
+                "Authentication-Results: (added by cf) mx.cloudflare.net; \
+                 dkim=pass header.d=netflix.com",
+            ),
+            "mx.cloudflare.net",
+        );
+        assert!(m.auth.is_trusted(&["netflix.com".into()]));
+    }
+
+    /// 表頭名稱大小寫不敏感（RFC 5322），挑表頭時不能因此漏掉。
+    #[test]
+    fn the_header_name_is_matched_case_insensitively() {
+        let m = parse(
+            &raw_with("AUTHENTICATION-RESULTS: mx.cloudflare.net; dkim=pass header.d=netflix.com"),
+            "mx.cloudflare.net",
+        );
+        assert!(m.auth.is_trusted(&["netflix.com".into()]));
+    }
+
+    /// RFC 8601 允許 authserv-id 後面帶版本號。
+    #[test]
+    fn the_real_authserv_still_passes() {
+        let m = parse(
+            &raw_with("Authentication-Results: MX.Cloudflare.NET 1; dkim=pass header.d=netflix.com"),
+            "mx.cloudflare.net",
+        );
+        assert!(m.auth.is_trusted(&["netflix.com".into()]));
+    }
+
     /// 解析失敗時沒有表頭可讀，必須落在「未通過」。
     #[test]
     fn unparseable_mail_is_not_trusted() {
-        let p = parse(b"\xff\xfe not a real message at all");
+        let p = parse(b"\xff\xfe not a real message at all", "mx.cloudflare.net");
         assert!(!p.auth.is_trusted(&allow()));
+    }
+
+    /// `İ`（U+0130）小寫化後變成兩個 code point、byte 數改變 —— 以前拿原字串
+    /// 的 byte 位移去切小寫字串，會落在字元中間而 panic。
+    #[test]
+    fn html_with_length_changing_lowercase_does_not_panic() {
+        let t = html_to_text("İ<script>x</script><p>ok</p>");
+        assert!(t.contains("ok"));
+        assert!(!t.contains("x"), "script 內容要整段丟掉");
+    }
+
+    /// 實體視窗以前固定切 12 bytes，第 12 個 byte 落在多位元字元中間就 panic。
+    #[test]
+    fn entity_window_never_splits_a_multibyte_char() {
+        assert_eq!(decode_entities("&a日日日日;"), "&a日日日日;");
+        assert_eq!(decode_entities("&amp;日"), "&日");
+    }
+
+    /// 整個解析器對任意 Unicode 都不得 unwind。
+    #[test]
+    fn parser_survives_hostile_unicode_html() {
+        for s in ["İ<", "<İ>", "&İİİİ;", "<p>İ</p>", "&#x1F600;İ<br", "ﬀ<style>İ</style>ﬀ", "<İ"] {
+            let _ = html_to_text(s);
+            let _ = decode_entities(s);
+        }
+    }
+
+    /// 迴歸：跳過 script/style 區塊後，原本會誤吞到「下一個」`>` 為止，
+    /// 把區塊之後的內容一起吃掉。
+    #[test]
+    fn text_after_a_script_or_style_block_is_kept() {
+        let t = html_to_text("<style>x{}</style>487261 is your code");
+        assert!(t.contains("487261"), "style 區塊之後的內容不該被吞掉");
+
+        let t = html_to_text("<script>a</script>KEEP<p>y</p>");
+        assert!(t.contains("KEEP"), "script 區塊之後的內容不該被吞掉");
+        assert!(t.contains('y'));
+        assert!(!t.contains('a'), "script 內容本身仍要整段丟掉");
+    }
+
+    /// 主旨、寄件者、Message-ID 沒有上限的話，每封信都能帶幾 MB 的表頭進資料庫。
+    ///
+    /// 主旨截短就好；位址與 Message-ID 只能整個拒收 —— 截短出來的位址會多出
+    /// 一個它本來沒有的網域，截短出來的 Message-ID 會撞掉別封信。
+    #[test]
+    fn header_metadata_is_capped() {
+        let long = "x".repeat(5000);
+        let raw = format!(
+            "From: {long}@example.com\r\nTo: {long}@share.example.com\r\nSubject: {long}\r\nMessage-ID: <{long}@x>\r\n\r\nhi\r\n"
+        );
+        let m = parse(raw.as_bytes(), "mx.cloudflare.net");
+        assert_eq!(m.subject.unwrap().chars().count(), MAX_SUBJECT_CHARS, "主旨截到上限");
+        assert_eq!(m.sender, None, "超長寄件者整個不採信，不是切一半");
+        assert_eq!(m.recipient, None, "收件者同理");
+        assert_eq!(m.message_id, None, "去重鍵寧可沒有，也不要一個截短的");
+        assert_eq!(m.auth.envelope_domain, None, "位址都拒收了，網域不該還留著");
+    }
+
+    /// 正常長度的表頭一個都不能被上限誤傷。
+    #[test]
+    fn normal_headers_survive_the_caps() {
+        let raw = "From: info@account.netflix.com\r\nTo: netflix@share.example.com\r\n\
+                   Subject: 您的登入驗證碼\r\nMessage-ID: <abc123@netflix.com>\r\n\r\nhi\r\n";
+        let m = parse(raw.as_bytes(), "mx.cloudflare.net");
+        assert_eq!(m.sender.as_deref(), Some("info@account.netflix.com"));
+        assert_eq!(m.recipient.as_deref(), Some("netflix@share.example.com"));
+        assert_eq!(m.subject.as_deref(), Some("您的登入驗證碼"));
+        assert_eq!(m.message_id.as_deref(), Some("abc123@netflix.com"));
+        assert_eq!(m.auth.envelope_domain.as_deref(), Some("account.netflix.com"));
     }
 }

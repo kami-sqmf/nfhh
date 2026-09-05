@@ -2,6 +2,7 @@
 Description=OTT Household — nftables 白名單 ACL
 Documentation=file:///opt/nfhh/README.md
 # 必須在 docker 之前就位：容器一起來就綁 :53/:443
+# 反向的依賴（docker 需要本 unit 成功）在 deploy/docker.service.d/10-nfhh-firewall.conf
 Before=docker.service
 After=network-pre.target
 Wants=network-pre.target

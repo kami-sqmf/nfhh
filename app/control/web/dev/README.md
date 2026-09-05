@@ -10,21 +10,33 @@
 ## 用法
 
 ```bash
-docker run -d --name nfhh-shot --network host -v /tmp/shots:/out --user root \
-  --entrypoint chromium-browser zenika/alpine-chrome \
-  --headless --no-sandbox --disable-gpu --hide-scrollbars \
-  --remote-debugging-port=9333 --remote-debugging-address=0.0.0.0 \
-  --disable-dev-shm-usage about:blank
-
-cp dev/*.js /tmp/shots/ && cd /tmp/shots
-MOCK=/tmp/shots/mock.js bun shoot.js 'https://dnf.example.com/' '[
+cd app/control/web
+dev/shoot.sh 'https://dnf.example.com/' '[
   {"dark":false,"goto":true,"shot":"home"},
   {"click":"白名單","shot":"allow"},
   {"click":"展開","shot":"allow-queries"}
 ]'
-
-docker rm -f nfhh-shot
 ```
+
+截圖在 `/tmp/shots/`（可用 `OUT=` 改）。容器由 `shoot.sh` 起、也由它清掉。
+
+跟舊版的差別，每一條都是安全理由：
+
+- **沒有 `--network host`**：CDP 只發佈到 `127.0.0.1:9333`。專案的 nftables 只攔 53/443/853，
+  以前 9333 對整個 LAN／VPN 開著，任何連得到的人都能用 DevTools 讀寫這個瀏覽器；
+  現在主機的其他介面連不到，但主機本身、以及同一個 default bridge 上的其他容器（打容器 IP）仍連得到。
+  容器內的 `--remote-debugging-address=0.0.0.0` 是給 Docker 的 port publish 用的，出不了主機。
+- **沒有 `--user root`、沒有 `-v /tmp/shots:/out`**：容器不需要寫任何主機目錄。
+  以前腳本被複製進容器可寫的目錄再從那裡執行，一個被污染的映像可以改寫腳本，
+  下一行 `bun` 就在你的帳號下跑它的程式碼。現在腳本從 repo 執行，容器碰不到。
+  `shoot.sh` 會用容器內的 `id -u` 確認不是 root。
+- **`@sha256:` 釘選**：浮動 tag 的內容會變。升級：`docker pull zenika/alpine-chrome:latest && docker image inspect --format '{{index .RepoDigests 0}}' zenika/alpine-chrome:latest`，把印出的值換進 `shoot.sh`。
+- `--no-sandbox` 保留：這個映像的 Chromium 在 Docker 預設 seccomp 下沒有 sandbox 跑不起來
+  （映像作者文件如此）。少了 host network 與主機掛載之後，它能影響的只剩容器自己。
+- `trap … EXIT`：正常結束或中斷都會清掉容器，不留一個在聽的 9333；也只清自己起的那個
+  （靠 `started` 旗標），不會誤殺另一個還在跑的 `shoot.sh` 的容器 —— 同名容器已存在時會直接中止。
+  容器不帶 `--rm`：CDP 15 秒內沒起來時腳本會印容器最後的輸出再非零退出，清理仍由 trap 做。
+- **`--security-opt no-new-privileges --cap-drop ALL`**：容器不能提權、不帶任何 capability。
 
 步驟支援 `dark`（模擬 `prefers-color-scheme`，Chrome 的 `--force-dark-mode`
 對宣告了 `color-scheme` 的頁面**不會**翻轉這個 media query，只能走 CDP）、

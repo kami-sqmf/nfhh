@@ -100,6 +100,8 @@ sudo nft list table inet nfhh
 cd /opt/nfhh && ./nfhh up
 ```
 
+`up` 會先確認第 1 步的 `inet nfhh` 表真的在核心裡（`sudo nft -t list table inet nfhh`），不在就印出修復指令並拒絕啟動 —— smartdns 與 nginx 是 host network，一起來就直接綁 `:53`／`:443`／`:853`，順序反了那幾秒就是 open resolver。`restart` 也做同一個檢查。CI 或測試機沒有 nft 時可設 `NFHH_SKIP_FIREWALL_CHECK=1` 跳過，會印一行警告。
+
 容器起來之後產生衍生設定：
 
 ```bash
@@ -118,16 +120,65 @@ cd /opt/nfhh && ./nfhh apply
 `deploy/` 底下的 unit 就是解這個的。
 
 ```bash
-sudo cp /opt/nfhh/deploy/nfhh-*.{service,timer,path} /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now nfhh-firewall.service nfhh-sync-ip.timer
+sudo cp /opt/nfhh/deploy/nfhh-*.{service,timer,path} /etc/systemd/system/ && sudo mkdir -p /etc/systemd/system/docker.service.d && sudo cp /opt/nfhh/deploy/docker.service.d/10-nfhh-firewall.conf /etc/systemd/system/docker.service.d/ && sudo systemctl daemon-reload && sudo systemctl enable --now nfhh-firewall.service nfhh-sync-ip.timer
 ```
 
 | Unit | 作用 |
 |---|---|
 | `nfhh-firewall.service` | 開機載入 nft 規則與白名單。排在 `docker.service` **之前**，確保容器綁 `:53` 時 ACL 已就位 |
+| `docker.service.d/10-nfhh-firewall.conf` | Docker 的 drop-in：`Requires=` 防火牆 unit，且啟動前確認 `inet nfhh` 表存在。防火牆載入失敗時 Docker **不會**啟動 |
 | `nfhh-sync-ip.timer` | 每 5 分鐘檢查出口 IP，變動時重新產生設定並重載 smartdns |
 | `nfhh-sync-ip.service` | 上面 timer 實際執行的工作 |
 | `nfhh-cert.path` | 監看 acme.sh 憑證續期（第 7 步啟用） |
 | `nfhh-cert.service` | 上面 path 觸發的工作 |
+
+> [!WARNING]
+> 這是刻意的 fail-closed：nft 規則載入失敗時整套服務（含管理面板）都不會起來。
+> 用 `systemctl status nfhh-firewall.service` 看原因、修好後
+> `sudo systemctl restart nfhh-firewall.service && sudo systemctl reset-failed docker.service && sudo systemctl start docker.service`
+> （是 `restart` 不是 `start`：這個 unit 是 `RemainAfterExit=yes` 的 oneshot，
+> 表被刪掉後它仍是 active，`start` 什麼都不會做。多了 `reset-failed` 是因為
+> docker.service 設了 `Restart=always`／`RestartSec=2`／`StartLimitBurst=3`／
+> `StartLimitIntervalSec=60`—— `ExecStartPre` 失敗一樣算一次重試，nft 表消失時
+> Docker 會在幾秒內燒完 3 次配額並進入 `failed`，之後 60 秒內手動
+> `systemctl start` 都會被拒絕：「start request repeated too quickly」）。
+>
+> 這條相依是雙向的：`stop`／`restart` `nfhh-firewall.service` 現在也會連帶
+> 停／重啟 Docker（nft 規則本身不會因此消失，理由見 docs/DECISIONS.md）。
+> 只是要讓改過的規則生效，不要 `restart` 這個 unit（那會連 Docker 一起重啟），用：
+> `sudo sh -c 'cat /opt/nfhh/config/nft/nfhh.nft /opt/nfhh/generated/nft/clients.nft > /run/nfhh-rules.nft && nft -f /run/nfhh-rules.nft'`
+> —— 一個交易把整張表換掉並補回白名單（`nfhh.nft` 檔頭的「先宣告再 delete」讓它可以
+> 重複套用；只套 `nfhh.nft` 會把動態白名單清空，家人會被擋在外面直到面板下次寫入，最多
+> 5 分鐘）。先寫成檔再套而不是直接 pipe：`clients.nft` 不在時 `cat` 只會報錯，pipe 裡的
+> `nft -f -` 仍會照第一個檔換表 —— 正是上面那個空窗。
+> 先 `sudo nft -c -f /opt/nfhh/config/nft/nfhh.nft` 可以只檢查語法不套用。
+>
+> 緊急時要解除這條相依（例如要單獨除錯 Docker、暫時不想連動防火牆）：
+> `sudo rm /etc/systemd/system/docker.service.d/10-nfhh-firewall.conf && sudo systemctl daemon-reload`。
+
+<details>
+<summary>驗證 drop-in 真的擋得住（維護時段、需要 console 進入方式）</summary>
+
+> [!CAUTION]
+> 這段會停掉 Docker 並刪除正式的 nft 表幾十秒：所有樓層的 DNS／proxy 會斷。
+> 順序是**先停 Docker 再刪表**（刪表瞬間 `:53` 若還開著就是 open resolver）。
+> 整段用 `trap` 包起來，連線中斷或 shell 結束時 trap 會自動復原。
+
+```bash
+set +e
+trap 'sudo systemctl restart nfhh-firewall.service; sudo systemctl reset-failed docker.service; sudo systemctl start docker.service; echo "已復原：$(systemctl is-active nfhh-firewall.service docker.service | tr "\n" " ")"' EXIT
+sudo systemctl daemon-reload
+echo "requires/after: $(systemctl show docker.service -p Requires -p After | grep -c nfhh-firewall)"   # 預期 2
+sudo systemctl stop docker.service
+sudo nft delete table inet nfhh
+sudo systemctl start docker.service; echo "docker: $(systemctl is-active docker.service)"          # 預期 start 報錯，is-active 印出 activating、failed 或 inactive（docker 會自己重試幾次）
+echo "public listeners: $(sudo ss -ltunp | grep -vE '127\.0\.0\.|\[::1\]' | grep -cE '[:.](53|443|853)\s')"   # 預期 0（loopback 的 stub resolver 不算）
+sudo systemctl restart nfhh-firewall.service && sudo nft list table inet nfhh >/dev/null && sudo systemctl reset-failed docker.service && sudo systemctl start docker.service
+systemctl is-active docker.service nfhh-firewall.service                                            # 預期兩行 active
+systemctl is-active --quiet docker.service && systemctl is-active --quiet nfhh-firewall.service && trap - EXIT
+```
+
+</details>
 
 > [!IMPORTANT]
 > unit 檔內的路徑是寫死的 —— **systemd 不吃 `.env`**。專案不在 `/opt/nfhh`、或執行使用者不叫 `nfhh` 時，複製過去後要改 `ExecStart` 與 `User`；`nfhh-cert.path` 監看的憑證目錄同理，見第 7 步。
@@ -141,6 +192,8 @@ sudo cp /opt/nfhh/deploy/nfhh-*.{service,timer,path} /etc/systemd/system/ && sud
 1. **Cloudflare Zero Trust 後台**新增 public hostname：`dnf.example.com` → `http://localhost:8081`
 
    本機 cloudflared 是 token 模式，ingress 規則只能在後台設，沒有本地設定檔。
+
+   建議順手在該網域的 **Security → WAF → Rate limiting rules** 加一條（免費方案有一條額度）：路徑符合 `/api/login/*` 或 `/api/join/*`，每 IP 每 10 秒超過 10 次就擋。面板自己有限流（每 IP 每 10 分鐘 30 次、全域 200 次，見 [CONTROL.md](CONTROL.md) §8），但它是記憶體內的、重啟歸零，而且全域 200 次一到「用 Email 加入」跟登入會一起被擋 —— 在 Cloudflare 邊緣先擋掉洪水，面板那層才留得住家人的額度。
 
 2. 啟動容器：
 
@@ -159,8 +212,10 @@ sudo cp /opt/nfhh/deploy/nfhh-*.{service,timer,path} /etc/systemd/system/ && sud
 一次性碼用完即失效，且**只有在系統還沒有任何帳號時才會發**。沒有這道關卡，面板一上線第一個找到它的人就能註冊成管理員。
 
 > [!CAUTION]
-> **只有一把 passkey 時，那台裝置遺失或重置就再也登不進面板。**
+> **第一個帳號是 admin，只有一把 passkey 時，那台裝置遺失或重置就再也進不了管理功能。**
 > 請立刻在**第二台裝置**上再註冊一把，面板內有按鈕。
+>
+> 登入頁的「改用 Email 驗證碼登入」是給 member 的備援（要先在 `.env` 填 `RESEND_API_KEY`，跟「用 Email 加入」共用同一個寄信服務）：admin 用它登進來只有 member 權限，也不能在那種 session 新增 Passkey，救不回管理功能 —— 理由見 [DECISIONS.md](DECISIONS.md)「Email 驗證碼登入是備援」。
 
 帳號建好之後，面板的其餘功能（邀請家人、角色權限、裝置遺失的救援、白名單同步機制）全部寫在 [CONTROL.md](CONTROL.md)，這裡不重複。
 
@@ -197,7 +252,7 @@ sudo cp /opt/nfhh/deploy/nfhh-*.{service,timer,path} /etc/systemd/system/ && sud
 
 `FALLBACK_TO` 保留是刻意的：Worker 或面板萬一壞掉，管理員仍收得到驗證碼，不會整組人被鎖在外面卻拿不到碼。它**永遠會被加進轉發名單** —— 連面板判定「這封不用轉」時也一樣，篩選器設錯才看得見。
 
-Worker 是**先推送再轉發**：轉發名單由面板決定，只有它解析得到內文，關鍵字才比對得了。推送失敗時 Worker 退回自己的環境變數照送 —— 面板掛掉絕不能讓信轉不出去。詳見 [CONTROL.md](CONTROL.md) §2.5。
+Worker 是**先推送再轉發**：轉發名單由面板決定，只有它解析得到內文，關鍵字才比對得了。面板**不可用**（逾時、DNS、面板停機、5xx 含端點未啟用的 503、408／429）或 Worker 根本沒設 `PANEL_ENDPOINT`／`PANEL_SECRET` 時，Worker 退回 `FORWARD_MAP` 照送 —— 面板掛掉絕不能讓信轉不出去；面板**拒收**（其餘 4xx：401 密鑰不符、422 解析失敗）則只轉 `FALLBACK_TO`，不走 `FORWARD_MAP`。詳見 [CONTROL.md](CONTROL.md) §2.5。
 
 > [!IMPORTANT]
 > `FORWARD_MAP` 是那條退路唯一的名單來源，請保持它與面板「轉發收件人」頁同步。
@@ -342,13 +397,15 @@ sudo cp /opt/nfhh/deploy/nfhh-cert.{path,service} /etc/systemd/system/ && sudo s
 
 **4. 手機設定**
 
-面板內建「連線教學」區塊，分 Android、iPhone ／ iPad、電視三頁，會自動帶入目前的網域名與出口 IP，並在該網路尚未授權時提示。家人註冊完直接照著做即可。
+面板內建「連線教學」區塊，分電視、Android、iOS、檢查四頁，會自動帶入目前的網域名與出口 IP，並在該網路尚未授權時提示。家人註冊完直接照著做即可。首頁「遇到同戶裝置問題？」區塊也有「點這裡看教學」直接跳過去。
 
-| 系統 | 做法 |
+| 系統 | 推薦做法 |
 |---|---|
-| Android | 設定 → 網路和網際網路 → 私人 DNS → 指定主機名稱 → `dns.example.com` |
-| iOS ／ iPadOS | 面板「連線教學 → iPhone ／ iPad」下載 `.mobileconfig` 描述檔後安裝 |
-| 電視與其他 | DNS 手動填出口 IP。⚠️ 重撥換 IP 後要重設 |
+| Android | 設定 → 網路和網際網路 → Wi‑Fi → 目前網路 → 編輯 → IP 設定改「靜態」→ DNS 1 填出口 IP |
+| iOS ／ iPadOS | 設定 → Wi‑Fi → ⓘ → 設定 DNS 改「手動」→ 填出口 IP |
+| 電視與其他 | DNS 手動填出口 IP |
+
+三種都是只改該 Wi‑Fi 的 IP 字面值。⚠️ 重撥換 IP 後要重設。私人 DNS（`dns.example.com`）與 iOS `.mobileconfig` 描述檔仍在教學頁，但標為不推薦：它們是全機設定，換到沒授權的網路整台會斷網。
 
 **iOS 描述檔的兩個實作重點：**
 

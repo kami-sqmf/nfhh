@@ -29,7 +29,12 @@ export const api = {
   joinVerify: (email, code) => req('/api/join/verify', { body: { email, code } }),
   // 邀請函連結：兌換成功等於信箱已驗證，下一步直接建 Passkey
   joinInvite: (token) => req('/api/join/invite', { body: { token } }),
-  setMyEmail: (email) => req('/api/me/email', { body: { email } }),
+
+  // Email 驗證碼登入（Passkey 的備援）。start 不管信箱有沒有帳號都回同一個
+  // `{ cooldown }`，所以前端拿不到、也不該去猜「這個信箱存不存在」。
+  // 這條路登入的 session 是弱認證：後端 admin 端點會拒絕（status.auth_via = 'otp'）。
+  loginOtpStart: (email) => req('/api/login/otp/start', { body: { email } }),
+  loginOtpVerify: (email, code) => req('/api/login/otp/verify', { body: { email, code } }),
 
   // 個人的 Passkey。一律只操作自己的 —— admin 也碰不到別人的憑證。
   passkeys: () => req('/api/passkeys'),
@@ -70,6 +75,8 @@ export const api = {
 
   // 驗證碼
   mails: () => req('/api/mail'),
+  // 清單只有摘要，全文（body / html / links）只從這支單封端點拿
+  mail: (id) => req(`/api/mail/${id}`),
   inbox: () => req('/api/mail/inbox'),
   deleteMail: (id) => req(`/api/mail/${id}`, { method: 'DELETE' }),
   purgeMails: () => req('/api/mail', { method: 'DELETE' }),
@@ -142,29 +149,6 @@ export async function registerPasskey({ email, bootstrapToken, nickname } = {}) 
   })
 }
 
-export async function loginPasskey(email) {
-  const o = await req('/api/login/start', { body: { email } })
-  const pk = o.publicKey
-  pk.challenge = b2a(pk.challenge)
-  ;(pk.allowCredentials || []).forEach((c) => (c.id = b2a(c.id)))
-
-  const c = await navigator.credentials.get({ publicKey: pk })
-  await req('/api/login/finish', {
-    body: {
-      id: c.id,
-      rawId: a2b(c.rawId),
-      type: c.type,
-      response: {
-        authenticatorData: a2b(c.response.authenticatorData),
-        clientDataJSON: a2b(c.response.clientDataJSON),
-        signature: a2b(c.response.signature),
-        userHandle: c.response.userHandle ? a2b(c.response.userHandle) : null,
-      },
-      clientExtensionResults: c.getClientExtensionResults(),
-    },
-  })
-}
-
 /**
  * 可探索登入：不告訴伺服器我是誰，由裝置自己挑一把 passkey。
  *
@@ -206,11 +190,6 @@ export async function loginDiscoverable({ conditional = false, signal } = {}) {
   })
 }
 
-/** 這個瀏覽器支援把 passkey 掛進自動填入嗎。 */
-export const supportsConditionalUi = () =>
-  typeof PublicKeyCredential !== 'undefined' &&
-  PublicKeyCredential.isConditionalMediationAvailable?.().catch(() => false)
-
 /**
  * 猜一個裝置名當預設值。使用者可以改，但多數人不會 —— 而「iPhone」比
  * 一片空白好認太多，尤其是三個月後回來看「哪一把是我弄丟的那台」。
@@ -242,13 +221,13 @@ export function passkeyError(e) {
     case 'InvalidStateError':
       return '這台裝置已經註冊過了'
     case 'NotSupportedError':
-      return '這個瀏覽器不支援免輸入帳號的登入，請改用下面的 Email 登入'
+      return '這個瀏覽器不支援免輸入帳號的登入，請改用下面的 Email 驗證碼登入'
     case 'SecurityError':
       return '網域設定不符，Passkey 無法在這個位址使用'
     case 'AbortError':
       return '已中斷'
     default:
       // 連 name 都對不上時至少講清楚下一步，別只丟英文原文
-      return `Passkey 無法使用（${e.name || '未知錯誤'}），請改用下面的 Email 登入`
+      return `Passkey 無法使用（${e.name || '未知錯誤'}），請改用下面的 Email 驗證碼登入`
   }
 }
