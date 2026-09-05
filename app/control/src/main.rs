@@ -17,6 +17,7 @@ mod otp;
 mod platforms;
 mod push;
 mod ratelimit;
+mod session_store;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -29,7 +30,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::sync::Arc;
-use tower_sessions::{MemoryStore, Session, SessionManagerLayer};
+use session_store::BoundedMemoryStore;
+use tower_sessions::{Expiry, Session, SessionManagerLayer};
 use webauthn_rs::prelude::*;
 
 // ── 設定 ──────────────────────────────────────────────
@@ -153,6 +155,9 @@ struct AppState {
     dns: Arc<dnslog::Window>,
     /// 不需要登入的那幾支端點共用的限流器。沒有帳號可擋，只剩來源 IP 可數。
     join_limiter: ratelimit::Limiter,
+    /// session store。放在這裡而不是 `routes` 裡自己建，是為了讓 `main` 的
+    /// 背景工作拿得到同一份來 `sweep`，測試也能直接看它的大小。
+    sessions: BoundedMemoryStore,
 }
 
 type Shared = Arc<AppState>;
@@ -314,6 +319,36 @@ const MAX_PASSKEYS_PER_USER: i64 = 10;
 const JOIN_LIMIT_WINDOW_SECS: i64 = 600;
 const JOIN_LIMIT_PER_IP: u32 = 30;
 const JOIN_LIMIT_GLOBAL: u32 = 200;
+
+/// session store 同時能放幾筆（報告 #1）。一家人 × 幾台裝置 × 兩週壽命
+/// 遠不到一萬；限流之下匿名起手每 10 分鐘最多 200 筆，要塞滿一萬得不間斷
+/// 灌 8 小時，而那時被踢的也只是 15 分鐘壽命的匿名紀錄。純粹是保險。
+const SESSION_STORE_MAX: usize = 10_000;
+/// 匿名 session（登入／加入起手到完成之間）的閒置壽命。要撐過整條流程裡
+/// 最長的一段：驗證碼本身 10 分鐘（`otp::TTL_SECS`），而 `join_verify` 寫下的
+/// 信箱證明要活到 `register_start`／`register_finish` 做完，`register_start`
+/// 認的時窗是 15 分鐘（`otp::VERIFIED_WINDOW_SECS`）。再長只是替灌 store
+/// 的人多留兩週而已。
+const ANON_SESSION_MINUTES: i64 = 15;
+
+/// 匿名的起手（挑戰、信箱證明）寫進 session 之前先呼叫：把這份 session 的
+/// 壽命縮到 `ANON_SESSION_MINUTES`，沒登入成功就自己消失，不必佔兩週。
+/// 已登入的人（例如登入著再去打 login/any/start）不動 —— 縮的是還沒證明
+/// 自己是誰的那些。
+async fn mark_anonymous(session: &Session) {
+    if current_user(session).await.is_none() {
+        session.set_expiry(Some(Expiry::OnInactivity(
+            tower_sessions::cookie::time::Duration::minutes(ANON_SESSION_MINUTES),
+        )));
+    }
+}
+
+/// 登入成功之後呼叫：解除 `mark_anonymous` 的短壽命，回到 tower-sessions
+/// 的預設（兩週）。CONTROL.md 沒有另外規定登入壽命，容器重啟本來就會
+/// 讓所有人重新登入。
+fn mark_authenticated(session: &Session) {
+    session.set_expiry(None);
+}
 
 fn valid_email(s: &str) -> bool {
     s.len() <= MAX_EMAIL_LEN && s.contains('@') && !s.contains(char::is_whitespace)
@@ -484,6 +519,7 @@ async fn join_verify(
             // 寫證明之前先換 session id：這個 session 從「匿名」升級成
             // 「持有某個信箱」，舊 id 若是被人事先塞進瀏覽器的（session
             // fixation），換掉它之後那個人手上的就只是一串失效的字。
+            mark_anonymous(&session).await;
             session.cycle_id().await?;
             session.insert(S_EMAIL_PROOF, &email).await?;
             db::audit(&st.db, None, "join_code_ok", Some(&email), ip.as_deref());
@@ -536,6 +572,7 @@ async fn join_invite(
     db::mark_email_verified(&st.db, &row.email, db::OTP_JOIN)?;
     // 跟驗證碼那條路一樣：兌換連結的是哪個瀏覽器，證明就記在哪個 session；
     // 也一樣先換 id 再寫（見 `join_verify`）。
+    mark_anonymous(&session).await;
     session.cycle_id().await?;
     session.insert(S_EMAIL_PROOF, &row.email).await?;
     db::audit(&st.db, None, "invite_link_opened", Some(&row.email), ip.as_deref());
@@ -624,6 +661,8 @@ async fn register_start(
         // 流量搶同一份額度 —— 上面讀的 session 不碰 DB，這裡仍在任何
         // DB 存取之前。
         throttle_public(&st, ip.as_deref())?;
+        // 這條分支結尾寫進 session 的註冊狀態是匿名的，壽命跟著縮短。
+        mark_anonymous(&session).await;
         let email = email.context("需要 Email 位址")?;
         if !valid_email(&email) {
             return Err(AppError(anyhow::anyhow!("請輸入完整的 Email 位址")));
@@ -814,6 +853,7 @@ async fn register_finish(
         session.insert(S_USER, &p.user_id).await?;
         session.insert(S_NAME, p.label()).await?;
         session.insert(S_AUTH_VIA, AUTH_VIA_PASSKEY).await?;
+        mark_authenticated(&session);
     }
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -848,6 +888,7 @@ async fn login_any_start(
     // session store 留一份挑戰，不擋等於讓人免費灌記憶體。
     throttle_public(&st, client_ip(&headers).as_deref())?;
     clear_auth_flows(&session).await?;
+    mark_anonymous(&session).await;
     let (rcr, disc) = st.webauthn.start_discoverable_authentication()?;
     session.insert(S_DISC, &disc).await?;
     Ok(Json(rcr))
@@ -899,6 +940,7 @@ async fn login_any_finish(
     session.insert(S_USER, &user.id).await?;
     session.insert(S_NAME, &label).await?;
     session.insert(S_AUTH_VIA, AUTH_VIA_PASSKEY).await?;
+    mark_authenticated(&session);
     db::audit(&st.db, Some(&label), "login", Some("passkey"), client_ip(&headers).as_deref());
     Ok(Json(serde_json::json!({ "ok": true, "username": label })))
 }
@@ -957,6 +999,7 @@ async fn login_otp_verify(
             session.insert(S_USER, &user.id).await?;
             session.insert(S_NAME, &label).await?;
             session.insert(S_AUTH_VIA, AUTH_VIA_OTP).await?;
+            mark_authenticated(&session);
             db::audit(&st.db, Some(&label), "login", Some("otp"), ip.as_deref());
             Ok(Json(serde_json::json!({ "ok": true, "username": label })))
         }
@@ -3401,7 +3444,7 @@ fn routes(state: Shared) -> Router {
         .layer(
             // `__Host-` 前綴：瀏覽器只接受 Secure、Path=/、不帶 Domain 的
             // 設定，子網域（或同機其他服務）寫不進這個名字的 cookie。
-            SessionManagerLayer::new(MemoryStore::default())
+            SessionManagerLayer::new(state.sessions.clone())
                 .with_name("__Host-nfhh_session")
                 .with_secure(true)
                 .with_http_only(true),
@@ -3518,10 +3561,14 @@ async fn main() -> Result<()> {
         Err(e) => tracing::error!("白名單同步失敗: {e:#}"),
     }
 
+    // session store 在這裡建、不在 `routes` 裡建：下面的背景工作要拿同一份去掃。
+    let sessions = BoundedMemoryStore::new(SESSION_STORE_MAX);
+
     // 背景工作：定期清除過期條目並重新同步
     {
         let db = db.clone();
         let path = cfg.clients_nft.clone();
+        let sessions = sessions.clone();
         // cfg 稍後會被搬進 AppState，先把要用的兩個數字抄走
         let (keep, max) = (cfg.audit_keep_days, cfg.audit_max_rows);
         tokio::spawn(async move {
@@ -3532,6 +3579,13 @@ async fn main() -> Result<()> {
                     Ok(n) if n > 0 => tracing::debug!("清掉 {n} 列逾期或超量的稽核"),
                     Ok(_) => {}
                     Err(e) => tracing::warn!("清理稽核失敗: {e:#}"),
+                }
+                // 過期 session 掛在既有的 5 分鐘 tick 上，不另開 60 秒的工作：
+                // 上限本身已經守住記憶體，`load` 也會順手刪過期的，這裡只是
+                // 把沒人再碰的匿名紀錄收走，五分鐘跟一分鐘沒有差別。
+                let swept = sessions.sweep();
+                if swept > 0 {
+                    tracing::debug!("清掉 {swept} 筆過期 session，剩 {}", sessions.len());
                 }
                 if let Err(e) = nft::sync(&db, &path) {
                     tracing::error!("定期同步失敗: {e:#}");
@@ -3576,6 +3630,7 @@ async fn main() -> Result<()> {
             JOIN_LIMIT_PER_IP,
             JOIN_LIMIT_GLOBAL,
         ),
+        sessions,
     });
 
     // 背景工作：tail smartdns 稽核檔，餵查詢視窗
@@ -4195,6 +4250,12 @@ mod tests {
 
     /// `set_var` 在 edition 2024 是 unsafe 且會干擾並行測試，改設定就直接組 Config。
     fn state_with_key(cfg: Config, resend_key: &str) -> Shared {
+        state_with_limits(cfg, resend_key, JOIN_LIMIT_PER_IP, JOIN_LIMIT_GLOBAL)
+    }
+
+    /// 限流門檻可調的 state。給「限流不在時 store 撐不撐得住」這類測試用，
+    /// 其他測試一律走上面的預設值。
+    fn state_with_limits(cfg: Config, resend_key: &str, per_ip: u32, global: u32) -> Shared {
         let webauthn = WebauthnBuilder::new("localhost", &Url::parse("http://localhost").unwrap())
             .unwrap()
             .build()
@@ -4209,11 +4270,8 @@ mod tests {
             push: push::Push::new("a@b.c"),
             cf: cloudflare::Cloudflare::new(String::new(), String::new()),
             dns: Arc::new(dnslog::Window::new(DNS_WINDOW_SECS)),
-            join_limiter: ratelimit::Limiter::new(
-                JOIN_LIMIT_WINDOW_SECS,
-                JOIN_LIMIT_PER_IP,
-                JOIN_LIMIT_GLOBAL,
-            ),
+            join_limiter: ratelimit::Limiter::new(JOIN_LIMIT_WINDOW_SECS, per_ip, global),
+            sessions: BoundedMemoryStore::new(SESSION_STORE_MAX),
         })
     }
 
@@ -4421,12 +4479,10 @@ mod tests {
     /// 「移除成員」要阻止的事。
     #[tokio::test]
     async fn a_deleted_member_loses_access_immediately() {
-        use tower_sessions::{MemoryStore, Session};
-
         let st = test_state();
         db::create_user_with_platforms(&st.db, "u1", "mei@x.tw", "mei", "member", Some("mei@x.tw"), &[]).unwrap();
 
-        let session = Session::new(None, std::sync::Arc::new(MemoryStore::default()), None);
+        let session = test_session();
         session.insert(S_USER, "u1".to_string()).await.unwrap();
         session.insert(S_NAME, "mei@x.tw".to_string()).await.unwrap();
 
@@ -4444,9 +4500,11 @@ mod tests {
     }
 
     /// 不經 HTTP 層直接餵給 handler 的 session。每個測試自己開一個，
-    /// 跨 session 的攻擊情境就用兩個。
+    /// 跨 session 的攻擊情境就用兩個。背後接的是正式環境用的
+    /// `BoundedMemoryStore`，不是 tower-sessions 附的 `MemoryStore` ——
+    /// handler 測試順便走過真正會上線的 store。
     fn test_session() -> Session {
-        Session::new(None, Arc::new(MemoryStore::default()), None)
+        Session::new(None, Arc::new(BoundedMemoryStore::new(SESSION_STORE_MAX)), None)
     }
 
     /// 這把新 Passkey 要寫給誰，必須跟「誰在這個 session 上」一致。
@@ -4831,6 +4889,80 @@ mod tests {
             .map_err(|e| e.0)
             .unwrap_err();
         assert!(err.to_string().contains("太頻繁"), "{err}");
+    }
+
+    /// 匿名起手留下的 session 只活 15 分鐘；登入成功就回到預設的兩週。
+    /// 報告 #1 的另一半：限流只是讓灌得慢，短壽命才讓灌進來的東西自己消失。
+    #[tokio::test]
+    async fn anonymous_starts_get_a_short_session_and_login_restores_the_default() {
+        use tower_sessions::cookie::time::{Duration, OffsetDateTime};
+
+        let st = test_state();
+        db::create_user_with_platforms(&st.db, "u1", "a@x.tw", "a@x.tw", "member", Some("a@x.tw"), &[]).unwrap();
+        let about = |session: &Session, minutes: i64| {
+            let left = session.expiry_date() - OffsetDateTime::now_utc();
+            (left - Duration::minutes(minutes)).abs() < Duration::minutes(1)
+        };
+        let long_lived = |session: &Session| session.expiry_date() - OffsetDateTime::now_utc() > Duration::days(1);
+
+        // 全新的 session 預設是兩週
+        let session = test_session();
+        assert!(long_lived(&session));
+
+        // Passkey 登入起手 → 15 分鐘
+        let _ = login_any_start(State(st.clone()), session.clone(), hdrs(&[])).await.map_err(|e| e.0).unwrap();
+        assert!(about(&session, ANON_SESSION_MINUTES), "剩 {}", session.expiry_date() - OffsetDateTime::now_utc());
+
+        // 加入流程的信箱證明也一樣
+        let joiner = test_session();
+        db::invite_email(&st.db, "mei@x.tw", "member", &[]).unwrap();
+        let hash = otp::hash(&st.db, "mei@x.tw", "482913").unwrap();
+        db::put_otp(&st.db, "mei@x.tw", db::OTP_JOIN, &hash, otp::TTL_SECS).unwrap();
+        let _ = join_verify(
+            State(st.clone()),
+            joiner.clone(),
+            hdrs(&[]),
+            Json(VerifyReq { email: "mei@x.tw".into(), code: "482913".into() }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap();
+        assert!(about(&joiner, ANON_SESSION_MINUTES));
+
+        // 驗證碼登入成功 → 回到預設
+        let hash = otp::hash(&st.db, "a@x.tw", "482913").unwrap();
+        db::put_otp(&st.db, "a@x.tw", db::OTP_LOGIN, &hash, otp::TTL_SECS).unwrap();
+        let _ = login_otp_verify(
+            State(st.clone()),
+            session.clone(),
+            hdrs(&[]),
+            Json(VerifyReq { email: "a@x.tw".into(), code: "482913".into() }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap();
+        assert!(long_lived(&session), "登入後不該還是 15 分鐘");
+
+        // 登入著再去打登入起手，不能把自己的 session 縮回 15 分鐘
+        let _ = login_any_start(State(st.clone()), session.clone(), hdrs(&[])).await.map_err(|e| e.0).unwrap();
+        assert!(long_lived(&session));
+    }
+
+    /// 報告 #1 的情境：拿掉限流、用 500 個全新的瀏覽器打登入起手，
+    /// store 也不能長過上限。這裡的 store 故意開很小，才看得出上限有在守。
+    #[tokio::test]
+    async fn a_flood_of_anonymous_login_starts_cannot_grow_the_store_past_its_cap() {
+        let st = state_with_limits(Config::from_env().unwrap(), "", u32::MAX, u32::MAX);
+        let store = BoundedMemoryStore::new(100);
+        for i in 0..500u32 {
+            // 每次都是新的 cookie（沒有 id），save 走的是 store 的 create
+            let session = Session::new(None, Arc::new(store.clone()), None);
+            let h = hdrs(&[("cf-connecting-ip", &format!("203.0.113.{}", i % 250))]);
+            let _ = login_any_start(State(st.clone()), session.clone(), h).await.map_err(|e| e.0).unwrap();
+            session.save().await.unwrap();
+            assert!(store.len() <= 100, "第 {i} 筆之後 store 有 {} 筆", store.len());
+        }
+        assert_eq!(store.len(), 100);
     }
 
     /// join/start 對「沒被邀請」與「已有帳號」的回應要跟真的寄出去一樣 ——
@@ -5229,13 +5361,11 @@ mod tests {
     /// 公網 IPv4 帶進 `?ip=`，這裡釘住後端會採信它。
     #[tokio::test]
     async fn the_claimed_ipv4_wins_over_the_ipv6_connection_address() {
-        use tower_sessions::{MemoryStore, Session};
-
         let st = test_state();
         db::create_user_with_platforms(&st.db, "u1", "mei@x.tw", "mei", "member", Some("mei@x.tw"), &[]).unwrap();
         db::upsert_allow(&st.db, "4.3.2.1", None, Some("mei@x.tw"), db::now() + 86400, 1).unwrap();
 
-        let session = Session::new(None, std::sync::Arc::new(MemoryStore::default()), None);
+        let session = test_session();
         session.insert(S_USER, "u1".to_string()).await.unwrap();
         session.insert(S_NAME, "mei@x.tw".to_string()).await.unwrap();
 
@@ -5266,7 +5396,7 @@ mod tests {
 
         // ⚠️ 未登入時一律不採信：這支端點不需要登入就打得到，採信了它就變成
         //    「某個 IP 在不在白名單裡」的探測器。
-        let anon = Session::new(None, std::sync::Arc::new(MemoryStore::default()), None);
+        let anon = test_session();
         let out = status(State(st), anon, h, q(Some("4.3.2.1"))).await.map_err(|e| e.0).unwrap().0;
         assert_eq!(out.my_ip.as_deref(), Some("2001:db8:5c07:5ec7::1"));
         assert!(!out.my_ip_allowed, "未登入不得靠 ?ip= 問出白名單內容");
