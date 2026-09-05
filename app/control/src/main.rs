@@ -869,18 +869,28 @@ async fn login_any_finish(
     let user = db::get_user(&st.db, &uuid.to_string())?
         .context("這把 Passkey 對應的帳號已不存在")?;
 
-    let keys: Vec<DiscoverableKey> = db::credentials_for(&st.db, &user.id)?
+    let mut passkeys: Vec<Passkey> = db::credentials_for(&st.db, &user.id)?
         .iter()
         .filter_map(|j| serde_json::from_str::<Passkey>(j).ok())
-        .map(|p| DiscoverableKey::from(&p))
         .collect();
+    let keys: Vec<DiscoverableKey> = passkeys.iter().map(DiscoverableKey::from).collect();
 
     let result = st
         .webauthn
         .finish_discoverable_authentication(&cred, disc, &keys)?;
 
+    // 把這次登入學到的狀態寫回去（報告 #10）：counter 前進了、備份旗標翻了，
+    // 都要進 DB，下次才有東西可比 —— 不然被複製出去的 passkey 拿舊 counter
+    // 來登入，webauthn-rs 看到的永遠是註冊當下的 0。`update_credential` 回
+    // `Some(true)` 才有新材料要存，否則只記 `last_used_at`。寫不回去就讓
+    // 登入失敗，不用 `let _ =` 假裝成功。
     let cred_id = base64_url(result.cred_id().as_ref());
-    let _ = db::touch_credential(&st.db, &cred_id);
+    let updated = passkeys
+        .iter_mut()
+        .find(|p| p.cred_id() == result.cred_id())
+        .and_then(|p| (p.update_credential(&result) == Some(true)).then(|| serde_json::to_string(p)))
+        .transpose()?;
+    db::update_credential(&st.db, &cred_id, &user.id, updated.as_deref())?;
     session.remove::<DiscoverableAuthentication>(S_DISC).await?;
 
     let label = user.label().to_string();
@@ -2529,6 +2539,22 @@ struct SubscribeReq {
     label: Option<String>,
 }
 
+/// 推送 endpoint 的形狀（報告 #6）。真的推送服務（FCM／Apple／Mozilla）
+/// 都是「https 網域、443、沒有 userinfo」，這裡把不長那樣的都擋掉：
+/// IP 字面值跟非 443 埠是拿面板去戳內網服務的形狀，`user@host` 是拿來
+/// 騙眼睛的形狀（`https://fcm.googleapis.com@10.0.0.1/`）。`localhost`
+/// 是 `Host::Domain` 但解到自己，也不收。
+fn valid_push_endpoint(s: &str) -> bool {
+    let Ok(u) = Url::parse(s) else { return false };
+    let Some(url::Host::Domain(host)) = u.host() else { return false };
+    u.scheme() == "https"
+        && u.username().is_empty()
+        && u.password().is_none()
+        && u.port_or_known_default() == Some(443)
+        && host != "localhost"
+        && !host.ends_with(".localhost")
+}
+
 async fn push_subscribe(
     State(st): State<Shared>,
     session: Session,
@@ -2542,6 +2568,11 @@ async fn push_subscribe(
     if !endpoint.starts_with("https://") || endpoint.len() > MAX_ENDPOINT_LEN {
         return Err(AppError(anyhow::anyhow!(
             "推送 endpoint 必須是 https 且不超過 {MAX_ENDPOINT_LEN} 字元"
+        )));
+    }
+    if !valid_push_endpoint(endpoint) {
+        return Err(AppError(anyhow::anyhow!(
+            "推送 endpoint 只能是 https 網域、標準 443 埠、不帶帳號密碼"
         )));
     }
     // 非空不等於能用：金鑰材料要真的解得開、p256dh 要在曲線上，
@@ -4345,6 +4376,25 @@ mod tests {
 
     /// 金鑰材料要是真的：長度先擋、base64 要解得開、p256dh 要是曲線上的點。
     #[test]
+    fn push_endpoints_must_look_like_a_push_service() {
+        for bad in [
+            "https://user@host/",
+            "https://user:pw@host/",
+            "https://1.2.3.4/",
+            "https://[::1]/",
+            "https://host:8443/",
+            "http://fcm.googleapis.com/fcm/send/abc",
+            "https://localhost/",
+            "https://push.localhost/",
+            "not a url",
+        ] {
+            assert!(!valid_push_endpoint(bad), "{bad} 該被擋");
+        }
+        assert!(valid_push_endpoint("https://fcm.googleapis.com/fcm/send/abc"));
+        assert!(valid_push_endpoint("https://web.push.apple.com:443/QAbc"), "明寫 443 也算標準埠");
+    }
+
+    #[test]
     fn push_key_material_must_be_real() {
         let ua = p256::SecretKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
         let good = push::B64.encode(ua.public_key().to_encoded_point(false).as_bytes());
@@ -5040,6 +5090,75 @@ mod tests {
         assert!(err.0.to_string().contains("不符"), "要擋在 owner 檢查，拿到的是：{}", err.0);
         assert!(db::credentials_for(&st.db, "admin").unwrap().is_empty(), "admin 不得多出憑證");
         assert!(db::credentials_for(&st.db, "mem").unwrap().is_empty(), "member 也不該拿到");
+    }
+
+    /// 報告 #10：登入後要把 passkey 學到的狀態寫回 DB。softpasskey 每次簽章
+    /// counter 都 +1，所以連登兩次之後 DB 裡那份 JSON 的 counter 必須跟著動 ——
+    /// 之前是 `let _ = touch_credential`，只記時間、憑證材料永遠停在註冊當下。
+    ///
+    /// softpasskey 不是瀏覽器：可探索登入的挑戰 `allowCredentials` 是空的，
+    /// 它挑不出金鑰、也不會帶 userHandle。這裡代替瀏覽器做那兩件事，
+    /// 其餘（簽章、counter）都是它真的算出來的。
+    #[tokio::test]
+    async fn a_login_writes_the_passkey_state_back() {
+        use webauthn_authenticator_rs::{softpasskey::SoftPasskey, WebauthnAuthenticator};
+        let st = test_state();
+        let origin = Url::parse("http://localhost").unwrap();
+        let uid = Uuid::new_v4();
+        db::create_user_with_platforms(&st.db, &uid.to_string(), "mei@x.tw", "mei", "member", Some("mei@x.tw"), &[]).unwrap();
+
+        // 註冊一把
+        let mut key = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let reg = test_session();
+        reg.insert(S_USER, &uid.to_string()).await.unwrap();
+        reg.insert(S_NAME, &"mei@x.tw".to_string()).await.unwrap();
+        let ccr = register_start(
+            State(st.clone()), reg.clone(), hdrs(&[]),
+            Json(RegisterStart { email: None, bootstrap_token: None, nickname: None }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .unwrap()
+        .0;
+        let cred = key.do_registration(origin.clone(), ccr).unwrap();
+        let _ = register_finish(State(st.clone()), reg, hdrs(&[]), Json(cred)).await.map_err(|e| e.0).unwrap();
+
+        let stored = || {
+            let json = db::credentials_for(&st.db, &uid.to_string()).unwrap().remove(0);
+            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let pk: Passkey = serde_json::from_str(&json).expect("回寫後仍要能反序列化成 Passkey");
+            (v["cred"]["counter"].as_u64().unwrap(), base64_url(pk.cred_id().as_ref()))
+        };
+        let (counter0, cred_id) = stored();
+
+        let do_login = async |key: &mut WebauthnAuthenticator<SoftPasskey>| {
+            let session = test_session();
+            let rcr = login_any_start(State(st.clone()), session.clone(), hdrs(&[]))
+                .await
+                .map_err(|e| e.0)
+                .unwrap()
+                .0;
+            // 代替瀏覽器：把可用的金鑰塞回挑戰、回應補上 userHandle
+            let mut v = serde_json::to_value(&rcr).unwrap();
+            v["publicKey"]["allowCredentials"] = serde_json::json!([{ "type": "public-key", "id": cred_id }]);
+            let rcr: RequestChallengeResponse = serde_json::from_value(v).unwrap();
+            let mut cred = key.do_authentication(origin.clone(), rcr).unwrap();
+            cred.response.user_handle = Some(uid.as_bytes().to_vec().into());
+            let _ = login_any_finish(State(st.clone()), session.clone(), hdrs(&[]), Json(cred))
+                .await
+                .map_err(|e| e.0)
+                .unwrap();
+            assert_eq!(current_user(&session).await.map(|(id, _)| id), Some(uid.to_string()));
+        };
+
+        do_login(&mut key).await;
+        let (counter1, _) = stored();
+        do_login(&mut key).await;
+        let (counter2, _) = stored();
+
+        assert!(counter1 > counter0, "第一次登入後 counter 要前進：{counter0} → {counter1}");
+        assert!(counter2 > counter1, "第二次登入後也要：{counter1} → {counter2}");
+        assert!(db::list_credentials(&st.db, &uid.to_string()).unwrap()[0].last_used_at.is_some());
     }
 
     /// 對稱檢查：註冊那一側也要清得乾淨。登入流程留下的挑戰若活過

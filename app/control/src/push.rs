@@ -75,8 +75,17 @@ impl Push {
         Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
+                // endpoint 是成員自填的字串。reqwest 預設跟 10 次轉址，跟著
+                // 30x 走等於讓人拿主機的網路位置去戳內網（Location 指到
+                // 10.x／127.x 就到了）。推送服務從不轉址，收到 3xx 直接當
+                // 失敗（`send` 的 `!is_success()` 已涵蓋）。`https_only` 是
+                // 第二道：訂閱時擋過 http，這裡再擋一次，兩邊誰漏了都還有另一邊。
+                .redirect(reqwest::redirect::Policy::none())
+                .https_only(true)
                 .build()
-                .unwrap_or_default(),
+                // 不退回 `Client::default()`：那顆會跟轉址、也收 http，上面
+                // 兩道防線就靜靜消失了。建不起來就在啟動時炸出來。
+                .expect("建立推播用的 HTTP 客戶端失敗"),
             contact: format!("mailto:{}", mail_from.trim()),
         }
     }

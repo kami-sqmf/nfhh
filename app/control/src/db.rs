@@ -763,12 +763,29 @@ pub fn credential_count(db: &Db, user_id: &str) -> Result<i64> {
     )?)
 }
 
-pub fn touch_credential(db: &Db, cred_id: &str) -> Result<()> {
+/// 登入成功後回寫這把 passkey 的狀態：`last_used_at` 一定更新；
+/// `passkey_json` 有值時（counter 前進、備份旗標翻了）連同新的憑證材料
+/// 一起寫，**同一句 UPDATE**。不回寫 counter 的話，被複製的 passkey
+/// 用舊 counter 登入時 webauthn-rs 就抓不到（報告 #10）。
+///
+/// WHERE 帶 `user_id`：這把是剛從那個人名下讀出來的，寫回去也只能寫回
+/// 那個人名下。改到 0 列 = 讀跟寫之間被移除了，那次登入就不算成功 ——
+/// 呼叫端不該吞掉這個錯誤。
+pub fn update_credential(
+    db: &Db,
+    cred_id: &str,
+    user_id: &str,
+    passkey_json: Option<&str>,
+) -> Result<()> {
     let conn = db.lock().unwrap();
-    conn.execute(
-        "UPDATE credentials SET last_used_at = ?1 WHERE id = ?2",
-        params![now(), cred_id],
+    let n = conn.execute(
+        "UPDATE credentials SET last_used_at = ?3, passkey = coalesce(?4, passkey)
+         WHERE id = ?1 AND user_id = ?2",
+        params![cred_id, user_id, now(), passkey_json],
     )?;
+    if n != 1 {
+        anyhow::bail!("這把 Passkey 已被移除");
+    }
     Ok(())
 }
 
@@ -2968,14 +2985,36 @@ mod tests {
         assert_eq!(list_credentials(&db, "u1").unwrap()[0].nickname, None);
     }
 
-    /// 登入會更新 last_used_at，帳號頁靠它分辨「哪一把還在用」。
+    /// 登入會更新 last_used_at，帳號頁靠它分辨「哪一把還在用」；憑證材料
+    /// 只在有新版本時才換，沒給就保留原本那份。
     #[test]
     fn using_a_credential_records_the_time() {
         let db = mem();
         create_user_with_platforms(&db, "u1", "a", "a", "admin", None, &[]).unwrap();
-        assert!(add_credential(&db, "c1", "u1", "{}", None, 10).unwrap());
-        touch_credential(&db, "c1").unwrap();
+        assert!(add_credential(&db, "c1", "u1", "{\"v\":1}", None, 10).unwrap());
+
+        update_credential(&db, "c1", "u1", None).unwrap();
         assert!(list_credentials(&db, "u1").unwrap()[0].last_used_at.is_some());
+        assert_eq!(credentials_for(&db, "u1").unwrap(), vec!["{\"v\":1}"], "沒給就不動");
+
+        update_credential(&db, "c1", "u1", Some("{\"v\":2}")).unwrap();
+        assert_eq!(credentials_for(&db, "u1").unwrap(), vec!["{\"v\":2}"]);
+    }
+
+    /// 回寫綁擁有者：拿別人的 id 寫不進去；剛被移除的也一樣，而且要報錯 ——
+    /// 呼叫端靠這個錯誤讓那次登入失敗。
+    #[test]
+    fn credential_write_back_is_bound_to_the_owner() {
+        let db = mem();
+        create_user_with_platforms(&db, "u1", "a", "a", "admin", None, &[]).unwrap();
+        create_user_with_platforms(&db, "u2", "b", "b", "member", None, &[]).unwrap();
+        assert!(add_credential(&db, "c1", "u1", "{}", None, 10).unwrap());
+
+        assert!(update_credential(&db, "c1", "u2", Some("{\"stolen\":1}")).is_err());
+        assert_eq!(credentials_for(&db, "u1").unwrap(), vec!["{}"]);
+
+        delete_credential(&db, "u1", "c1").unwrap();
+        assert!(update_credential(&db, "c1", "u1", None).is_err());
     }
 
     /// 報告 #3：每人 passkey 有上限，而且是在 INSERT 那句 SQL 裡守的 ——
