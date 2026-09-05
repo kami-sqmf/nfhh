@@ -100,6 +100,8 @@ sudo nft list table inet nfhh
 cd /opt/nfhh && ./nfhh up
 ```
 
+`up` 會先確認第 1 步的 `inet nfhh` 表真的在核心裡（`sudo nft -t list table inet nfhh`），不在就印出修復指令並拒絕啟動 —— smartdns 與 nginx 是 host network，一起來就直接綁 `:53`／`:443`／`:853`，順序反了那幾秒就是 open resolver。`restart` 也做同一個檢查。CI 或測試機沒有 nft 時可設 `NFHH_SKIP_FIREWALL_CHECK=1` 跳過，會印一行警告。
+
 容器起來之後產生衍生設定：
 
 ```bash
@@ -191,6 +193,8 @@ systemctl is-active --quiet docker.service && systemctl is-active --quiet nfhh-f
 
    本機 cloudflared 是 token 模式，ingress 規則只能在後台設，沒有本地設定檔。
 
+   建議順手在該網域的 **Security → WAF → Rate limiting rules** 加一條（免費方案有一條額度）：路徑符合 `/api/login/*` 或 `/api/join/*`，每 IP 每 10 秒超過 10 次就擋。面板自己有限流（每 IP 每 10 分鐘 30 次、全域 200 次，見 [CONTROL.md](CONTROL.md) §8），但它是記憶體內的、重啟歸零，而且全域 200 次一到「用 Email 加入」跟登入會一起被擋 —— 在 Cloudflare 邊緣先擋掉洪水，面板那層才留得住家人的額度。
+
 2. 啟動容器：
 
    ```bash
@@ -208,8 +212,10 @@ systemctl is-active --quiet docker.service && systemctl is-active --quiet nfhh-f
 一次性碼用完即失效，且**只有在系統還沒有任何帳號時才會發**。沒有這道關卡，面板一上線第一個找到它的人就能註冊成管理員。
 
 > [!CAUTION]
-> **只有一把 passkey 時，那台裝置遺失或重置就再也登不進面板。**
+> **第一個帳號是 admin，只有一把 passkey 時，那台裝置遺失或重置就再也進不了管理功能。**
 > 請立刻在**第二台裝置**上再註冊一把，面板內有按鈕。
+>
+> 登入頁的「改用 Email 驗證碼登入」是給 member 的備援（要先在 `.env` 填 `RESEND_API_KEY`，跟「用 Email 加入」共用同一個寄信服務）：admin 用它登進來只有 member 權限，也不能在那種 session 新增 Passkey，救不回管理功能 —— 理由見 [DECISIONS.md](DECISIONS.md)「Email 驗證碼登入是備援」。
 
 帳號建好之後，面板的其餘功能（邀請家人、角色權限、裝置遺失的救援、白名單同步機制）全部寫在 [CONTROL.md](CONTROL.md)，這裡不重複。
 

@@ -35,7 +35,9 @@
 
 來源 IP 只從 `CF-Connecting-IP` 取，刻意不讀 `X-Forwarded-For`。該值決定要把哪個 IP 寫進防火牆，兩件事合起來才讓它可信 —— 理由見 [DECISIONS.md](DECISIONS.md)。
 
-工作階段存在記憶體（`MemoryStore`），**容器重啟後所有人需要重新登入**。Cookie 為 `nfhh_session`，帶 `Secure` 與 `HttpOnly`。
+工作階段存在記憶體（`MemoryStore`），**容器重啟後所有人需要重新登入**。Cookie 為 `__Host-nfhh_session`，帶 `Secure` 與 `HttpOnly`。
+
+`__Host-` 前綴是瀏覽器端的規則：只接受 `Secure`、`Path=/`、不帶 `Domain` 的設定，所以**同一個父網域底下的其他服務寫不進這個名字的 cookie**。面板跟 music、Wolfram、Frigate 共用一個父網域，少了這道前綴，任何一個 sibling 被攻下就能替訪客預先種好一個 session id（session fixation）。另一半的防護在後端：每一次認證升級（通過加入驗證碼、兌換邀請連結、登入完成、建立新帳號）寫入身分之前都先 `session.cycle_id()`，匿名階段的 session id 不會延用到登入之後 —— 就算有人事先種了 id，換掉之後他手上的只是一串失效的字。
 
 ## 2. 帳號與認證
 
@@ -59,9 +61,17 @@ docker logs nfhh-control 2>&1 | grep -A2 一次性
 
 **登記邀請 Email**（v6 起，取代了原本的邀請碼連結）。admin 在成員管理頁登記一個位址，對方到登入頁點「用 Email 加入」，輸入**完全相同**的位址，系統寄一組 6 位數，通過後才建 Passkey。
 
+`POST /api/join/start` **不會說這個位址有沒有被登記、有沒有帳號**：沒被邀請、已經有帳號、還在冷卻中，回應跟真的寄出去一模一樣（`{ ok, cooldown }`），畫面一律說「若這個信箱有被邀請，驗證碼已寄出」。唯一仍會報錯的是信箱格式、限流與寄信服務未設定 —— 三種都跟「這個位址是誰的」無關。這是 v13 起的改法：以前這裡直接講「沒有被邀請」，理由是封閉的家用系統、含糊訊息只會讓打錯字的家人看不懂；現在登入也能寄碼（`/api/login/otp/start`，見下），兩支端點都對外開放，明確訊息的代價變成「任何人都能列舉家人的信箱」，理由見 [DECISIONS.md](DECISIONS.md)。為了讓兩種回應真的分不出來，還有三件事一起做：
+
+- **`cooldown` 一律回常數 60**（`otp::RESEND_COOLDOWN_SECS`），不是剩餘秒數 —— 剩餘秒數會隨「上一次是幾秒前寄的」變動，等於告訴外人這個信箱剛剛有沒有真的被寄過碼。前端在倒數歸零前不會叫重寄，用不到剩餘值。
+- **寄信在背景做**（`tokio::spawn`）：`send_code` 要連外、要等 Resend 回，會寄的位址跟不會寄的位址回應時間差好幾百毫秒，量得出來就等於明講。所以寫完 DB 就回覆；寄失敗只寫稽核（`join_code_send_failed`／`login_otp_send_failed`）與日誌，使用者等不到信會按重寄。
+- **寄信服務未設定的檢查排在「該不該寄」之前**：擺在後面的話，Resend 關著時會變成「該寄的報錯、不該寄的回 Ok」，又把位址有沒有登記洩漏出去。
+
+兩支寄碼端點共用同一段尾巴（`send_otp`），差別只在前面的條件（加入：沒帳號且被邀請；登入：有帳號）與寫進 `email_otp.purpose` 的用途（`join`／`login`）。**兩種用途的碼互不相認**：登入碼不能拿去過 `register_start` 的信箱證明，加入碼也不能拿去登入（`db::check_otp` 只認同用途的列）。冷卻則刻意**不分用途** —— 它保護的是那個收件匣不被當成寄信目標洗。
+
 v9 起登記時**順帶寄一封邀請函**（Resend 樣板，見下節）。信裡的連結是 `/join/<token>`，按下去等於「這個信箱是我的」已經證明完畢 —— 前端直接跳到建立 Passkey 那一步，不必再輸入一次位址、也不必等驗證碼。兩條路徑接的是**同一道關卡**：兌換連結做的事就是把信箱標成剛剛驗證過（`email_otp.verified_at`）、並把證明記在**這個瀏覽器的 session**（`S_EMAIL_PROOF`），`register_start` 兩個都查，時窗一樣是 15 分鐘。全域旗標只說「有人驗過」，說不出是誰的瀏覽器驗的 —— 少了 session 那一半，知道受邀位址的人可以等持有人驗完、在自己的瀏覽器搶先建帳號。
 
-所有認證流程開始時清除其他流程的 session 狀態（`clear_auth_flows`）：登入存 `S_LOGIN_USER`、註冊存 `S_REG_USER`，兩把鍵不共用；`register_finish` 檢查目標等於目前登入者（`check_registration_owner`）—— 已登入的人只能替自己加備援金鑰，建新帳號時不該有人登入著。以前共用一把鍵，member 先啟動「新增 Passkey」、再對 admin 的 Email 啟動登入、最後提交註冊回應，新金鑰就寫進 admin 列。
+所有認證流程開始時清除其他流程的 session 狀態（`clear_auth_flows`）：Passkey 登入存 `S_DISC`、註冊存 `S_REG` 與 `S_REG_USER`，三把鍵都清、清不掉就整個請求失敗；刻意不清的是登入身分（`S_USER`／`S_NAME`／`S_AUTH_VIA`，加備援金鑰本來就要登入著）與信箱證明（`S_EMAIL_PROOF`，`register_start` 在清除之後才讀它）。`register_finish` 另外檢查目標等於目前登入者（`check_registration_owner`）—— 已登入的人只能替自己加備援金鑰，建新帳號時不該有人登入著。以前登入與註冊共用一把鍵，member 先啟動「新增 Passkey」、再對 admin 的 Email 啟動登入、最後提交註冊回應，新金鑰就寫進 admin 列。
 
 寄信失敗不會讓登記失敗 —— 位址已經生效，`POST /api/invite` 回 200 帶 `sent: false` 與原因，畫面上照樣給得出連結讓 admin 自己傳。
 
@@ -101,27 +111,36 @@ v7 起**登記時就選好平台**，註冊完成的那一刻生效。v6 的流�
 cargo test -- --ignored smoke_send_invite
 ```
 
-驗證碼的細節在 `src/otp.rs`：存 HMAC-SHA256 而非明碼（金鑰在首次使用時產生並存進 `settings`）、碼綁著信箱一起簽、10 分鐘失效、錯 5 次鎖住、重寄冷卻 60 秒、重寄會讓舊碼當場失效。
+驗證碼的細節在 `src/otp.rs`：存 HMAC-SHA256 而非明碼（金鑰在首次使用時產生並存進 `settings`）、碼綁著信箱一起簽、10 分鐘失效、錯 5 次鎖住、重寄冷卻 60 秒、重寄會讓舊碼當場失效、每組碼帶用途（`email_otp.purpose`，v13）。
 
 一次性碼與登記位址都在註冊流程的 **finish 階段才消耗**，不是 start。消耗用 `UPDATE ... WHERE used_at IS NULL`，兩人同時送出時只有一個成功。
 
 ### 登入的兩條路
 
-| 路徑 | 端點 | 用途 |
-|---|---|---|
-| 可探索憑證 | `/api/login/any/start` `/finish` | 不必輸入信箱，裝置自己挑一把 |
-| 信箱 + passkey | `/api/login/start` `/finish` | 退路 |
+| 路徑 | 端點 | 用途 | session 的 `auth_via` |
+|---|---|---|---|
+| 可探索 Passkey | `/api/login/any/start` `/finish` | **主路徑**。不必輸入信箱，裝置自己挑一把 | `passkey` |
+| Email 驗證碼 | `/api/login/otp/start` `/verify` | **備援**，給「換了手機、金鑰不在身上」的人 | `otp`（弱認證） |
 
-> [!IMPORTANT]
-> **退路現在還不能拿掉。** `start_passkey_registration` 送出的是 `residentKey: "discouraged"`（webauthn-rs 0.5 寫死，高階 API 沒有非 attested 的 resident key 入口）。iOS、Android、Chrome 的密碼管理器實務上仍會存成可探索的，所以第一條路對它們有效；但硬體金鑰或設定較嚴格的認證器可能不會。
+以前的退路是「信箱 + Passkey」（`/api/login/start`，用信箱查出憑證再帶 `allowCredentials`），存在的理由是 webauthn-rs 0.5 註冊時送 `residentKey: "discouraged"`，怕有人的 Passkey 不可探索。家裡的憑證確認都是可探索的（iOS、Android、Chrome 的密碼管理器實務上都存成可探索），那條路連同前端的 conditional UI 一起拿掉了；留下來的備援改成**不靠 Passkey** 的 Email 驗證碼 —— 退路的意義本來就是「Passkey 不在身上時還進得來」。
 
-前端的主按鈕走可探索登入（跳系統選擇器），展開退路時額外掛 conditional UI（把 passkey 掛進輸入框的自動填入）。兩者共用同一個後端挑戰，差別只在 `navigator.credentials.get()` 有沒有帶 `mediation: 'conditional'`。
+**Email 驗證碼登入是弱認證。** 加了它之後，威脅模型跟多數消費級服務一樣：**誰控制家人的信箱，誰就進得了 member 功能**（授權 IP、看驗證碼）。對家用系統這是可接受的取捨，但影響要收在 member 的範圍內，所以：
+
+- 登入流程寫進 session 的 `S_AUTH_VIA` 記下**是怎麼登入的**。`/api/status` 把它回成 `auth_via`，另有 `role`（帳號本身的角色）與 `is_admin`（這個 session **現在**有沒有 admin 特權）。三個欄位分開，前端才能對驗證碼登入的 admin 說「你是管理員，但這次是用驗證碼登入」，而不是讓管理分頁無聲消失。
+- **admin 特權一律走 `admin_powers`**：角色是 admin **而且** `auth_via = passkey`。`require_admin` 守的端點、member 端點裡順手給 admin 的特權（改別人的白名單、讀所有人的信、全覽白名單）、`/api/status` 的 `is_admin`，全部看同一個函式，不直接看 `is_admin()`。驗證碼登入的 admin 在**任何地方**都只是 member —— 否則家人信箱一失守，只要那位家人碰巧是 admin，整個面板就跟著失守。
+- **驗證碼登入的 admin 也不能替自己新增 Passkey**（`register_start` 與 `register_finish` 各擋一次，finish 看的是 DB 現在的角色）：否則「驗證碼登入 → 加 Passkey → 登出 → 用那把 Passkey 登入」四步就把上面那條繞掉了。member 不擋 —— 拿得到信箱的人本來就等於那位 member，讓他在新手機建一把之後就不必再收驗證碼，正是備援存在的目的。首頁對驗證碼登入的人提示「這台裝置可能還沒有 Passkey」。
+
+`/api/login/otp/start` 的條件跟 `join_start` **相反**：帳號必須存在。查無帳號時不寄、不寫 `email_otp`，但回應跟有帳號時完全一樣（同一個 `{ ok, cooldown }`），稽核照寫 `login_otp_no_account`，admin 看得到有人在試。`verify` 通過後清掉那組碼、清掉半途的 Passkey 流程狀態、`cycle_id`、寫入身分。
+
+兩條路的 start 都不需要登入，都過 `throttle_public`（跟加入流程共用限流器，見 §8）—— `login/any/start` 每一次都會在 session store 留一份挑戰，不擋等於讓人免費灌記憶體。
+
+Passkey 登入成功後會**回寫這把憑證的狀態**（`db::update_credential`）：`last_used_at` 一定更新；webauthn-rs 的 `update_credential` 回 `Some(true)`（signature counter 前進、備份旗標翻了）時連同新的憑證材料同一句 UPDATE 寫回。不回寫 counter 的話，被複製出去的 Passkey 拿舊 counter 來登入，webauthn-rs 看到的永遠是註冊當下的 0，抓不到。寫不回去（讀跟寫之間憑證被移除）就讓登入失敗，不用 `let _ =` 假裝成功。
 
 ### 角色
 
 | 角色 | 權限 |
 |---|---|
-| `admin` | 全部。登記邀請 Email、升降角色、指派平台、改設定、移除任何人的白名單 |
+| `admin` | 全部。登記邀請 Email、升降角色、指派平台、改設定、移除任何人的白名單。**只在用 Passkey 登入時生效**（`admin_powers`，見上）；用 Email 驗證碼登入的 admin 在這次 session 裡是 member |
 | `member` | 授權自己所在的網路；**只能移除或改名自己新增的白名單項目** |
 
 ### 一封信會不會出現在驗證碼分頁
@@ -178,8 +197,10 @@ cargo test -- --ignored smoke_send_invite
 
 一律只能操作**自己的**。admin 可以降權某個成員、看他加了哪些 IP，但碰不到別人的憑證：那是登入手段本身，不是設定。刪除的 WHERE 帶上 `user_id` 而不只是 `id` —— credential id 會出現在登入回應裡，不是機密。
 
+**每人最多 10 把**（`MAX_PASSKEYS_PER_USER`）。一家人一人幾台裝置，10 綽綽有餘；上限是為了防已登入的人無限灌 `credentials` 表，不是產品上的限制。`register_start` 先擋一次讓人在按下裝置確認之前就看到原因，真正守住的是 `db::add_credential` 那句 `INSERT … SELECT … WHERE count < max` —— 上限檢查與寫入是同一句 SQL，兩個分頁同時按「新增」不會各數到 9 然後變 11。
+
 > [!CAUTION]
-> **撤銷最後一把會被擋下**（後端與 UI 各擋一次）。這個系統沒有密碼、沒有信箱救援可以繞過 Passkey，刪光了就永遠登不進來，而且沒有任何介面能救。
+> **撤銷最後一把會被擋下**（後端與 UI 各擋一次）。member 刪光了還能用 Email 驗證碼登入再建一把；**admin 不行** —— 驗證碼登入的 admin 不能新增 Passkey（見「登入的兩條路」），刪光了只剩「裝置遺失」那節的資料庫救援，沒有任何介面能救。
 >
 > 剩最後一把時要換裝置的正確順序是：**先在新裝置註冊，再撤銷舊的**。
 
@@ -219,7 +240,7 @@ cargo test -- --ignored smoke_send_invite
 
 ### 裝置遺失
 
-只有一把 passkey 時裝置遺失就再也登不進來，面板偵測到會主動提示註冊備援。全部遺失時的救援：停容器，清掉 `control-data` volume 內 `users` 與 `credentials` 兩張表的內容，重啟後會重新發一次性碼。白名單與信件資料不受影響。
+只有一把 passkey 時面板會主動提示註冊備援。全部遺失時：**member** 用 Email 驗證碼登入（要有寄信服務），到帳號頁建一把新的即可；**admin** 的驗證碼 session 不能新增 Passkey，只剩資料庫救援 —— 停容器，清掉 `control-data` volume 內 `users` 與 `credentials` 兩張表的內容，重啟後會重新發一次性碼。白名單與信件資料不受影響。
 
 > [!CAUTION]
 > `NFHH_RP_ID` 不能事後改，改網域等於所有 passkey 作廢。
@@ -269,8 +290,10 @@ IPv4 因為 NAT，一筆就代表整戶。所以前端在**瀏覽器端**向只�
 檢查順序：
 
 1. **必須是公網位址** —— 私有、loopback、link-local、CGNAT `100.64/10`、ULA `fc00::/7`、`fe80::/10` 一律拒絕。加進去不會有效果，擋掉才不會讓人誤加自己手機的 `192.168.x` 就以為設定好了。
-2. **每人額度 `NFHH_MAX_PER_USER`**（預設 4）。已在自己名下的同一 IP 是「延長授權」，不佔新額度；**別人名下的直接拒絕**（只有新增者或 admin 能改寫，判斷與寫入是同一句 SQL，見 `db::upsert_allow_owned`），畫面上也不給那顆「延長」按鈕 —— 那個網路本來就通了。`clients.nft` 匯入的無主條目只有 admin 能改，改了就認到 admin 名下。v6 起沒有全域上限 —— 濫用防護改由「每人 4 條 × 成員數」與 admin 的 Email 登記共同構成。
+2. **帳號還在、每人額度 `NFHH_MAX_PER_USER`**（預設 4）**、寫入 —— 同一把鎖、同一個 transaction**（`db::allow_add_atomic`，回 `Added`／`QuotaFull`／`NotOwner`／`UserGone` 四態）。已在自己名下的同一 IP 是「延長授權」，不佔新額度；**別人名下的直接拒絕**（只有新增者或 admin 能改寫，判斷與寫入是同一句 `INSERT … ON CONFLICT … WHERE added_by = … OR is_admin`），畫面上也不給那顆「延長」按鈕 —— 那個網路本來就通了。`clients.nft` 匯入的無主條目只有 admin 能改，改了就認到 admin 名下。「admin」在這裡指 `admin_powers`：驗證碼登入的 admin 改不了別人的條目。v6 起沒有全域上限 —— 濫用防護改由「每人 4 條 × 成員數」與 admin 的 Email 登記共同構成。
 3. **TTL** 取 `ttl_days`，預設 `NFHH_TTL_DAYS`（7），夾在 1 到 30 天。這個天數**存在條目上**（`allowlist.ttl_days`），自動續期時才知道要延多久。
+
+為什麼第 2 步要是一個 transaction：分成幾次呼叫時有兩個空隙。admin 刪掉這個人之後、他手上還在跑的 `allow_add` 照樣寫進一條白名單 —— `delete_user` 是照 `added_by` 清的，之後才寫進去的那條就沒人管；同一個人同時開幾個請求，各自數到 `max - 1` 然後各寫一條，額度就破了。兩個都是「先查再寫」的競態，解法一樣：查跟寫之間不放鎖。額度只在「全新的 IP」時扣 —— 已在自己名下的是延長，別人的會被 upsert 的 WHERE 拒絕，不該先扣掉呼叫者的額度。
 
 寫入 DB 後立刻 `nft::sync()`，並寫一筆稽核。
 
@@ -511,7 +534,12 @@ Cloudflare 那步失敗**不回滾登記**，跟寄信失敗同一個原則：�
 |---|---|
 | `allow_add` ／ `allow_remove` | 白名單變更，detail 含 IP 與 TTL |
 | `invite_email_registered` ／ `invite_email_revoked` | 登記邀請 Email |
-| `join_code_sent` ／ `join_code_ok` ／ `join_code_locked` | Email 驗證碼 |
+| `login` | 登入成功，detail 是 `passkey` 或 `otp` |
+| `join_code_sent` ／ `join_code_ok` ／ `join_code_locked` | 加入用的 Email 驗證碼 |
+| `join_not_invited` ／ `join_has_account` | 對沒被邀請、或已有帳號的位址按「用 Email 加入」。**回應對外一律裝成已寄出**，只有這裡看得出來 |
+| `login_otp_sent` ／ `login_otp_locked` | 登入用的 Email 驗證碼 |
+| `login_otp_no_account` | 對沒有帳號的位址按驗證碼登入。同上，只有稽核看得出來 |
+| `join_code_send_failed` ／ `login_otp_send_failed` | 背景寄信失敗（Resend 回錯或連不上）。位址只進稽核，不進容器日誌 |
 | `invite_mail_sent` ／ `invite_mail_failed` | 邀請函寄送結果 |
 | `invite_link_opened` ／ `invite_link_bad` | 邀請連結被兌換或權杖對不上 |
 | `allow_renewed` | 自動續期（actor 為空 = 機器做的） |
@@ -529,17 +557,17 @@ Cloudflare 那步失敗**不回滾登記**，跟寄信失敗同一個原則：�
 | 方法 (Method) | 路徑 (Path) | 權限 (Auth) |
 |---|---|---|
 | GET | `/` | 公開（前端頁面） |
-| GET | `/api/status` | 公開；未登入時不揭露白名單內容 |
-| POST | `/api/join/start` `/verify` | 公開；寄與核對 Email 驗證碼。與 `/api/join/invite`、未登入的 `/api/register/start` 共用限流：每 IP 每 10 分鐘 30 次、全域 200 次 |
+| GET | `/api/status` | 公開；未登入時不揭露白名單內容。登入後多回 `role`、`auth_via`、`is_admin`（後者是這個 session 的實際特權，驗證碼登入的 admin 是 false） |
+| POST | `/api/join/start` `/verify` | 公開；寄與核對加入用的 Email 驗證碼。`start` 對「沒被邀請／已有帳號／冷卻中」回的跟已寄出一樣。所有匿名認證端點（`/api/join/*`、`/api/login/*`、未登入的 `/api/register/start`）共用一個限流器：每 IP 每 10 分鐘 30 次、全域 200 次 |
 | POST | `/api/join/invite` | 公開；兌換邀請連結的權杖，回信箱與平台。限流同上 |
-| POST | `/api/register/start` `/finish` | 依 §2 三種情境；未登入的分支限流同上，finish 檢查目標等於目前登入者（建新帳號的分支則要求未登入） |
-| POST | `/api/login/any/start` `/finish` | 公開；可探索憑證 |
-| POST | `/api/login/start` `/finish` | 公開；信箱 + passkey（退路） |
+| POST | `/api/register/start` `/finish` | 依 §2 三種情境；未登入的分支限流同上，finish 檢查目標等於目前登入者（建新帳號的分支則要求未登入）。每人最多 10 把；驗證碼登入的 admin 不能加 |
+| POST | `/api/login/any/start` `/finish` | 公開；可探索 Passkey（主路徑）。`start` 限流同上 |
+| POST | `/api/login/otp/start` `/verify` | 公開；Email 驗證碼登入（備援，session 標 `auth_via=otp`，進不了管理功能）。`start` 對沒有帳號的位址回的跟有帳號一樣。限流同上 |
 | POST | `/api/logout` | 登入 |
 | GET | `/api/passkeys` | 登入；只列自己的，不含憑證材料 |
 | POST | `/api/passkeys/{id}` | 登入；重新命名，限自己的 |
 | DELETE | `/api/passkeys/{id}` | 登入；限自己的，**擋掉刪到剩零把** |
-| POST | `/api/allow` | 登入；既有條目只有新增者或 admin 能改寫（同一句 SQL），別人的 IP 直接拒絕；無主條目由 admin 認領 |
+| POST | `/api/allow` | 登入；帳號存在、額度、寫入同一個 transaction（`allow_add_atomic`）；既有條目只有新增者或 admin 能改寫，別人的 IP 直接拒絕；無主條目由 admin 認領 |
 | POST | `/api/allow/{ip}` | 登入；重新命名，member 限自己新增的 |
 | DELETE | `/api/allow/{ip}` | 登入；member 限自己新增的 |
 | GET | `/api/allow/{ip}/queries` | 登入；**限條目擁有者，admin 也不例外** |
@@ -566,7 +594,7 @@ Cloudflare 那步失敗**不回滾登記**，跟寄信失敗同一個原則：�
 | POST | `/api/recipients/{id}/enabled` | **管理員** |
 | GET POST | `/api/invite` | **管理員**；登記邀請 Email，POST 順帶寄邀請函、建轉發、回連結 |
 | GET | `/api/push/key` | 登入；訂閱要用的 VAPID 公鑰 |
-| GET POST | `/api/push/subs` | 登入；列出或新增自己的裝置訂閱，**每人 8 筆** |
+| GET POST | `/api/push/subs` | 登入；列出或新增自己的裝置訂閱，**每人 8 筆**。endpoint 只收 https 網域、443、無 userinfo、非 localhost |
 | DELETE | `/api/push/subs/{id}` | 登入；限自己的 |
 | POST | `/api/push/unsubscribe` | 登入；這台裝置帶著 endpoint 自己退訂 |
 | POST | `/api/push/check` | 登入；帶 endpoint 問「這個訂閱還在嗎」，只回布林 |
@@ -622,6 +650,7 @@ Cloudflare 那步失敗**不回滾登記**，跟寄信失敗同一個原則：�
 
 | 版本 | 內容 |
 |---|---|
+| v13 | `email_otp.purpose`（`join`／`login`，預設 `join`）。登入用的驗證碼跟加入用的互不相認：`check_otp` 只認同用途的列，既有的列一律視為加入碼 |
 | v12 | `mails.ingested_at`（面板收到的時間）。排序、分頁、保留期只看它，`received_at` 降為顯示用。回填取 `min(received_at, unixepoch())`，升級前的偽造未來日期不會變成可信時間；順帶丟掉只剩維護成本的 `idx_mails_at` |
 | v11 | 補跑 v10 那批 `add_column`。`cf_present` 曾被後補進 v10，而線上 `user_version` 已經是 10，那個區塊不再執行，直到 SELECT 撞上 `no such column` 才發現 |
 | v10 | `push_subscriptions`；`users.notify_codes` 與 `notify_expiry`；`allowlist.expiry_notified_at`（到期提醒的去重標記，續期時清回 NULL）；`mail_recipients.cf_present`（見 §6 的四種狀態） |
@@ -669,6 +698,8 @@ Cloudflare 那步失敗**不回滾登記**，跟寄信失敗同一個原則：�
 **每人最多 8 筆**（`MAX_PUSH_SUBS_PER_USER`），配額在同一把鎖內檢查與寫入。只有「已經是自己的 endpoint」不佔新配額；接手別人的 endpoint 算新裝置、計入配額但仍允許 —— endpoint 不外流，要拿到得先有資料庫或那台裝置。`p256dh` 必須是 65 bytes 的未壓縮 P-256 點、`auth` 16 bytes：壓縮點能過曲線檢查、推送服務也回 201，但兩邊的 key_info 不同，那台裝置一輩子解不開，而且沒有任何一次會回報失敗。
 
 扇出同時最多 8 個 task、整批 60 秒 deadline；連續失敗 10 次（`PUSH_MAX_FAILS`）的訂閱不再參與，到期提醒也一樣。
+
+`endpoint` 是成員自填的字串，面板之後會對它發 POST，所以訂閱時先看**形狀**（`valid_push_endpoint`）：`https`、host 是網域（不收 IP 字面值）、埠是 443、沒有 userinfo、不是 `localhost`／`*.localhost`（尾端點 `localhost.` 也算）。真的推送服務（FCM／Apple／Mozilla）都長這樣；IP 字面值與非 443 埠是拿面板去戳內網服務的形狀，`https://fcm.googleapis.com@10.0.0.1/` 是騙眼睛的形狀。推播客戶端（`push.rs`）再守第二層：**不跟轉址**（`redirect::Policy::none()`；reqwest 預設跟 10 次，`Location` 指到 10.x／127.x 就等於讓人拿主機的網路位置戳內網）、**只走 https**（`https_only(true)`）。推送服務從不轉址，收到 3xx 直接當失敗。兩層誰漏了都還有另一層。
 
 `endpoint` **不外流到前端**（`serde(skip)`）—— 它等於「可以推播到這台裝置」的能力。所以裝置自己退訂走 `/api/push/unsubscribe` 帶 endpoint，設定頁的清單則用 id。
 
@@ -737,7 +768,10 @@ Cloudflare 那步失敗**不回滾登記**，跟寄信失敗同一個原則：�
 | 症狀 | 檢查 |
 |---|---|
 | 面板打不開 | `docker logs nfhh-control`；`NFHH_BIND` 非 loopback 會拒絕啟動 |
-| 全部人被登出 | 正常，session 存記憶體，容器重啟即失效 |
+| 全部人被登出 | 正常，session 存記憶體，容器重啟即失效。cookie 改名（`__Host-nfhh_session`）那次部署也會登出一次 |
+| 登不進去（換了手機、Passkey 不在身上） | 登入頁「登不進去？改用 Email 驗證碼登入」。要有寄信服務（`NFHH_RESEND_KEY`）。登進去後到帳號頁建一把 Passkey 就不必再收驗證碼；admin 用這條路只有 member 權限，管理功能要 Passkey |
+| 管理分頁不見了 | 看首頁有沒有「你是管理員，但這次是用驗證碼登入」—— 登出改用 Passkey |
+| 按「用 Email 加入」收不到信 | 回應不會說位址有沒有被邀請。先確認拼字跟 admin 登記的一模一樣；admin 看稽核的 `join_not_invited`／`join_has_account`／`join_code_send_failed` |
 | 授權後仍連不上 | `sudo nft list set inet nfhh clients_v4` 看是否真的寫進去 |
 | 白名單漂移 | 等 5 分鐘的背景同步，或改動任一項目觸發全量重建 |
 | 驗證碼區塊沒出現 | `NFHH_MAIL_SECRET` 沒設，端點是停用的 |

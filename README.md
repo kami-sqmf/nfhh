@@ -38,7 +38,7 @@
 
 - **smartdns** — DNS 改寫與 split-horizon 分流，剝除 AAAA
 - **sni-proxy**（nginx）— 讀 ClientHello 的 SNI 比對白名單，純 TCP passthrough
-- **control** — Passkey 管理面板（Rust + Axum + SQLite），管理白名單、成員與驗證碼
+- **control** — Passkey 管理面板（Rust + Axum + SQLite），管理白名單、成員與驗證碼。登入走 Passkey，備援是 Email 驗證碼（只有 member 權限）
 
 ## 運作原理
 
@@ -115,6 +115,8 @@ sudo nft -f config/nft/nfhh.nft
 ./nfhh up
 ```
 
+`nft -f` 一定在 `up` 之前：smartdns 與 nginx 是 host network，容器一起來就直接綁 `:53`／`:443`／`:853`。`./nfhh up` 與 `./nfhh restart` 會先確認 `inet nfhh` 表在（需要 sudo），不在就印修復指令並拒絕啟動；CI／測試機可設 `NFHH_SKIP_FIREWALL_CHECK=1` 跳過。
+
 > [!WARNING]
 > 這只是把服務跑起來。完整架設還包含路由器 port forward、Cloudflare Tunnel、
 > Email Routing 與憑證，**依序**做完 [docs/SETUP.md](docs/SETUP.md) 的七個步驟才會有可用的系統。
@@ -175,9 +177,9 @@ cd /opt/nfhh && ./nfhh status
 | 命令 | 作用 |
 |---|---|
 | `./nfhh status` | 一頁看完：容器、埠、白名單、對外 IP、憑證、systemd |
-| `./nfhh up` | 啟動三個容器 |
+| `./nfhh up` | 啟動三個容器（先確認 nft 表 `inet nfhh` 存在，不在就拒絕） |
 | `./nfhh logs [服務]` | 追蹤日誌，服務可填 `smartdns` ／ `sni-proxy` ／ `control` |
-| `./nfhh restart` | 重啟三個容器 |
+| `./nfhh restart` | 重啟三個容器（同樣先確認 nft 表） |
 | `./nfhh apply` | 改完平台網域清單後，讓變更生效 |
 | `./nfhh check <來源IP>` | 找出該來源查過、但沒被平台清單涵蓋的網域 |
 | `./nfhh cert` | 重新部署憑證並重載 smartdns（需 sudo） |
