@@ -678,20 +678,26 @@ pub struct Credential {
     pub last_used_at: Option<i64>,
 }
 
+/// 幫某人存一把新 passkey。回 false = 這個人已有 `max_per_user` 把，沒有寫入。
+///
+/// 上限檢查與 INSERT 是同一句 SQL（`INSERT … SELECT … WHERE count < max`）：
+/// 兩個分頁同時按「新增 Passkey」時，不會各自數到 9 把然後各寫一把變 11。
 pub fn add_credential(
     db: &Db,
     cred_id: &str,
     user_id: &str,
     passkey_json: &str,
     nickname: Option<&str>,
-) -> Result<()> {
+    max_per_user: i64,
+) -> Result<bool> {
     let conn = db.lock().unwrap();
-    conn.execute(
+    let n = conn.execute(
         "INSERT INTO credentials (id, user_id, passkey, nickname, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![cred_id, user_id, passkey_json, nickname, now()],
+         SELECT ?1, ?2, ?3, ?4, ?5
+         WHERE (SELECT COUNT(*) FROM credentials WHERE user_id = ?2) < ?6",
+        params![cred_id, user_id, passkey_json, nickname, now(), max_per_user],
     )?;
-    Ok(())
+    Ok(n == 1)
 }
 
 pub fn list_credentials(db: &Db, user_id: &str) -> Result<Vec<Credential>> {
@@ -853,7 +859,7 @@ pub fn purge_expired(db: &Db) -> Result<usize> {
 
 /// ⚠️ 這支**不做任何所有權檢查**，任何呼叫者都能改寫任何人的條目。
 /// 只給 `nft::import_legacy`（開機匯入，當下還沒有使用者）與測試用；
-/// handler 一律走 `upsert_allow_owned`。
+/// handler 一律走 `allow_add_atomic`。
 pub fn upsert_allow(
     db: &Db,
     ip: &str,
@@ -887,16 +893,18 @@ pub fn upsert_allow(
 /// 時 `added_by` 保持原擁有者 —— 那是「誰的網路」，不是「誰最後按了按鈕」；
 /// 只有**無主**的條目（`clients.nft` 匯入的沒有 added_by）會就這樣認到
 /// admin 名下，讓它從此有人負責。`coalesce` 保證這不會奪走別人的條目。
-pub fn upsert_allow_owned(
-    db: &Db,
+///
+/// 這是 `allow_add_atomic` 的最後一步，吃的是呼叫端已經拿在手上的連線
+/// （或 transaction），才能跟前面的存在／額度檢查共用同一把鎖。
+fn upsert_allow_owned_on(
+    conn: &Connection,
     ip: &str,
     label: Option<&str>,
     owner: &str,
     expires_at: i64,
     ttl_days: i64,
     is_admin: bool,
-) -> Result<bool> {
-    let conn = db.lock().unwrap();
+) -> rusqlite::Result<bool> {
     let n = conn.execute(
         "INSERT INTO allowlist (ip, label, added_by, added_at, expires_at, ttl_days)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -910,6 +918,89 @@ pub fn upsert_allow_owned(
         params![ip, label, owner, now(), expires_at, ttl_days, is_admin],
     )?;
     Ok(n == 1)
+}
+
+/// 測試用：單獨驅動上面那句 SQL 的所有權語意，不必先湊出帳號與額度。
+/// handler 走 `allow_add_atomic`。
+#[cfg(test)]
+pub fn upsert_allow_owned(
+    db: &Db,
+    ip: &str,
+    label: Option<&str>,
+    owner: &str,
+    expires_at: i64,
+    ttl_days: i64,
+    is_admin: bool,
+) -> Result<bool> {
+    let conn = db.lock().unwrap();
+    Ok(upsert_allow_owned_on(&conn, ip, label, owner, expires_at, ttl_days, is_admin)?)
+}
+
+/// `allow_add_atomic` 的結果。三個失敗態各對一句給使用者看的話，
+/// 由 handler 決定怎麼講。
+#[derive(Debug, PartialEq, Eq)]
+pub enum AllowAdd {
+    Added,
+    /// 全新的 IP，但這個人的條目已經 `mine` 條、上限 `max`。
+    QuotaFull { mine: i64, max: i64 },
+    /// IP 已存在且是別人的（`is_admin` 為 false 時）。
+    NotOwner,
+    /// 呼叫者的帳號在這期間被刪了。
+    UserGone,
+}
+
+/// 新增或續期一條白名單：帳號還在 → 額度 → 寫入，**同一把鎖、同一個
+/// transaction**。
+///
+/// 分成四次呼叫時有兩個空隙：(1) admin 刪掉這個人之後、他手上還在跑的
+/// `allow_add` 照樣寫進一條無主的白名單（`delete_user` 是照 `added_by` 清
+/// 的，之後再寫進去的就沒人管）；(2) 同一個人同時開幾個請求，各自數到
+/// `max - 1` 然後各寫一條，額度就破了。兩個都是「先查再寫」的競態，
+/// 解法一樣：查跟寫之間不放鎖。
+///
+/// 額度只在「全新的 IP」時扣：已在自己名下的是延長；別人的會被 upsert
+/// 的 WHERE 拒絕（`NotOwner`），不該先扣掉呼叫者的額度。
+#[allow(clippy::too_many_arguments)]
+pub fn allow_add_atomic(
+    db: &Db,
+    user_id: &str,
+    ip: &str,
+    label: Option<&str>,
+    owner: &str,
+    expires_at: i64,
+    ttl_days: i64,
+    is_admin: bool,
+    max_per_user: i64,
+) -> Result<AllowAdd> {
+    let mut conn = db.lock().unwrap();
+    let tx = conn.transaction()?;
+
+    let user_exists: Option<i64> = tx
+        .query_row("SELECT 1 FROM users WHERE id = ?1", params![user_id], |r| r.get(0))
+        .optional()?;
+    if user_exists.is_none() {
+        return Ok(AllowAdd::UserGone);
+    }
+
+    let ip_exists: Option<i64> = tx
+        .query_row("SELECT 1 FROM allowlist WHERE ip = ?1", params![ip], |r| r.get(0))
+        .optional()?;
+    if ip_exists.is_none() {
+        let mine: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM allowlist WHERE added_by = ?1",
+            params![owner],
+            |r| r.get(0),
+        )?;
+        if mine >= max_per_user {
+            return Ok(AllowAdd::QuotaFull { mine, max: max_per_user });
+        }
+    }
+
+    if !upsert_allow_owned_on(&tx, ip, label, owner, expires_at, ttl_days, is_admin)? {
+        return Ok(AllowAdd::NotOwner);
+    }
+    tx.commit()?;
+    Ok(AllowAdd::Added)
 }
 
 pub fn remove_allow(db: &Db, ip: &str) -> Result<usize> {
@@ -2414,6 +2505,81 @@ mod tests {
         assert_eq!((e.added_by.as_deref(), e.expires_at, e.ttl_days), (Some("root@x"), t7 + 86400, 30));
     }
 
+    /// 報告 #5：同一個人同時開 N 個請求各加一個新 IP，額度檢查跟寫入若不在
+    /// 同一把鎖裡，每個都會數到「還沒滿」然後各寫一條。這裡真的開多執行緒
+    /// 打同一顆 DB，最後條目數不得超過上限，而且成功回 `Added` 的次數要剛好等於上限。
+    #[test]
+    fn concurrent_adds_by_one_owner_never_exceed_the_quota() {
+        let db = test_db();
+        create_user_with_platforms(&db, "u1", "a@x", "a", "member", Some("a@x"), &[]).unwrap();
+        const MAX: i64 = 4;
+        const N: usize = 16;
+        let t = now() + 86400;
+
+        let added = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|sc| {
+            for i in 0..N {
+                let (db, added) = (&db, &added);
+                sc.spawn(move || {
+                    let ip = format!("203.0.113.{i}");
+                    let r = allow_add_atomic(db, "u1", &ip, None, "a@x", t, 1, false, MAX).unwrap();
+                    match r {
+                        AllowAdd::Added => {
+                            added.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        AllowAdd::QuotaFull { mine, max } => {
+                            assert!(mine >= max, "被拒時額度應已滿：{mine}/{max}");
+                        }
+                        other => panic!("不該出現 {other:?}"),
+                    }
+                });
+            }
+        });
+
+        assert_eq!(allow_count_by(&db, "a@x").unwrap(), MAX);
+        assert_eq!(added.load(std::sync::atomic::Ordering::SeqCst), MAX as usize);
+    }
+
+    /// 額度只算新的 IP：已在自己名下的是續期，滿額時照樣能延長；
+    /// 別人的 IP 是 `NotOwner`，而且不會偷偷扣到自己的額度。
+    #[test]
+    fn renewing_an_owned_ip_does_not_consume_quota() {
+        let db = test_db();
+        create_user_with_platforms(&db, "u1", "a@x", "a", "member", Some("a@x"), &[]).unwrap();
+        create_user_with_platforms(&db, "u2", "b@x", "b", "member", Some("b@x"), &[]).unwrap();
+        let t = now() + 86400;
+        let add = |uid: &str, ip: &str, owner: &str, exp: i64| {
+            allow_add_atomic(&db, uid, ip, None, owner, exp, 1, false, 1).unwrap()
+        };
+
+        assert_eq!(add("u1", "1.1.1.1", "a@x", t), AllowAdd::Added);
+        assert_eq!(add("u1", "2.2.2.2", "a@x", t), AllowAdd::QuotaFull { mine: 1, max: 1 });
+        // 續期：同一個 IP 再加一次，額度已滿也要過，而且到期時間真的往後
+        assert_eq!(add("u1", "1.1.1.1", "a@x", t + 3600), AllowAdd::Added);
+        let e = list_allow(&db).unwrap().into_iter().find(|e| e.ip == "1.1.1.1").unwrap();
+        assert_eq!(e.expires_at, t + 3600);
+        assert_eq!(allow_count_by(&db, "a@x").unwrap(), 1);
+
+        // 別人碰它：拒絕，兩邊的額度都不動
+        assert_eq!(add("u2", "1.1.1.1", "b@x", t), AllowAdd::NotOwner);
+        assert_eq!(allow_count_by(&db, "b@x").unwrap(), 0);
+        let e = list_allow(&db).unwrap().into_iter().find(|e| e.ip == "1.1.1.1").unwrap();
+        assert_eq!((e.added_by.as_deref(), e.expires_at), (Some("a@x"), t + 3600));
+    }
+
+    /// 報告 #2：admin 刪掉這個人之後，他手上還在跑的 `allow_add` 不得寫進
+    /// 一條無主的白名單 —— 存在檢查跟寫入在同一個 transaction 裡。
+    #[test]
+    fn a_deleted_user_cannot_add_an_entry() {
+        let db = test_db();
+        create_user_with_platforms(&db, "u1", "a@x", "a", "member", Some("a@x"), &[]).unwrap();
+        delete_user(&db, "u1", "a@x").unwrap();
+
+        let r = allow_add_atomic(&db, "u1", "9.9.9.9", None, "a@x", now() + 86400, 1, false, 4).unwrap();
+        assert_eq!(r, AllowAdd::UserGone);
+        assert!(list_allow(&db).unwrap().is_empty(), "帳號不在了就不該有新列");
+    }
+
     /// 自動續期要依條目自己的 ttl_days，不是全域預設。
     #[test]
     fn renewal_uses_entry_own_ttl() {
@@ -2760,8 +2926,8 @@ mod tests {
         let db = mem();
         create_user_with_platforms(&db, "u1", "a", "a", "admin", None, &[]).unwrap();
         create_user_with_platforms(&db, "u2", "b", "b", "member", None, &[]).unwrap();
-        add_credential(&db, "c1", "u1", "{}", Some("iPhone")).unwrap();
-        add_credential(&db, "c2", "u1", "{}", None).unwrap();
+        assert!(add_credential(&db, "c1", "u1", "{}", Some("iPhone"), 10).unwrap());
+        assert!(add_credential(&db, "c2", "u1", "{}", None, 10).unwrap());
 
         // u2 拿著 u1 的 credential id 也刪不掉、改不動
         assert_eq!(delete_credential(&db, "u2", "c1").unwrap(), 0);
@@ -2777,7 +2943,7 @@ mod tests {
     fn listing_credentials_omits_the_key_material() {
         let db = mem();
         create_user_with_platforms(&db, "u1", "a", "a", "admin", None, &[]).unwrap();
-        add_credential(&db, "c1", "u1", "{\"secret\":\"不該外流\"}", Some("iPhone")).unwrap();
+        assert!(add_credential(&db, "c1", "u1", "{\"secret\":\"不該外流\"}", Some("iPhone"), 10).unwrap());
 
         let list = list_credentials(&db, "u1").unwrap();
         assert_eq!(list.len(), 1);
@@ -2792,7 +2958,7 @@ mod tests {
     fn nickname_can_be_set_and_cleared() {
         let db = mem();
         create_user_with_platforms(&db, "u1", "a", "a", "admin", None, &[]).unwrap();
-        add_credential(&db, "c1", "u1", "{}", None).unwrap();
+        assert!(add_credential(&db, "c1", "u1", "{}", None, 10).unwrap());
         assert_eq!(list_credentials(&db, "u1").unwrap()[0].nickname, None);
 
         rename_credential(&db, "u1", "c1", Some("備援金鑰")).unwrap();
@@ -2807,9 +2973,25 @@ mod tests {
     fn using_a_credential_records_the_time() {
         let db = mem();
         create_user_with_platforms(&db, "u1", "a", "a", "admin", None, &[]).unwrap();
-        add_credential(&db, "c1", "u1", "{}", None).unwrap();
+        assert!(add_credential(&db, "c1", "u1", "{}", None, 10).unwrap());
         touch_credential(&db, "c1").unwrap();
         assert!(list_credentials(&db, "u1").unwrap()[0].last_used_at.is_some());
+    }
+
+    /// 報告 #3：每人 passkey 有上限，而且是在 INSERT 那句 SQL 裡守的 ——
+    /// 滿了就回 false、一列都不多。
+    #[test]
+    fn credentials_per_user_are_capped_atomically() {
+        let db = mem();
+        create_user_with_platforms(&db, "u1", "a", "a", "admin", None, &[]).unwrap();
+        create_user_with_platforms(&db, "u2", "b", "b", "member", None, &[]).unwrap();
+        for i in 0..10 {
+            assert!(add_credential(&db, &format!("c{i}"), "u1", "{}", None, 10).unwrap());
+        }
+        assert!(!add_credential(&db, "c10", "u1", "{}", None, 10).unwrap(), "第 11 把要被擋");
+        assert_eq!(credential_count(&db, "u1").unwrap(), 10);
+        // 上限是每人各算的，別人滿了不影響我
+        assert!(add_credential(&db, "d0", "u2", "{}", None, 10).unwrap());
     }
 
     /// 登記時選的平台要原封不動傳到註冊完成的那一刻。
@@ -2862,7 +3044,7 @@ mod tests {
         let db = mem();
         create_user_with_platforms(&db, "u1", "mei@x.tw", "mei", "member", Some("mei@x.tw"), &[]).unwrap();
         create_user_with_platforms(&db, "u2", "other@x.tw", "other", "admin", Some("other@x.tw"), &[]).unwrap();
-        add_credential(&db, "c1", "u1", "{}", None).unwrap();
+        assert!(add_credential(&db, "c1", "u1", "{}", None, 10).unwrap());
         grant_platform(&db, "u1", "netflix", "admin").unwrap();
         upsert_allow(&db, "1.1.1.1", None, Some("mei@x.tw"), 999, 7).unwrap();
         upsert_allow(&db, "2.2.2.2", None, Some("mei@x.tw"), 999, 7).unwrap();
@@ -2943,7 +3125,7 @@ mod tests {
         .unwrap();
 
         // 他名下的每一種資料各放一筆
-        add_credential(&db, "cred1", "u1", "passkey-json", Some("iPhone")).unwrap();
+        assert!(add_credential(&db, "cred1", "u1", "passkey-json", Some("iPhone"), 10).unwrap());
         assert!(add_push_sub(&db, "u1", "https://push.example/aaa", "pub", "auth", None, 8).unwrap());
         upsert_allow(&db, "1.2.3.4", None, Some("mei@x.tw"), now() + 86400, 7).unwrap();
         add_recipient(&db, "netflix@share.example.com", "mei@x.tw", None, "admin").unwrap();
@@ -2953,7 +3135,7 @@ mod tests {
 
         // 另一個人的同類資料，用來確認刪除有界線
         create_user_with_platforms(&db, "u2", "ann@x.tw", "ann", "member", Some("ann@x.tw"), &[]).unwrap();
-        add_credential(&db, "cred2", "u2", "passkey-json", None).unwrap();
+        assert!(add_credential(&db, "cred2", "u2", "passkey-json", None, 10).unwrap());
         upsert_allow(&db, "5.6.7.8", None, Some("ann@x.tw"), now() + 86400, 7).unwrap();
         add_recipient(&db, "netflix@share.example.com", "ann@x.tw", None, "admin").unwrap();
 

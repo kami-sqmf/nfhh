@@ -301,6 +301,10 @@ async fn require_admin(st: &Shared, session: &Session) -> ApiResult<db::User> {
 const MAX_EMAIL_LEN: usize = 254;
 /// 白名單標籤、裝置名稱等可顯示文字的上限。
 const MAX_LABEL_LEN: usize = 128;
+/// 每個帳號最多幾把 Passkey。一家人一人幾台裝置，10 綽綽有餘；
+/// 上限是為了防已登入的人無限灌 `credentials` 表（報告 #3），
+/// 不是產品上的限制。
+const MAX_PASSKEYS_PER_USER: i64 = 10;
 /// 不需要登入的端點（join/start、join/verify、join/invite，以及 register/start
 /// 的未登入分支）共用的限流：每個來源 IP 每 10 分鐘 30 次、全域 200 次。
 /// 名字沿用 join，計數是共用的。
@@ -599,6 +603,13 @@ async fn register_start(
                 "管理員帳號要先用 Passkey 登入才能新增 Passkey"
             )));
         }
+        // 先在這裡擋一次，讓人在按下裝置的確認之前就看到原因；真正守住的
+        // 是 `register_finish` 那句原子的 INSERT。
+        if db::credential_count(&st.db, &u.id)? >= MAX_PASSKEYS_PER_USER {
+            return Err(AppError(anyhow::anyhow!(
+                "這個帳號的 Passkey 已達上限（{MAX_PASSKEYS_PER_USER} 把），請先移除不用的"
+            )));
+        }
         PendingReg {
             user_id: u.id,
             username: u.username,
@@ -764,13 +775,20 @@ async fn register_finish(
     }
 
     let cred_id = base64_url(passkey.cred_id().as_ref());
-    db::add_credential(
+    // 上限只會在「加備援」那條路撞到：新帳號永遠是第 1 把。這個檢查沒辦法
+    // 提早到消耗 bootstrap／邀請之前 —— 要先驗過 WebAuthn 才知道有沒有東西可存。
+    if !db::add_credential(
         &st.db,
         &cred_id,
         &p.user_id,
         &serde_json::to_string(&passkey)?,
         p.nickname.as_deref(),
-    )?;
+        MAX_PASSKEYS_PER_USER,
+    )? {
+        return Err(AppError(anyhow::anyhow!(
+            "這個帳號的 Passkey 已達上限（{MAX_PASSKEYS_PER_USER} 把），請先移除不用的"
+        )));
+    }
 
     // 三把鍵都清，而且清不掉要報錯：殘留的目標是下一次攻擊的材料。
     // 排在 `add_credential` **之後**：憑證寫失敗就整個請求失敗，這時清掉
@@ -1279,37 +1297,38 @@ async fn allow_add(
 
     db::purge_expired(&st.db)?;
 
+    // 這裡讀角色只是為了決定 admin 特權；「帳號還在不在」會在下面那個
+    // transaction 裡再看一次，這一眼跟寫入之間被刪掉也不會漏寫進去。
     let me = db::get_user(&st.db, &uid)?.context("帳號已不存在")?;
-
-    // 額度只在「全新的 IP」時扣：已在自己名下的是延長；別人的會在下面被
-    // SQL 拒絕，也不該先扣掉呼叫者的額度。
-    let exists = db::list_allow(&st.db)?.iter().any(|e| e.ip == ip_str);
-    if !exists {
-        let mine = db::allow_count_by(&st.db, &username)?;
-        if mine >= st.cfg.max_per_user {
-            return Err(AppError(anyhow::anyhow!(
-                "你的額度已滿（{mine} / {}），請先移除不用的網路",
-                st.cfg.max_per_user
-            )));
-        }
-    }
 
     let ttl_days = req.ttl_days.unwrap_or(st.cfg.default_ttl_days).clamp(1, 30);
     let expires_at = db::now() + ttl_days * 86400;
     // 改別人的條目是 admin 特權，跟其他特權一樣只給強認證的 admin。
     let admin = admin_powers(&session, &me).await;
-    if !db::upsert_allow_owned(
+    // 存在、額度、寫入放在同一把鎖、同一個 transaction 裡（報告 #2、#5）。
+    match db::allow_add_atomic(
         &st.db,
+        &uid,
         &ip_str,
         req.label.as_deref(),
         &username,
         expires_at,
         ttl_days,
         admin,
+        st.cfg.max_per_user,
     )? {
-        return Err(AppError(anyhow::anyhow!(
-            "{ip_str} 不是你新增的，只有新增者或管理員能修改"
-        )));
+        db::AllowAdd::Added => {}
+        db::AllowAdd::QuotaFull { mine, max } => {
+            return Err(AppError(anyhow::anyhow!(
+                "你的額度已滿（{mine} / {max}），請先移除不用的網路"
+            )));
+        }
+        db::AllowAdd::NotOwner => {
+            return Err(AppError(anyhow::anyhow!(
+                "{ip_str} 不是你新增的，只有新增者或管理員能修改"
+            )));
+        }
+        db::AllowAdd::UserGone => return Err(AppError(anyhow::anyhow!("帳號已不存在"))),
     }
 
     let n = nft::sync(&st.db, &st.cfg.clients_nft)?;
@@ -5164,6 +5183,31 @@ mod tests {
             (Some("a@x"), Some("老家"), 30),
             "被拒絕的請求不得留下任何痕跡"
         );
+    }
+
+    /// 報告 #3：已登入的人不能無限加 Passkey。`register_start` 就要說清楚
+    /// 為什麼，不必等到裝置確認完才在 finish 被打回。
+    #[tokio::test]
+    async fn register_start_refuses_when_the_passkey_cap_is_reached() {
+        let st = test_state();
+        db::create_user_with_platforms(&st.db, "u1", "mei@x.tw", "mei", "member", Some("mei@x.tw"), &[]).unwrap();
+        for i in 0..MAX_PASSKEYS_PER_USER {
+            assert!(db::add_credential(&st.db, &format!("c{i}"), "u1", "{}", None, MAX_PASSKEYS_PER_USER).unwrap());
+        }
+
+        let session = test_session();
+        session.insert(S_USER, &"u1".to_string()).await.unwrap();
+        session.insert(S_NAME, &"mei@x.tw".to_string()).await.unwrap();
+
+        let err = register_start(
+            State(st.clone()), session.clone(), hdrs(&[]),
+            Json(RegisterStart { email: None, bootstrap_token: None, nickname: None }),
+        )
+        .await
+        .map_err(|e| e.0)
+        .expect_err("滿額就不該發挑戰");
+        assert!(err.to_string().contains("已達上限"), "拿到的是：{err}");
+        assert!(session.get::<PendingReg>(S_REG_USER).await.unwrap().is_none(), "不該留下註冊狀態");
     }
 
     /// 額度只在「全新的 IP」時扣，但那條路要真的擋得住 —— 額度滿了就不能
