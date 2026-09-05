@@ -75,7 +75,24 @@ fn migrate(conn: &Connection) -> Result<()> {
         migrate_v12(conn)?;
         conn.pragma_update(None, "user_version", 12)?;
     }
+    if version < 13 {
+        migrate_v13(conn)?;
+        conn.pragma_update(None, "user_version", 13)?;
+    }
     Ok(())
+}
+
+/// v13：驗證碼的用途。
+///
+/// 驗證碼從只給「加入」用，變成也能「登入」（見 otp.rs 檔頭）。兩種碼寄到
+/// 同一個信箱、長得一樣，卻換到不同的東西：一個換「可以建帳號」，一個換
+/// 「直接進到面板」。沒有這欄，加入流程寄出的碼可以拿去登入端點試，反之
+/// 登入碼也能拿去過 `register_start` 的信箱證明。`check_otp` 與
+/// `otp_recently_verified` 只認同用途的列。
+///
+/// 既有的列一律視為 `join`：升級當下在途的碼全是加入流程寄的。
+fn migrate_v13(conn: &Connection) -> Result<()> {
+    add_column(conn, "email_otp", "purpose", "TEXT NOT NULL DEFAULT 'join'")
 }
 
 /// v12：可信的接收時間。
@@ -273,7 +290,8 @@ fn migrate_v6(conn: &Connection) -> Result<()> {
             expires_at  INTEGER NOT NULL,
             attempts    INTEGER NOT NULL DEFAULT 0,
             sent_at     INTEGER NOT NULL,  -- 重寄冷卻的基準
-            verified_at INTEGER
+            verified_at INTEGER,
+            purpose     TEXT NOT NULL DEFAULT 'join'  -- join／login，見 v13
         );
 
         -- 成員 × 平台的授權矩陣。
@@ -1732,23 +1750,35 @@ pub fn invited_email_by_token(db: &Db, token_hash: &str) -> Result<Option<Invite
 
 // ── Email 一次性驗證碼 ────────────────────────────────
 
+/// 加入流程寄的碼：通過後換到的是「可以在這個瀏覽器建帳號」。
+pub const OTP_JOIN: &str = "join";
+/// 登入流程寄的碼：通過後直接以那個信箱的帳號登入（弱認證，見 otp.rs）。
+pub const OTP_LOGIN: &str = "login";
+
 /// 同一個信箱同時只會有一組有效的碼 —— 重寄直接覆蓋，
 /// 舊碼當場失效，避免「攻擊者觸發重寄、舊碼還能用」的窗口。
-pub fn put_otp(db: &Db, email: &str, code_hash: &str, ttl_secs: i64) -> Result<()> {
+///
+/// 用途一起覆寫：同一個信箱在「沒帳號」與「有帳號」之間切換時
+/// （家人剛註冊完），殘留的加入碼不該還被當成加入碼認。
+pub fn put_otp(db: &Db, email: &str, purpose: &str, code_hash: &str, ttl_secs: i64) -> Result<()> {
     let conn = db.lock().unwrap();
     let t = now();
     conn.execute(
-        "INSERT INTO email_otp (email, code_hash, expires_at, attempts, sent_at)
-         VALUES (?1,?2,?3,0,?4)
+        "INSERT INTO email_otp (email, code_hash, expires_at, attempts, sent_at, purpose)
+         VALUES (?1,?2,?3,0,?4,?5)
          ON CONFLICT(email) DO UPDATE SET
              code_hash=excluded.code_hash, expires_at=excluded.expires_at,
-             attempts=0, sent_at=excluded.sent_at, verified_at=NULL",
-        params![norm(email), code_hash, t + ttl_secs, t],
+             attempts=0, sent_at=excluded.sent_at, verified_at=NULL,
+             purpose=excluded.purpose",
+        params![norm(email), code_hash, t + ttl_secs, t, purpose],
     )?;
     Ok(())
 }
 
 /// 距離可以重寄還剩幾秒。0 代表現在就能重寄。
+///
+/// 刻意**不看用途**：冷卻保護的是那個信箱不被當成寄信目標洗，
+/// 加入碼跟登入碼寄到的是同一個收件匣。
 pub fn otp_cooldown(db: &Db, email: &str, cooldown_secs: i64) -> Result<i64> {
     let conn = db.lock().unwrap();
     let sent: Option<i64> = conn
@@ -1770,13 +1800,23 @@ pub enum OtpCheck {
 
 /// 驗證並在成功時標記通過。失敗一律累加 attempts ——
 /// 六位數只有一百萬種，沒有次數上限就等於沒有保護。
-pub fn check_otp(db: &Db, email: &str, code_hash: &str, max_attempts: i64) -> Result<OtpCheck> {
+///
+/// 只認同用途的列：拿加入碼來登入、拿登入碼來註冊，在這裡都跟「沒有這組碼」
+/// 一樣回 `Expired`。不累加 attempts —— 那一列根本不是這條流程的碼。
+pub fn check_otp(
+    db: &Db,
+    email: &str,
+    purpose: &str,
+    code_hash: &str,
+    max_attempts: i64,
+) -> Result<OtpCheck> {
     let conn = db.lock().unwrap();
     let email = norm(email);
     let row: Option<(String, i64, i64)> = conn
         .query_row(
-            "SELECT code_hash, expires_at, attempts FROM email_otp WHERE email = ?1",
-            params![email],
+            "SELECT code_hash, expires_at, attempts FROM email_otp
+             WHERE email = ?1 AND purpose = ?2",
+            params![email, purpose],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
@@ -1809,12 +1849,15 @@ pub fn check_otp(db: &Db, email: &str, code_hash: &str, max_attempts: i64) -> Re
 
 /// 這個信箱剛剛通過 OTP 了嗎？註冊 passkey 前的最後一道確認。
 /// 給一個短的有效窗口，避免「幾天前驗過」還能拿來建帳號。
-pub fn otp_recently_verified(db: &Db, email: &str, window_secs: i64) -> Result<bool> {
+///
+/// 同樣只認同用途的列：登入碼通過後 `verified_at` 也會被寫上，
+/// 但那不是「可以建帳號」的證明。
+pub fn otp_recently_verified(db: &Db, email: &str, purpose: &str, window_secs: i64) -> Result<bool> {
     let conn = db.lock().unwrap();
     let v: Option<i64> = conn
         .query_row(
-            "SELECT verified_at FROM email_otp WHERE email = ?1",
-            params![norm(email)],
+            "SELECT verified_at FROM email_otp WHERE email = ?1 AND purpose = ?2",
+            params![norm(email), purpose],
             |r| r.get(0),
         )
         .optional()?
@@ -1833,14 +1876,15 @@ pub fn otp_recently_verified(db: &Db, email: &str, window_secs: i64) -> Result<b
 /// `sent_at` 新建時給 0、既有的不動：那欄是重寄冷卻的基準，而這裡根本沒寄
 /// 任何東西。給 `now()` 的話，走完連結又想退回「用 Email 加入」的人會被
 /// 擋在「請等 60 秒」後面，而他等的是一封從來沒寄出的信。
-pub fn mark_email_verified(db: &Db, email: &str) -> Result<()> {
+pub fn mark_email_verified(db: &Db, email: &str, purpose: &str) -> Result<()> {
     let conn = db.lock().unwrap();
     conn.execute(
-        "INSERT INTO email_otp (email, code_hash, expires_at, attempts, sent_at, verified_at)
-         VALUES (?1,'-',0,0,0,?2)
+        "INSERT INTO email_otp (email, code_hash, expires_at, attempts, sent_at, verified_at, purpose)
+         VALUES (?1,'-',0,0,0,?2,?3)
          ON CONFLICT(email) DO UPDATE SET
-             code_hash='-', expires_at=0, attempts=0, verified_at=excluded.verified_at",
-        params![norm(email), now()],
+             code_hash='-', expires_at=0, attempts=0, verified_at=excluded.verified_at,
+             purpose=excluded.purpose",
+        params![norm(email), now(), purpose],
     )?;
     Ok(())
 }
@@ -2467,18 +2511,18 @@ mod tests {
     #[test]
     fn marking_verified_opens_the_registration_window() {
         let db = mem();
-        assert!(!otp_recently_verified(&db, "mei@example.com", 900).unwrap());
-        mark_email_verified(&db, "Mei@Example.com").unwrap();
-        assert!(otp_recently_verified(&db, "mei@example.com", 900).unwrap());
+        assert!(!otp_recently_verified(&db, "mei@example.com", OTP_JOIN, 900).unwrap());
+        mark_email_verified(&db, "Mei@Example.com", OTP_JOIN).unwrap();
+        assert!(otp_recently_verified(&db, "mei@example.com", OTP_JOIN, 900).unwrap());
     }
 
     /// 但那一筆不是一組能拿去輸入的碼 —— 它連「還沒過期」都不是。
     #[test]
     fn marking_verified_does_not_hand_out_a_usable_code() {
         let db = mem();
-        mark_email_verified(&db, "mei@example.com").unwrap();
+        mark_email_verified(&db, "mei@example.com", OTP_JOIN).unwrap();
         assert!(matches!(
-            check_otp(&db, "mei@example.com", "-", 5).unwrap(),
+            check_otp(&db, "mei@example.com", OTP_JOIN, "-", 5).unwrap(),
             OtpCheck::Expired
         ));
     }
@@ -2488,7 +2532,7 @@ mod tests {
     #[test]
     fn marking_verified_does_not_start_a_resend_cooldown() {
         let db = mem();
-        mark_email_verified(&db, "mei@example.com").unwrap();
+        mark_email_verified(&db, "mei@example.com", OTP_JOIN).unwrap();
         assert_eq!(otp_cooldown(&db, "mei@example.com", 60).unwrap(), 0);
     }
 
@@ -2496,8 +2540,8 @@ mod tests {
     #[test]
     fn marking_verified_keeps_an_existing_cooldown() {
         let db = mem();
-        put_otp(&db, "mei@example.com", "h", 600).unwrap();
-        mark_email_verified(&db, "mei@example.com").unwrap();
+        put_otp(&db, "mei@example.com", OTP_JOIN, "h", 600).unwrap();
+        mark_email_verified(&db, "mei@example.com", OTP_JOIN).unwrap();
         assert!(otp_cooldown(&db, "mei@example.com", 60).unwrap() > 0);
     }
 
@@ -2507,26 +2551,26 @@ mod tests {
     fn marking_verified_replaces_a_pending_code() {
         let db = mem();
         let h = crate::otp::hash(&db, "mei@example.com", "123456").unwrap();
-        put_otp(&db, "mei@example.com", &h, 600).unwrap();
-        mark_email_verified(&db, "mei@example.com").unwrap();
-        assert!(matches!(check_otp(&db, "mei@example.com", &h, 5).unwrap(), OtpCheck::Expired));
+        put_otp(&db, "mei@example.com", OTP_JOIN, &h, 600).unwrap();
+        mark_email_verified(&db, "mei@example.com", OTP_JOIN).unwrap();
+        assert!(matches!(check_otp(&db, "mei@example.com", OTP_JOIN, &h, 5).unwrap(), OtpCheck::Expired));
     }
 
     /// 六位數只有一百萬種，沒有次數上限等於沒有保護。
     #[test]
     fn otp_locks_out_after_too_many_attempts() {
         let db = mem();
-        put_otp(&db, "mei@example.com", "hash-good", 600).unwrap();
+        put_otp(&db, "mei@example.com", OTP_JOIN, "hash-good", 600).unwrap();
 
         for _ in 0..3 {
             assert!(matches!(
-                check_otp(&db, "mei@example.com", "hash-bad", 3).unwrap(),
+                check_otp(&db, "mei@example.com", OTP_JOIN, "hash-bad", 3).unwrap(),
                 OtpCheck::Wrong
             ));
         }
         // 用完次數之後，連正確的碼也不放行
         assert!(matches!(
-            check_otp(&db, "mei@example.com", "hash-good", 3).unwrap(),
+            check_otp(&db, "mei@example.com", OTP_JOIN, "hash-good", 3).unwrap(),
             OtpCheck::TooManyAttempts
         ));
     }
@@ -2537,13 +2581,13 @@ mod tests {
     #[test]
     fn a_locked_code_expires_like_any_other() {
         let db = mem();
-        put_otp(&db, "mei@example.com", "hash-good", 600).unwrap();
+        put_otp(&db, "mei@example.com", OTP_JOIN, "hash-good", 600).unwrap();
         for _ in 0..3 {
-            check_otp(&db, "mei@example.com", "hash-bad", 3).unwrap();
+            check_otp(&db, "mei@example.com", OTP_JOIN, "hash-bad", 3).unwrap();
         }
         // 時窗內照舊鎖住：這是原本就有的語義，不能因為換順序而消失
         assert!(matches!(
-            check_otp(&db, "mei@example.com", "hash-good", 3).unwrap(),
+            check_otp(&db, "mei@example.com", OTP_JOIN, "hash-good", 3).unwrap(),
             OtpCheck::TooManyAttempts
         ));
 
@@ -2552,7 +2596,7 @@ mod tests {
             .execute("UPDATE email_otp SET expires_at = 1", [])
             .unwrap();
         assert!(
-            matches!(check_otp(&db, "mei@example.com", "hash-good", 3).unwrap(), OtpCheck::Expired),
+            matches!(check_otp(&db, "mei@example.com", OTP_JOIN, "hash-good", 3).unwrap(), OtpCheck::Expired),
             "過了 TTL 就該跟任何一組碼一樣單純過期，鎖不能比碼活得更久"
         );
     }
@@ -2561,26 +2605,26 @@ mod tests {
     #[test]
     fn resending_invalidates_the_previous_code() {
         let db = mem();
-        put_otp(&db, "mei@example.com", "hash-old", 600).unwrap();
-        put_otp(&db, "mei@example.com", "hash-new", 600).unwrap();
+        put_otp(&db, "mei@example.com", OTP_JOIN, "hash-old", 600).unwrap();
+        put_otp(&db, "mei@example.com", OTP_JOIN, "hash-new", 600).unwrap();
 
         assert!(matches!(
-            check_otp(&db, "mei@example.com", "hash-old", 3).unwrap(),
+            check_otp(&db, "mei@example.com", OTP_JOIN, "hash-old", 3).unwrap(),
             OtpCheck::Wrong
         ));
         assert!(matches!(
-            check_otp(&db, "mei@example.com", "hash-new", 3).unwrap(),
+            check_otp(&db, "mei@example.com", OTP_JOIN, "hash-new", 3).unwrap(),
             OtpCheck::Ok
         ));
-        assert!(otp_recently_verified(&db, "mei@example.com", 600).unwrap());
+        assert!(otp_recently_verified(&db, "mei@example.com", OTP_JOIN, 600).unwrap());
     }
 
     #[test]
     fn expired_otp_is_rejected() {
         let db = mem();
-        put_otp(&db, "mei@example.com", "h", -1).unwrap();
+        put_otp(&db, "mei@example.com", OTP_JOIN, "h", -1).unwrap();
         assert!(matches!(
-            check_otp(&db, "mei@example.com", "h", 3).unwrap(),
+            check_otp(&db, "mei@example.com", OTP_JOIN, "h", 3).unwrap(),
             OtpCheck::Expired
         ));
     }
@@ -2589,9 +2633,69 @@ mod tests {
     #[test]
     fn stale_verification_does_not_count() {
         let db = mem();
-        put_otp(&db, "mei@example.com", "h", 600).unwrap();
-        check_otp(&db, "mei@example.com", "h", 3).unwrap();
-        assert!(!otp_recently_verified(&db, "mei@example.com", -1).unwrap());
+        put_otp(&db, "mei@example.com", OTP_JOIN, "h", 600).unwrap();
+        check_otp(&db, "mei@example.com", OTP_JOIN, "h", 3).unwrap();
+        assert!(!otp_recently_verified(&db, "mei@example.com", OTP_JOIN, -1).unwrap());
+    }
+
+    /// 加入碼跟登入碼長得一樣、寄到同一個信箱，但換到的東西不同 ——
+    /// 拿錯用途的碼來，要跟「沒有這組碼」一樣，而且不燒次數。
+    #[test]
+    fn a_code_only_counts_for_the_purpose_it_was_issued_for() {
+        let db = mem();
+        put_otp(&db, "mei@example.com", OTP_JOIN, "h", 600).unwrap();
+        assert!(matches!(
+            check_otp(&db, "mei@example.com", OTP_LOGIN, "h", 3).unwrap(),
+            OtpCheck::Expired
+        ));
+        let attempts: i64 = db
+            .lock()
+            .unwrap()
+            .query_row("SELECT attempts FROM email_otp", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(attempts, 0, "用錯流程不該算成猜錯");
+        assert!(matches!(
+            check_otp(&db, "mei@example.com", OTP_JOIN, "h", 3).unwrap(),
+            OtpCheck::Ok
+        ));
+    }
+
+    /// 登入碼通過後也會寫 `verified_at`，但那不是「可以建帳號」的證明。
+    #[test]
+    fn a_verified_login_code_does_not_open_the_registration_window() {
+        let db = mem();
+        put_otp(&db, "mei@example.com", OTP_LOGIN, "h", 600).unwrap();
+        assert!(matches!(
+            check_otp(&db, "mei@example.com", OTP_LOGIN, "h", 3).unwrap(),
+            OtpCheck::Ok
+        ));
+        assert!(otp_recently_verified(&db, "mei@example.com", OTP_LOGIN, 600).unwrap());
+        assert!(!otp_recently_verified(&db, "mei@example.com", OTP_JOIN, 600).unwrap());
+    }
+
+    /// 重寄會連用途一起換：剛註冊完的人殘留的加入碼，不該在他改寄登入碼之後
+    /// 還被當成加入碼認。
+    #[test]
+    fn resending_replaces_the_purpose_too() {
+        let db = mem();
+        put_otp(&db, "mei@example.com", OTP_JOIN, "old", 600).unwrap();
+        put_otp(&db, "mei@example.com", OTP_LOGIN, "new", 600).unwrap();
+        assert!(matches!(
+            check_otp(&db, "mei@example.com", OTP_JOIN, "old", 3).unwrap(),
+            OtpCheck::Expired
+        ));
+        assert!(matches!(
+            check_otp(&db, "mei@example.com", OTP_LOGIN, "new", 3).unwrap(),
+            OtpCheck::Ok
+        ));
+    }
+
+    /// 冷卻不分用途：保護的是那個收件匣，不是某一條流程。
+    #[test]
+    fn cooldown_is_shared_across_purposes() {
+        let db = mem();
+        put_otp(&db, "mei@example.com", OTP_JOIN, "h", 600).unwrap();
+        assert!(otp_cooldown(&db, "mei@example.com", 60).unwrap() > 0);
     }
 
     /// UI 改過的設定不該被下一次重啟的環境變數種子蓋掉。
@@ -3378,7 +3482,7 @@ mod tests {
         migrate(&conn).unwrap();
         migrate(&conn).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 12);
+        assert_eq!(v, 13);
     }
 
     /// ⚠️ 已經跑過 v10 的資料庫必須也拿得到後來補的那幾個欄位。
@@ -3475,6 +3579,30 @@ mod tests {
         assert_eq!(recent_mails(&db, 10).unwrap().len(), 1);
     }
 
+    /// 已經在 v12 的資料庫也要拿得到 `purpose`，而且既有的列要被視為加入碼 ——
+    /// 升級當下在途的碼全是加入流程寄的，讓它們失效等於讓正在註冊的人重來。
+    #[test]
+    fn a_database_already_at_v12_gets_the_purpose_column_with_join_as_default() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute_batch("ALTER TABLE email_otp DROP COLUMN purpose;").unwrap();
+        conn.pragma_update(None, "user_version", 12).unwrap();
+        conn.execute(
+            "INSERT INTO email_otp (email, code_hash, expires_at, attempts, sent_at)
+             VALUES ('mei@example.com', 'h', ?1, 0, ?1)",
+            params![now() + 600],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 13);
+        let purpose: String = conn
+            .query_row("SELECT purpose FROM email_otp", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(purpose, OTP_JOIN);
+    }
+
     /// 升級前就存在的未來日期郵件，不能把偽造的時間原樣搬進可信欄位。
     /// 造一顆 v11 的庫（跟 `migration_is_idempotent` 同一招：退版號、拿掉欄位）。
     #[test]
@@ -3495,7 +3623,7 @@ mod tests {
 
         migrate(&conn).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 12);
+        assert_eq!(v, 13);
         let f: i64 = conn
             .query_row("SELECT ingested_at FROM mails WHERE message_id = 'f'", [], |r| r.get(0))
             .unwrap();
