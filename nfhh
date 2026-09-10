@@ -29,6 +29,7 @@ usage() {
   check <來源IP>    列出該來源查過、但沒被平台清單涵蓋的網域
   cert              重新部署憑證並重啟 smartdns（啟用/更新 DoT，需 sudo）
   bootstrap         建立 generated/ 底下的佔位設定檔（全新 checkout 用）
+  check-env         檢查 .env 會不會讓容器起不來或功能靜默停用（唯讀，不印密鑰）
 
 白名單一律經面板 https://dnf.${NFHH_DOMAIN} 管理，不要用 nft 手動加 —— 見 README.md。
 EOF
@@ -187,6 +188,7 @@ case "$cmd" in
     check)     exec scripts/find-missing-domains.sh "$@" ;;
     cert)      exec sudo scripts/sync-cert.sh "$@" ;;
     bootstrap) exec scripts/bootstrap.sh "$@" ;;
+    check-env) exec scripts/check-env.sh "$@" ;;
     help|-h|--help) usage ;;
     *)         echo "未知命令：$cmd" >&2; echo >&2; usage >&2; exit 1 ;;
 esac
